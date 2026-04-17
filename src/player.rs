@@ -1,10 +1,16 @@
 //! ProTracker playback engine.
 //!
-//! Drives a `PlayerState` forward one tick at a time, rendering mixed
-//! stereo PCM as it goes. The mixing core keeps per-channel state in
-//! `Channel` so that a future multichannel-output mode can tap the
-//! same per-channel buffers without a refactor (see MEMORY.md →
-//! "MOD multichannel").
+//! Drives a `PlayerState` forward one tick at a time. Two output modes
+//! share the same mixing core:
+//!
+//! - [`PlayerState::render`] writes interleaved stereo S16 PCM, applying
+//!   the Amiga hard-pan convention (channels 0 & 3 left, 1 & 2 right;
+//!   repeats every 4 for >4-channel files) and a 1/(N/2) headroom scale.
+//! - [`PlayerState::render_per_channel`] writes one S16 plane per MOD
+//!   tracker channel, post-volume but pre-pan and pre-mix. Downstream
+//!   consumers that need to mix / pan / analyse channels independently
+//!   (DAWs, visualisers, per-instrument remastering) drive the player
+//!   via this path.
 //!
 //! Terminology:
 //! - **Row**: a line in a pattern. A pattern has 64 rows.
@@ -334,30 +340,42 @@ impl PlayerState {
         }
     }
 
-    /// Render one stereo S16 interleaved sample pair by mixing all channels.
-    /// Channels 0 and 3 pan hard-left, 1 and 2 hard-right (Amiga convention).
-    fn render_one(&mut self, out: &mut [i16]) {
+    /// True if track index `i` is hard-panned left under the classic
+    /// Amiga convention (channels 0 & 3 left, 1 & 2 right; for >4 channels
+    /// the pattern repeats every 4).
+    pub fn channel_is_left(i: usize) -> bool {
+        matches!(i % 4, 0 | 3)
+    }
+
+    /// Sample all channels once, returning per-channel floats in
+    /// `-1.0..=1.0` range (pre-pan, pre-mix) and a stereo mix scaled so
+    /// that a fully-saturated 4-channel MOD stays within the -1..1 range.
+    /// Per-channel values are the *raw* post-volume signal so callers that
+    /// want independent channel streams can mix / pan them however they
+    /// like.
+    fn sample_all_channels(&mut self, per_channel: &mut [f32]) -> (f32, f32) {
         let out_rate = self.sample_rate as f32;
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         let n_ch = self.channels.len();
         for (i, ch) in self.channels.iter_mut().enumerate() {
             let s = ch.mix_one(&self.samples, out_rate);
-            // Amiga pan: channels 0 & 3 left, 1 & 2 right. For >4 channels
-            // alternate L/R.
-            let left = matches!(i % 4, 0 | 3);
-            if left {
+            per_channel[i] = s;
+            if Self::channel_is_left(i) {
                 l += s;
             } else {
                 r += s;
             }
         }
-        // Scale: divide by expected max contributions so 4-channel full
-        // output stays in -1..1 range.
         let norm = (n_ch as f32 / 2.0).max(1.0);
-        l /= norm;
-        r /= norm;
-        // Clip softly.
+        (l / norm, r / norm)
+    }
+
+    /// Render one stereo S16 interleaved sample pair by mixing all channels.
+    /// Channels 0 and 3 pan hard-left, 1 and 2 hard-right (Amiga convention).
+    fn render_one(&mut self, out: &mut [i16]) {
+        let mut per_channel = vec![0.0f32; self.channels.len()];
+        let (l, r) = self.sample_all_channels(&mut per_channel);
         let l = l.clamp(-1.0, 1.0);
         let r = r.clamp(-1.0, 1.0);
         out[0] = (l * 32767.0) as i16;
@@ -386,6 +404,65 @@ impl PlayerState {
             for _ in 0..want {
                 let off = produced * 2;
                 self.render_one(&mut dst[off..off + 2]);
+                produced += 1;
+            }
+
+            self.tick_sample_cursor += want as u32;
+            if self.tick_sample_cursor >= spt {
+                self.tick_sample_cursor = 0;
+                self.tick += 1;
+                if self.tick >= self.speed {
+                    self.tick = 0;
+                    self.next_row();
+                }
+            }
+        }
+        produced
+    }
+
+    /// Render into one S16 plane per MOD channel. `planes.len()` must
+    /// equal `self.channels.len()`; each plane receives the same number
+    /// of samples, and all planes must be at least `n_frames` long.
+    ///
+    /// Returns the number of mono samples written to each plane. Each
+    /// channel is emitted post-volume, pre-pan, pre-mix — no stereo
+    /// scaling is applied, so callers get the raw per-channel signal
+    /// (suitable for independent mixing, per-instrument analysis, DAW
+    /// export, etc.).
+    pub fn render_per_channel(&mut self, planes: &mut [&mut [i16]], n_frames: usize) -> usize {
+        assert_eq!(
+            planes.len(),
+            self.channels.len(),
+            "render_per_channel: plane count must equal MOD channel count"
+        );
+        for p in planes.iter() {
+            assert!(
+                p.len() >= n_frames,
+                "render_per_channel: every plane must hold at least n_frames samples"
+            );
+        }
+
+        let mut produced = 0usize;
+        let mut scratch = vec![0.0f32; self.channels.len()];
+
+        while produced < n_frames {
+            if self.ended {
+                break;
+            }
+            if self.tick_sample_cursor == 0 {
+                self.advance_tick();
+            }
+            let spt = self.samples_per_tick().max(1);
+            let remaining_in_tick = spt.saturating_sub(self.tick_sample_cursor);
+            let want = (n_frames - produced).min(remaining_in_tick as usize);
+
+            for _ in 0..want {
+                // Discard the stereo mix; we only need per-channel here.
+                let _ = self.sample_all_channels(&mut scratch);
+                for (ch_idx, plane) in planes.iter_mut().enumerate() {
+                    let v = scratch[ch_idx].clamp(-1.0, 1.0);
+                    plane[produced] = (v * 32767.0) as i16;
+                }
                 produced += 1;
             }
 
@@ -572,5 +649,72 @@ pub mod tests {
         let patterns = parse_patterns(&header, &bytes);
         let player = PlayerState::new(&header, samples, patterns, 44_100);
         assert_eq!(player.samples_per_tick(), 882);
+    }
+
+    #[test]
+    fn render_per_channel_isolates_channels() {
+        // The synth MOD triggers notes exclusively on channel 0, so any
+        // per-channel stream other than 0 must be pure silence.
+        let bytes = synth_square_mod();
+        let header = parse_header(&bytes).unwrap();
+        let samples = extract_samples(&header, &bytes);
+        let patterns = parse_patterns(&header, &bytes);
+        let mut player = PlayerState::new(&header, samples, patterns, 44_100);
+
+        let n_frames = 4410;
+        let mut planes: Vec<Vec<i16>> = (0..player.channels.len())
+            .map(|_| vec![0i16; n_frames])
+            .collect();
+        let produced = {
+            let mut views: Vec<&mut [i16]> = planes.iter_mut().map(|v| v.as_mut_slice()).collect();
+            player.render_per_channel(&mut views, n_frames)
+        };
+        assert_eq!(produced, n_frames);
+
+        let ch0_nonzero = planes[0].iter().filter(|&&s| s != 0).count();
+        assert!(
+            ch0_nonzero > 100,
+            "channel 0 should carry audible signal, got {ch0_nonzero} non-zero samples"
+        );
+        for (i, plane) in planes.iter().enumerate().skip(1) {
+            let nonzero = plane.iter().filter(|&&s| s != 0).count();
+            assert_eq!(
+                nonzero, 0,
+                "channel {i} should be silent in synth_square_mod, got {nonzero} non-zero samples"
+            );
+        }
+    }
+
+    #[test]
+    fn render_per_channel_matches_mixed_song_length() {
+        // Rendering the same song through both paths must terminate after
+        // the same number of frames (both are driven by the same
+        // PlayerState tick machinery).
+        let bytes = synth_square_mod();
+        let header = parse_header(&bytes).unwrap();
+        let samples_a = extract_samples(&header, &bytes);
+        let patterns_a = parse_patterns(&header, &bytes);
+        let mut player_mixed = PlayerState::new(&header, samples_a, patterns_a, 44_100);
+
+        let samples_b = extract_samples(&header, &bytes);
+        let patterns_b = parse_patterns(&header, &bytes);
+        let mut player_planar = PlayerState::new(&header, samples_b, patterns_b, 44_100);
+
+        // Render a bounded chunk through each; ticks are deterministic so
+        // both must produce exactly `n_frames` samples.
+        let n_frames = 2205;
+        let mut mixed = vec![0i16; n_frames * 2];
+        let produced_mixed = player_mixed.render(&mut mixed);
+
+        let mut planes: Vec<Vec<i16>> = (0..player_planar.channels.len())
+            .map(|_| vec![0i16; n_frames])
+            .collect();
+        let produced_planar = {
+            let mut views: Vec<&mut [i16]> = planes.iter_mut().map(|v| v.as_mut_slice()).collect();
+            player_planar.render_per_channel(&mut views, n_frames)
+        };
+
+        assert_eq!(produced_mixed, n_frames);
+        assert_eq!(produced_planar, n_frames);
     }
 }
