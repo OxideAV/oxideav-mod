@@ -15,7 +15,7 @@
 //!   to mix / pan / analyse channels independently (DAWs, visualizers,
 //!   per-instrument tooling) drive the decoder via this codec id.
 
-use oxideav_codec::{CodecRegistry, Decoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result,
     SampleFormat, TimeBase,
@@ -33,10 +33,10 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_channels(32)
         .with_max_sample_rate(OUTPUT_SAMPLE_RATE);
-    reg.register_decoder_impl(
-        CodecId::new(crate::CODEC_ID_STR),
-        mixed_caps,
-        make_mixed_decoder,
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::CODEC_ID_STR))
+            .capabilities(mixed_caps)
+            .decoder(make_mixed_decoder),
     );
 
     let planar_caps = CodecCapabilities::audio("mod_sw_planar")
@@ -45,10 +45,10 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_channels(32)
         .with_max_sample_rate(OUTPUT_SAMPLE_RATE);
-    reg.register_decoder_impl(
-        CodecId::new(crate::CODEC_ID_PLANAR_STR),
-        planar_caps,
-        make_planar_decoder,
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::CODEC_ID_PLANAR_STR))
+            .capabilities(planar_caps)
+            .decoder(make_planar_decoder),
     );
 }
 
