@@ -46,9 +46,12 @@
 //!   8- or 16-bit PCM bodies). A minimum XM playback engine is wired via
 //!   the shared [`mixer::MixerVoice`] core and [`mixer::XmPitch`] pitch
 //!   model (both Amiga and Linear frequency tables supported); drive it
-//!   via [`xm_player::XmPlayerState::render`]. Envelopes, fadeout,
-//!   vibrato, and the bulk of the Axy/Dxy/Exy/Fxy effect space are not
-//!   yet implemented. The codec id [`CODEC_ID_XM_STR`] = `"xm"` remains
+//!   via [`xm_player::XmPlayerState::render`]. Volume + panning envelopes
+//!   (tick-based linear interpolation with sustain-point hold and
+//!   loop-start/loop-end looping), fadeout (on key-off / note 97), and
+//!   key-off events are supported. Vibrato, tone portamento, and the
+//!   bulk of the Bxy/Dxy/Exy/Fxy/Kxy/Lxy effect space remain
+//!   unimplemented. The codec id [`CODEC_ID_XM_STR`] = `"xm"` remains
 //!   a parsing-only decoder pending effect-set completeness — use
 //!   [`xm::parse_header`] / [`xm::parse_patterns`] / [`xm::parse_instruments`]
 //!   / [`xm::extract_sample_bodies`] for structural access, or drive

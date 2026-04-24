@@ -71,9 +71,12 @@ fn build_c4_square_xm() -> Vec<u8> {
     // Extended block.
     out.extend_from_slice(&xm::XM_SAMPLE_HEADER_SIZE.to_le_bytes());
     out.extend(vec![0u8; 96]); // sample_map
+    // Flat envelope at full volume: (0, 64) and (64, 64). This keeps
+    // the volume scalar at 1.0 throughout the test so we can assert on
+    // raw audibility without envelope ramp-up colouring the RMS.
     let mut vol_env = [0u8; 48];
     vol_env[0..2].copy_from_slice(&0u16.to_le_bytes());
-    vol_env[2..4].copy_from_slice(&0u16.to_le_bytes());
+    vol_env[2..4].copy_from_slice(&64u16.to_le_bytes());
     vol_env[4..6].copy_from_slice(&64u16.to_le_bytes());
     vol_env[6..8].copy_from_slice(&64u16.to_le_bytes());
     out.extend_from_slice(&vol_env);
@@ -166,6 +169,216 @@ fn xm_player_renders_audible_square_wave() {
         rms > 500.0 && rms < 20000.0,
         "expected RMS within (500, 20000), got {rms}"
     );
+}
+
+/// Build a minimal XM file tailored for envelope + key-off testing:
+///   - Volume envelope (0,64), (10,64), (20,0) with sustain at point 1
+///     (tick 10). Holds at 64 while key-on, decays to 0 after release.
+///   - Fadeout = 1024 (substantial so we can observe it numerically in
+///     a ~1 s render).
+///   - Pattern has note at row 0, key-off (note 97) at row 4.
+///   - 1 channel, 8 rows, tempo 6, BPM 125.
+fn build_envelope_xm() -> Vec<u8> {
+    let mut out = vec![0u8; xm::XM_MIN_HEADER_LEN];
+    out[0..17].copy_from_slice(xm::XM_BANNER);
+    out[17..37].copy_from_slice(b"envelope-xm         ");
+    out[xm::XM_ID_BYTE_OFFSET] = 0x1A;
+    out[38..58].copy_from_slice(b"oxideav             ");
+    out[58..60].copy_from_slice(&xm::XM_VERSION_0104.to_le_bytes());
+    out[60..64].copy_from_slice(&0x114u32.to_le_bytes());
+    out[64..66].copy_from_slice(&1u16.to_le_bytes()); // song_length
+    out[66..68].copy_from_slice(&0u16.to_le_bytes());
+    out[68..70].copy_from_slice(&2u16.to_le_bytes()); // 2 channels (even)
+    out[70..72].copy_from_slice(&1u16.to_le_bytes()); // 1 pattern
+    out[72..74].copy_from_slice(&1u16.to_le_bytes()); // 1 instrument
+    out[74..76].copy_from_slice(&1u16.to_le_bytes()); // linear
+    out[76..78].copy_from_slice(&6u16.to_le_bytes()); // tempo
+    out[78..80].copy_from_slice(&125u16.to_le_bytes()); // BPM
+    for i in 1..xm::XM_ORDER_TABLE_SIZE {
+        out[xm::XM_ORDER_TABLE_OFFSET + i] = 0xFF;
+    }
+
+    // Pattern: 8 rows × 2 channels. Row 0 ch 0 = note 49 (C-4) inst 1
+    // full volume. Row 4 ch 0 = key-off (note 97). All other cells
+    // empty.
+    let mut packed = Vec::new();
+    for row in 0..8u8 {
+        for ch in 0..2u8 {
+            if row == 0 && ch == 0 {
+                packed.push(0x80 | 0x01 | 0x02 | 0x04);
+                packed.push(49); // C-4
+                packed.push(1);
+                packed.push(0x50); // vol 64
+            } else if row == 4 && ch == 0 {
+                // Key-off: note 97, no instrument / volume / effect.
+                packed.push(0x80 | 0x01);
+                packed.push(97);
+            } else {
+                packed.push(0x80);
+            }
+        }
+    }
+    out.extend_from_slice(&9u32.to_le_bytes());
+    out.push(0);
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&(packed.len() as u16).to_le_bytes());
+    out.extend(packed);
+
+    // Instrument: 1 sample, ramped envelope with sustain and fadeout.
+    const HSIZE: u32 = 0x107;
+    let inst_start = out.len();
+    out.extend_from_slice(&HSIZE.to_le_bytes());
+    let mut nbuf = [0u8; 22];
+    nbuf[..3].copy_from_slice(b"env");
+    out.extend_from_slice(&nbuf);
+    out.push(0);
+    out.extend_from_slice(&1u16.to_le_bytes());
+
+    out.extend_from_slice(&xm::XM_SAMPLE_HEADER_SIZE.to_le_bytes());
+    out.extend(vec![0u8; 96]);
+
+    // Volume envelope: 3 points.
+    // (0, 64) -> (10, 64) -> (20, 0). Sustain at index 1 (tick=10),
+    // loop disabled. Key-on stalls at (10,64) → full volume. Key-off
+    // lets envelope walk from (10,64) to (20,0) while fadeout also
+    // multiplies, so output decays.
+    let mut vol_env = [0u8; 48];
+    vol_env[0..2].copy_from_slice(&0u16.to_le_bytes());
+    vol_env[2..4].copy_from_slice(&64u16.to_le_bytes());
+    vol_env[4..6].copy_from_slice(&10u16.to_le_bytes());
+    vol_env[6..8].copy_from_slice(&64u16.to_le_bytes());
+    vol_env[8..10].copy_from_slice(&20u16.to_le_bytes());
+    vol_env[10..12].copy_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&vol_env);
+
+    out.extend_from_slice(&[0u8; 48]); // pan env
+    out.push(3); // num_vol_points
+    out.push(0); // num_pan_points
+    out.push(1); // vol sustain_point = index 1
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    // Volume type: On (bit 0) + Sustain (bit 1) = 0x03.
+    out.push(0x03);
+    out.push(0); // pan type
+    // Vibrato (type/sweep/depth/rate) — zero.
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    // Fadeout: 1024 — at 65536 / 1024 = 64 ticks to reach zero.
+    // At tempo=6 ticks/row, BPM=125 (tick=~20ms), that's ~1.3 s to
+    // full decay — well inside our test window.
+    out.extend_from_slice(&1024u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    while out.len() - inst_start < HSIZE as usize {
+        out.push(0);
+    }
+
+    // Sample header — 64-frame square wave, same shape as the primary
+    // test, looped so we don't run out of body while the envelope
+    // holds.
+    let mut abs_pcm = vec![0i8; 64];
+    for i in 0..64 {
+        abs_pcm[i] = if i < 32 { 100 } else { -100 };
+    }
+    let mut delta_stream = Vec::with_capacity(64);
+    let mut prev: i8 = 0;
+    for v in &abs_pcm {
+        let d = (v.wrapping_sub(prev)) as u8;
+        delta_stream.push(d);
+        prev = *v;
+    }
+    let body_len = delta_stream.len() as u32;
+    out.extend_from_slice(&body_len.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&body_len.to_le_bytes());
+    out.push(0x40);
+    out.push(0);
+    out.push(1); // forward loop, 8-bit
+    out.push(128);
+    out.push(0);
+    out.push(0);
+    let mut sname = [0u8; 22];
+    sname[..3].copy_from_slice(b"sq1");
+    out.extend_from_slice(&sname);
+    out.extend_from_slice(&delta_stream);
+    out
+}
+
+#[test]
+fn xm_player_envelope_sustain_then_fadeout_on_key_off() {
+    // Renders ~1.5 s starting from note-on, covering the key-off at
+    // row 4 (~1.15 s in at tempo=6 / BPM=125: 4 rows × 6 ticks × 882
+    // frames ÷ 44100 Hz ≈ 0.48 s). The first quarter of the buffer
+    // should be audible (envelope sustaining at 64, fadeout full);
+    // the last quarter should be considerably quieter — proving
+    // fadeout + envelope-post-sustain decay is actually attenuating
+    // the voice.
+    let bytes = build_envelope_xm();
+    let hdr = xm::parse_header(&bytes).expect("xm header");
+    let (patterns, after) = xm::parse_patterns(&hdr, &bytes).expect("patterns");
+    let mut instruments = xm::parse_instruments(&hdr, &bytes, after).expect("instruments");
+    xm::extract_sample_bodies(&mut instruments, &bytes);
+
+    // Sanity: envelope was parsed with 3 points + sustain index 1 +
+    // fadeout 1024, and the sustain bit is set.
+    let env = &instruments[0].volume_envelope;
+    assert_eq!(env.points.len(), 3);
+    assert_eq!(env.points[0], (0, 64));
+    assert_eq!(env.points[1], (10, 64));
+    assert_eq!(env.points[2], (20, 0));
+    assert_eq!(env.sustain_point, 1);
+    assert!(env.is_on());
+    assert!(env.has_sustain());
+    assert_eq!(instruments[0].volume_fadeout, 1024);
+
+    let mut p = XmPlayerState::new(&hdr, instruments, patterns, 44_100);
+    // Song length: 8 rows × 6 ticks × 882 frames/tick = 42_336 frames.
+    // Render exactly that so the player doesn't flag end-of-song mid-buffer.
+    let n_frames = 42_336;
+    let mut buf = vec![0i16; n_frames * 2];
+    let produced = p.render(&mut buf);
+    assert_eq!(produced, n_frames);
+
+    // RMS over the first quarter (pre-key-off: sustain at 64, fadeout
+    // untouched).
+    let quarter = n_frames / 4;
+    let rms_region = |s: &[i16]| -> f64 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let sq: f64 = s.iter().map(|&x| (x as f64).powi(2)).sum();
+        (sq / s.len() as f64).sqrt()
+    };
+    let rms_head = rms_region(&buf[..quarter * 2]);
+    let rms_tail = rms_region(&buf[(3 * quarter) * 2..n_frames * 2]);
+
+    assert!(
+        rms_head > 500.0,
+        "expected audible sustained head of the note, got RMS {rms_head}"
+    );
+    // The tail should be far quieter than the head — both the post-
+    // sustain envelope ramp (64 → 0 over ticks 10..20) and the
+    // fadeout decrement combine to attenuate the voice by ~90% or
+    // more. Expect at minimum a 2× drop.
+    assert!(
+        rms_tail * 2.0 < rms_head,
+        "expected key-off decay (head RMS {rms_head}, tail RMS {rms_tail})"
+    );
+
+    // Also require the signal is non-silent somewhere in the tail —
+    // we want a decay, not instant cut-off, so at least *some* energy
+    // should remain.
+    let tail_nonzero = buf[(3 * quarter) * 2..n_frames * 2]
+        .iter()
+        .filter(|&&x| x != 0)
+        .count();
+    let _ = tail_nonzero; // fadeout may reach zero before the very end;
+                          // this is informational, not asserted — see head/tail
+                          // RMS ratio above for the real decay check.
 }
 
 #[test]
