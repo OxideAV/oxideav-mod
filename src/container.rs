@@ -205,10 +205,7 @@ fn probe_stm(p: &oxideav_container::ProbeData) -> u8 {
     0
 }
 
-fn open_stm(
-    mut input: Box<dyn ReadSeek>,
-    _codecs: &dyn CodecResolver,
-) -> Result<Box<dyn Demuxer>> {
+fn open_stm(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut blob = Vec::new();
     input.read_to_end(&mut blob)?;
     if blob.len() < stm::ORDER_TABLE_OFFSET + stm::ORDER_TABLE_SIZE {

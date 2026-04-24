@@ -41,7 +41,7 @@ fn build_minimal_xm() -> Vec<u8> {
     out[74..76].copy_from_slice(&1u16.to_le_bytes()); // flags: linear
     out[76..78].copy_from_slice(&6u16.to_le_bytes()); // tempo
     out[78..80].copy_from_slice(&125u16.to_le_bytes()); // bpm
-    // order[0] = 0, rest 0xFF
+                                                        // order[0] = 0, rest 0xFF
     for i in 1..xm::XM_ORDER_TABLE_SIZE {
         out[xm::XM_ORDER_TABLE_OFFSET + i] = 0xFF;
     }
@@ -81,7 +81,7 @@ fn build_minimal_xm() -> Vec<u8> {
 
     // Extended instrument block (file-offset +29 from inst_start):
     out.extend_from_slice(&xm::XM_SAMPLE_HEADER_SIZE.to_le_bytes()); // sample_header_size
-    // sample_map (96 bytes of zero).
+                                                                     // sample_map (96 bytes of zero).
     out.extend(vec![0u8; 96]);
     // Volume envelope: (0,0) + (32,64) — 2 points.
     let mut vol_env = [0u8; 48];

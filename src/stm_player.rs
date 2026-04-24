@@ -151,8 +151,7 @@ impl StmPlayerState {
                             c3_hz: body.c3_hz as f32,
                         };
                         let freq = pitch.note_to_freq(ch.note);
-                        let vol = (ch.volume as f32 / 64.0)
-                            * (self.global_volume as f32 / 64.0);
+                        let vol = (ch.volume as f32 / 64.0) * (self.global_volume as f32 / 64.0);
                         ch.voice.trigger(freq, vol);
                     }
                 }
@@ -288,7 +287,7 @@ fn apply_tickn_effect(ch: &mut StmChannel) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::{parse_header, parse_patterns, extract_samples};
+    use crate::stm::{extract_samples, parse_header, parse_patterns};
 
     /// Build a tiny STM file with a single note-on on row 0, channel 0.
     pub fn build_ping_stm() -> Vec<u8> {
@@ -320,7 +319,7 @@ mod tests {
         // Pattern 0: row 0 / ch 0 = note C-4 (octave 4, semitone 0), instrument 1.
         let mut pattern = vec![0u8; BYTES_PER_PATTERN];
         pattern[0] = 0x40; // octave 4, semitone 0
-        // vol_lo 0, instrument 1.
+                           // vol_lo 0, instrument 1.
         pattern[1] = 1 << 3;
         pattern[2] = 0;
         pattern[3] = 0;

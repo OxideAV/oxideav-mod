@@ -452,7 +452,10 @@ mod tests {
         }
 
         // Pattern block filled with zeros.
-        out.extend(std::iter::repeat_n(0u8, n_patterns as usize * BYTES_PER_PATTERN));
+        out.extend(std::iter::repeat_n(
+            0u8,
+            n_patterns as usize * BYTES_PER_PATTERN,
+        ));
 
         // Instrument 0 body: 4 signed bytes.
         out.extend([0x10u8, 0xF0, 0x40, 0xC0]);
@@ -540,7 +543,13 @@ mod tests {
         let pats = parse_patterns(&h, &bytes);
         let c = pats[0].rows[0][0];
         assert_eq!(c.note_raw, 0x40);
-        assert_eq!(c.kind(), StmNoteKind::Note { octave: 4, semitone: 0 });
+        assert_eq!(
+            c.kind(),
+            StmNoteKind::Note {
+                octave: 4,
+                semitone: 0
+            }
+        );
         assert_eq!(c.instrument, 3);
         assert_eq!(c.volume, (2 << 3) | 4);
         assert_eq!(c.command, 5);

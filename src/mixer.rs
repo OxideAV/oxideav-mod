@@ -282,11 +282,10 @@ pub enum XmPitchTable {
 /// corresponding to C-4, which is the centre of the XM keyboard).
 ///
 /// Formulas from `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt`:
-/// - Linear:  `Period = 10*12*16*4 - Note*16*4 - FineTune/2`,
-///            `Freq   = 8363 * 2 ^ ((6*12*16*4 - Period) / (12*16*4))`.
-/// - Amiga:   interpolate a 96-entry `PeriodTab` via
-///            `note % 12 * 8 + finetune/16`, then
-///            `Freq = 8363 * 1712 / Period`.
+/// - Linear: `Period = 10*12*16*4 - Note*16*4 - FineTune/2`,
+///   `Freq   = 8363 * 2 ^ ((6*12*16*4 - Period) / (12*16*4))`.
+/// - Amiga: interpolate a 96-entry `PeriodTab` via
+///   `note % 12 * 8 + finetune/16`, then `Freq = 8363 * 1712 / Period`.
 ///
 /// `Note` here is a pair `(real_note, finetune)` where `real_note` is
 /// `0..=118` (0 = C-0, 48 = C-4). The tracker-format code is responsible
@@ -298,7 +297,9 @@ pub struct XmPitch {
 
 impl Default for XmPitch {
     fn default() -> Self {
-        XmPitch { table: XmPitchTable::Amiga }
+        XmPitch {
+            table: XmPitchTable::Amiga,
+        }
     }
 }
 
@@ -315,6 +316,10 @@ impl XmPitch {
         570,567,563,559,555,551,547,543,538,535,532,528,524,520,516,513,
         508,505,502,498,494,491,487,484,480,477,474,470,467,463,460,457,
     ];
+
+    /// Public re-export of the period table for use by the XM player's
+    /// own period-based pitch math (vibrato / tone-porta in Amiga mode).
+    pub const PERIOD_TAB_PUB: [u16; 96] = Self::PERIOD_TAB;
 
     fn amiga_period(real_note: i32, finetune: i32) -> f32 {
         // finetune/16 can be negative; wrap index accordingly.
@@ -335,7 +340,8 @@ impl XmPitch {
 
     fn linear_period(real_note: i32, finetune: i32) -> f32 {
         // Period = 10*12*16*4 - Note*16*4 - FineTune/2;
-        let p = 10.0 * 12.0 * 16.0 * 4.0 - (real_note as f32) * 16.0 * 4.0 - (finetune as f32) / 2.0;
+        let p =
+            10.0 * 12.0 * 16.0 * 4.0 - (real_note as f32) * 16.0 * 4.0 - (finetune as f32) / 2.0;
         p.max(1.0)
     }
 }
@@ -378,16 +384,28 @@ mod tests {
     }
 
     impl SampleSource for TestSource {
-        fn len(&self) -> usize { self.pcm.len() }
-        fn loop_start(&self) -> usize { self.loop_start }
-        fn loop_end(&self) -> usize { self.loop_end }
-        fn loop_kind(&self) -> LoopKind { self.kind }
-        fn at(&self, idx: usize) -> f32 { self.pcm.get(idx).copied().unwrap_or(0.0) }
+        fn len(&self) -> usize {
+            self.pcm.len()
+        }
+        fn loop_start(&self) -> usize {
+            self.loop_start
+        }
+        fn loop_end(&self) -> usize {
+            self.loop_end
+        }
+        fn loop_kind(&self) -> LoopKind {
+            self.kind
+        }
+        fn at(&self, idx: usize) -> f32 {
+            self.pcm.get(idx).copied().unwrap_or(0.0)
+        }
     }
 
     #[test]
     fn amiga_period_pitch_matches_formula() {
-        let p = AmigaPeriodPitch { paula_clock: 3_546_894.6 };
+        let p = AmigaPeriodPitch {
+            paula_clock: 3_546_894.6,
+        };
         // Period 428 = classic C-2; expected rate ~8287.14
         let f = p.note_to_freq(428);
         assert!((f - 8287.14).abs() < 0.5, "got {f}");
@@ -395,7 +413,9 @@ mod tests {
 
     #[test]
     fn amiga_period_pitch_zero_means_silent() {
-        let p = AmigaPeriodPitch { paula_clock: 3_546_894.6 };
+        let p = AmigaPeriodPitch {
+            paula_clock: 3_546_894.6,
+        };
         assert_eq!(p.note_to_freq(0), 0.0);
     }
 
@@ -422,7 +442,9 @@ mod tests {
         // For XM, real_note 48 = C-4 corresponds to 8363 Hz under the
         // Linear table at finetune 0 (this is the XM convention:
         // `RelativeTone = 0` maps C-4 → sample's native 8363 Hz).
-        let p = XmPitch { table: XmPitchTable::Linear };
+        let p = XmPitch {
+            table: XmPitchTable::Linear,
+        };
         let f = p.note_to_freq((48, 0));
         assert!((f - 8363.0).abs() < 1.0, "got {f}");
     }
@@ -435,7 +457,9 @@ mod tests {
         // therefore don't pin an absolute reference frequency — we just
         // check the invariant that still matters: one XM octave really is
         // a 2× ratio in the output frequency.
-        let p = XmPitch { table: XmPitchTable::Amiga };
+        let p = XmPitch {
+            table: XmPitchTable::Amiga,
+        };
         let c4 = p.note_to_freq((48, 0));
         let c5 = p.note_to_freq((60, 0));
         assert!(c4 > 0.0);
@@ -444,7 +468,9 @@ mod tests {
 
     #[test]
     fn xm_linear_pitch_one_octave_doubles() {
-        let p = XmPitch { table: XmPitchTable::Linear };
+        let p = XmPitch {
+            table: XmPitchTable::Linear,
+        };
         let c4 = p.note_to_freq((48, 0));
         let c5 = p.note_to_freq((60, 0));
         assert!((c5 / c4 - 2.0).abs() < 1e-3);
@@ -460,7 +486,7 @@ mod tests {
         };
         let mut v = MixerVoice::default();
         v.trigger(44100.0, 1.0); // one sample-unit per render
-        // Render past the end.
+                                 // Render past the end.
         for _ in 0..10 {
             v.render_one(&src, 44100.0);
         }

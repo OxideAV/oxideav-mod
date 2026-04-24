@@ -132,7 +132,9 @@ fn stm_decoder_rejects_with_unsupported_but_is_constructible() {
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STM_STR));
-    let mut dec: Box<dyn Decoder> = reg.make_decoder(&params).expect("stm decoder constructible");
+    let mut dec: Box<dyn Decoder> = reg
+        .make_decoder(&params)
+        .expect("stm decoder constructible");
 
     let bytes = build_minimal_stm();
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
@@ -152,7 +154,9 @@ fn stm_decoder_rejects_non_stm_blob_as_invalid() {
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STM_STR));
-    let mut dec: Box<dyn Decoder> = reg.make_decoder(&params).expect("stm decoder constructible");
+    let mut dec: Box<dyn Decoder> = reg
+        .make_decoder(&params)
+        .expect("stm decoder constructible");
 
     // Zero blob — no 0x1A id byte, so is_stm returns false.
     let bytes = vec![0u8; 0x410];

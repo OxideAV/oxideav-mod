@@ -402,9 +402,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<XmHeader> {
         ));
     }
     if bytes[XM_ID_BYTE_OFFSET] != 0x1A {
-        return Err(Error::invalid(
-            "XM: missing 0x1A marker byte at offset 37",
-        ));
+        return Err(Error::invalid("XM: missing 0x1A marker byte at offset 37"));
     }
 
     let module_name = trim_fixed_string(&bytes[17..37]);
@@ -442,8 +440,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<XmHeader> {
         XmFrequencyTable::Amiga
     };
 
-    let order =
-        bytes[XM_ORDER_TABLE_OFFSET..XM_ORDER_TABLE_OFFSET + XM_ORDER_TABLE_SIZE].to_vec();
+    let order = bytes[XM_ORDER_TABLE_OFFSET..XM_ORDER_TABLE_OFFSET + XM_ORDER_TABLE_SIZE].to_vec();
 
     Ok(XmHeader {
         module_name,
@@ -584,7 +581,9 @@ pub fn parse_patterns(header: &XmHeader, bytes: &[u8]) -> Result<(Vec<XmPattern>
                 rows.push(vec![XmCell::default(); num_channels]);
             }
         } else {
-            let data_end = data_start.saturating_add(packed_size as usize).min(bytes.len());
+            let data_end = data_start
+                .saturating_add(packed_size as usize)
+                .min(bytes.len());
             let slice = &bytes[data_start..data_end];
             let mut inner = 0usize;
             for _ in 0..num_rows {
@@ -806,9 +805,8 @@ pub fn parse_instruments(
     let mut out = Vec::with_capacity(header.num_instruments as usize);
     let mut cur = instruments_offset;
     for i in 0..header.num_instruments as usize {
-        let (inst, _next) = parse_one_instrument(bytes, cur).map_err(|e| {
-            Error::invalid(format!("XM: failed to parse instrument #{i}: {e}"))
-        })?;
+        let (inst, _next) = parse_one_instrument(bytes, cur)
+            .map_err(|e| Error::invalid(format!("XM: failed to parse instrument #{i}: {e}")))?;
         // Advance to the byte just past all sample bodies of this
         // instrument. Sample headers live between `header_size`-end and
         // `inst.sample_data_offset`; PCM bodies of length
@@ -877,7 +875,10 @@ pub fn estimate_duration_micros(header: &XmHeader, patterns: &[XmPattern]) -> i6
     let mut total_rows: u64 = 0;
     for idx in 0..song_length {
         let pat_idx = *header.order.get(idx).unwrap_or(&0) as usize;
-        let rows = patterns.get(pat_idx).map(|p| p.num_rows as u64).unwrap_or(64);
+        let rows = patterns
+            .get(pat_idx)
+            .map(|p| p.num_rows as u64)
+            .unwrap_or(64);
         total_rows = total_rows.saturating_add(rows);
     }
     // microseconds = rows * tempo (ticks/row) * 1e6 / ticks/sec.
@@ -920,7 +921,7 @@ mod tests {
         out[74..76].copy_from_slice(&flags.to_le_bytes());
         out[76..78].copy_from_slice(&6u16.to_le_bytes()); // default tempo
         out[78..80].copy_from_slice(&125u16.to_le_bytes()); // default BPM
-        // order[0] = 0, rest stays 0 or we write 255 like STM does
+                                                            // order[0] = 0, rest stays 0 or we write 255 like STM does
         for i in 1..XM_ORDER_TABLE_SIZE {
             out[XM_ORDER_TABLE_OFFSET + i] = 0xFF;
         }
@@ -1169,7 +1170,10 @@ mod tests {
 
     #[test]
     fn xm_volume_kinds_classify_correctly() {
-        let mk = |v: u8| XmCell { volume: v, ..XmCell::default() };
+        let mk = |v: u8| XmCell {
+            volume: v,
+            ..XmCell::default()
+        };
         assert_eq!(mk(0).volume_kind(), XmVolume::Empty);
         assert_eq!(mk(0x10).volume_kind(), XmVolume::SetVolume(0));
         assert_eq!(mk(0x50).volume_kind(), XmVolume::SetVolume(0x40));
@@ -1246,8 +1250,7 @@ mod tests {
         bytes.truncate(bytes.len() - drop);
 
         let h = parse_header(&bytes).unwrap();
-        let mut insts =
-            parse_instruments(&h, &bytes, pattern_data_offset(&h)).unwrap();
+        let mut insts = parse_instruments(&h, &bytes, pattern_data_offset(&h)).unwrap();
         extract_sample_bodies(&mut insts, &bytes);
         assert_eq!(insts[0].samples[0].pcm8.len(), body_bytes.len() - drop);
     }
