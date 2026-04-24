@@ -31,6 +31,21 @@
 //!   `unsupported` error and callers should drive playback off the
 //!   [`stm::parse_header`] / [`stm::parse_patterns`] / [`stm::extract_samples`]
 //!   helpers directly.
+//! - A **container** (`xm`) that recognises FastTracker 2 Extended
+//!   Module files by the 17-byte `"Extended Module: "` ASCII banner at
+//!   offset 0. Parses the 336-byte file header (banner, module/tracker
+//!   names, version, header size, song length, restart position,
+//!   channel / pattern / instrument counts, frequency-table flag,
+//!   default tempo / BPM, 256-entry order table), the variable-length
+//!   bit-packed patterns (note / instrument / volume-column / effect /
+//!   effect-param, each optional per mask byte), and the instrument
+//!   table (per-note sample mapping, volume + panning envelopes, vibrato
+//!   state, fadeout, multiple samples per instrument with delta-encoded
+//!   8- or 16-bit PCM bodies). Playback is not wired through the MOD
+//!   mixer yet (XM has a broader pitch / envelope model than MOD), so
+//!   [`CODEC_ID_XM_STR`] = `"xm"` is a parsing-only entry point — use
+//!   [`xm::parse_header`] / [`xm::parse_patterns`] / [`xm::parse_instruments`]
+//!   / [`xm::extract_sample_bodies`] directly for structural access.
 //!
 //! The tracker convention of exposing per-channel streams alongside a
 //! mixed stereo mix is shared across tracker formats — see
@@ -44,6 +59,7 @@ pub mod header;
 pub mod player;
 pub mod samples;
 pub mod stm;
+pub mod xm;
 
 use oxideav_codec::CodecRegistry;
 use oxideav_container::ContainerRegistry;
@@ -56,6 +72,9 @@ pub const CODEC_ID_PLANAR_STR: &str = "mod_planar";
 
 /// Codec id for the STM (Scream Tracker v1) parsing-only decoder.
 pub const CODEC_ID_STM_STR: &str = "stm";
+
+/// Codec id for the XM (FastTracker 2 Extended Module) parsing-only decoder.
+pub const CODEC_ID_XM_STR: &str = "xm";
 
 pub fn register_codecs(reg: &mut CodecRegistry) {
     decoder::register(reg);

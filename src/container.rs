@@ -16,6 +16,7 @@ use oxideav_core::{
 
 use crate::header::parse_header;
 use crate::stm;
+use crate::xm;
 
 /// Output sample rate used by the decoder. 44.1 kHz is a common choice
 /// that matches most "modern" MOD players; the Amiga Paula chip ran at
@@ -32,6 +33,15 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("stm", open_stm);
     reg.register_extension("stm", "stm");
     reg.register_probe("stm", probe_stm);
+
+    // FastTracker 2 (.xm) registration — single-packet demuxer guarded
+    // by the 17-byte "Extended Module: " banner probe. The codec id is
+    // a parsing-only stub today (see `make_xm_stub_decoder` in the
+    // decoder module); callers drive playback off the `xm::parse_*`
+    // helpers directly.
+    reg.register_demuxer("xm", open_xm);
+    reg.register_extension("xm", "xm");
+    reg.register_probe("xm", probe_xm);
 }
 
 /// ProTracker / Soundtracker family signature at offset 1080 — a 4-byte
@@ -276,6 +286,140 @@ struct StmDemuxer {
 impl Demuxer for StmDemuxer {
     fn format_name(&self) -> &str {
         "stm"
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        if self.consumed {
+            return Err(Error::Eof);
+        }
+        self.consumed = true;
+        let data = std::mem::take(&mut self.blob);
+        let stream = &self.streams[0];
+        let mut pkt = Packet::new(0, stream.time_base, data);
+        pkt.pts = Some(0);
+        pkt.dts = Some(0);
+        pkt.flags.keyframe = true;
+        Ok(pkt)
+    }
+
+    fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        if self.duration_micros > 0 {
+            Some(self.duration_micros)
+        } else {
+            None
+        }
+    }
+}
+
+/// FastTracker 2 (.xm) probe: the canonical signature is the 17-byte
+/// `"Extended Module: "` ASCII banner at offset 0 (capital M, trailing
+/// colon+space — per `FastTracker-2-xm-alt.txt`, lowercase is rejected
+/// by FT2 itself). Extension-only match is a weak fallback.
+fn probe_xm(p: &oxideav_container::ProbeData) -> u8 {
+    if xm::is_xm(p.buf) {
+        return 100;
+    }
+    if p.ext == Some("xm") && p.buf.len() >= xm::XM_MIN_HEADER_LEN {
+        return 25;
+    }
+    0
+}
+
+fn open_xm(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    let mut blob = Vec::new();
+    input.read_to_end(&mut blob)?;
+    if blob.len() < xm::XM_MIN_HEADER_LEN {
+        return Err(Error::invalid(
+            "XM: file shorter than 336-byte banner+header+order block",
+        ));
+    }
+    let header = xm::parse_header(&blob)?;
+
+    let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_XM_STR));
+    params.media_type = MediaType::Audio;
+    params.channels = Some(2); // mixed stereo output (once playback lands)
+    params.sample_rate = Some(OUTPUT_SAMPLE_RATE);
+    params.sample_format = Some(SampleFormat::S16);
+    params.extradata = blob.clone();
+
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+
+    // Duration estimate is best-effort: walk patterns once (cheaply) to
+    // get row counts. If pattern parsing hiccups we just leave the
+    // duration unset rather than error out of container open.
+    let duration_micros = match xm::parse_patterns(&header, &blob) {
+        Ok((pats, _)) => xm::estimate_duration_micros(&header, &pats),
+        Err(_) => 0,
+    };
+
+    let metadata = build_xm_metadata(&header);
+
+    Ok(Box::new(XmDemuxer {
+        streams: vec![stream],
+        blob,
+        consumed: false,
+        metadata,
+        duration_micros,
+        _header: header,
+    }))
+}
+
+fn build_xm_metadata(h: &xm::XmHeader) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if !h.module_name.is_empty() {
+        out.push(("title".into(), h.module_name.clone()));
+    }
+    if !h.tracker_name.is_empty() {
+        out.push(("tracker".into(), h.tracker_name.clone()));
+    }
+    let freq = match h.frequency_table {
+        xm::XmFrequencyTable::Amiga => "amiga",
+        xm::XmFrequencyTable::Linear => "linear",
+    };
+    out.push((
+        "extra_info".into(),
+        format!(
+            "{} channels, {} patterns, {} instruments, song_len={}, restart={}, tempo={}, bpm={}, freq={}, version=0x{:04X}",
+            h.num_channels,
+            h.num_patterns,
+            h.num_instruments,
+            h.song_length,
+            h.restart_position,
+            h.default_tempo,
+            h.default_bpm,
+            freq,
+            h.version,
+        ),
+    ));
+    out
+}
+
+struct XmDemuxer {
+    streams: Vec<StreamInfo>,
+    blob: Vec<u8>,
+    consumed: bool,
+    metadata: Vec<(String, String)>,
+    duration_micros: i64,
+    _header: xm::XmHeader,
+}
+
+impl Demuxer for XmDemuxer {
+    fn format_name(&self) -> &str {
+        "xm"
     }
 
     fn streams(&self) -> &[StreamInfo] {
