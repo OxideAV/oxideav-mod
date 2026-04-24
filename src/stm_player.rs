@@ -5,16 +5,37 @@
 //! rather than Amiga periods (see [`crate::mixer::StmC3Pitch`]) and
 //! ProTracker-like effect columns.
 //!
-//! This player covers the minimum needed to emit audible PCM:
-//!  - Row / tick scheduling with a ProTracker-style `speed` (ticks/row).
-//!  - Note triggering with sample change + volume override.
-//!  - Volume as encoded in the STM cell byte (0..=64).
-//!  - A handful of effects (Cxx set-volume, Axx volume-slide).
+//! Effects implemented (round 9):
 //!
-//! Effects that mutate pitch (Exx, Fxx-ish tone porta, arpeggio) are
-//! not implemented here; notes play at the sample's C3 frequency for
-//! their full row. This is explicitly the first audible milestone; the
-//! shared core means adding effects later is local work.
+//!  - Cxx: set volume.
+//!  - Axy: volume slide (+x per tick, else -y).
+//!  - Fxx: set speed / tempo (<0x20 = speed, >=0x20 = tempo).
+//!  - Bxy: order / position jump.
+//!  - Dxy: pattern break (FT2-style decimal `x*10+y` landing row —
+//!    matches XM parity; STM files in the wild typically encode row 0
+//!    as plain `D00` so the decimal quirk is a non-issue in practice).
+//!  - 1xy: porta up — shift pitch up by `p` units per tick.
+//!  - 2xy: porta down — shift pitch down.
+//!  - 3xy: tone portamento — glide semitone-offset toward the target
+//!    note without retriggering; per-channel `porta_target` + memory.
+//!  - 4xy: vibrato — sine LFO on pitch in semitone units; per-nibble
+//!    speed + depth memory.
+//!  - 5xy: tone porta + volume slide (combined).
+//!  - 6xy: vibrato + volume slide.
+//!  - Exy subcommands: E1x / E2x fine porta, EA x / EB x fine volume
+//!    slide, EC x note cut, ED x note delay.
+//!
+//! STM lacks period representation (pitch is derived from C3 Hz and a
+//! `(octave, semitone)` token), so pitch effects operate in the
+//! **semitone** domain:
+//!
+//!   `freq = base_c3_hz * 2 ^ ((cur_semitone_offset - 3*12) / 12)`
+//!
+//! where `cur_semitone_offset` is a fractional semitone count measured
+//! from C-0. Porta "period units" in STM are very loose; we treat the
+//! ProTracker-style parameter as *centisemitones* (1 unit = 1/16 of a
+//! semitone) which gives musically-plausible slide rates — a 3xy speed
+//! of 0x80 traverses an octave in ~12 ticks.
 
 use crate::mixer::{MixerVoice, PitchModel, StmC3Pitch};
 use crate::stm::{
@@ -25,6 +46,45 @@ use crate::stm::{
 /// ticks-per-row and BPM-equivalent values; we keep the MOD defaults
 /// unless the file overrides them.
 pub const DEFAULT_SPEED_TICKS: u8 = 6;
+
+/// 64-entry signed sine table for vibrato — one quarter-wave reaches
+/// ±127 at indices 16 and 48. Matches the XM vibrato table so the STM
+/// and XM vibrato implementations behave identically.
+#[rustfmt::skip]
+const SINE_TABLE: [i8; 64] = [
+      0,  12,  25,  37,  49,  60,  71,  81,
+     90,  98, 106, 112, 117, 122, 125, 126,
+    127, 126, 125, 122, 117, 112, 106,  98,
+     90,  81,  71,  60,  49,  37,  25,  12,
+      0, -12, -25, -37, -49, -60, -71, -81,
+    -90, -98,-106,-112,-117,-122,-125,-126,
+   -127,-126,-125,-122,-117,-112,-106, -98,
+    -90, -81, -71, -60, -49, -37, -25, -12,
+];
+
+/// Number of "porta units" per semitone. ProTracker's porta parameters
+/// are in Amiga period units, where one semitone ≈ 38 units near C-4.
+/// STM has no periods, so we pick a scale that matches musical
+/// expectations: `SEMITONE_UNITS = 16` means a 3xy speed of 16 walks
+/// exactly one semitone per tick, so speed 0x08 ≈ half a semitone.
+const SEMITONE_UNITS: f32 = 16.0;
+
+/// Convert a `(octave, semitone)` note into a continuous semitone index
+/// from C-0. `real = octave*12 + semitone`. STM encodes octave in the
+/// high nibble and semitone in the low nibble.
+fn note_to_semis(octave: u8, semitone: u8) -> f32 {
+    (octave as f32) * 12.0 + (semitone as f32)
+}
+
+/// Convert a fractional semitone index from C-0 into a playback
+/// frequency using the given C3 reference Hz. The STM pitch model
+/// maps (octave=3, semitone=0) → c3_hz, so we subtract 3 octaves.
+fn semis_to_freq(c3_hz: f32, semis_from_c0: f32) -> f32 {
+    if c3_hz <= 0.0 {
+        return 0.0;
+    }
+    c3_hz * 2.0f32.powf((semis_from_c0 - 3.0 * 12.0) / 12.0)
+}
 
 /// Per-channel playback state for STM.
 #[derive(Clone, Debug, Default)]
@@ -41,6 +101,40 @@ pub struct StmChannel {
     pub effect: u8,
     /// Current effect parameter.
     pub effect_param: u8,
+
+    // -------- pitch state (semitone-space) --------
+    /// Current live semitone index (fractional, measured from C-0).
+    /// Porta / vibrato / fine porta all mutate this; the voice
+    /// frequency is derived from it every tick.
+    pub cur_semis: f32,
+    /// Target semitone index for tone portamento (3xy / 5xy).
+    pub porta_target_semis: f32,
+    /// Tone-porta speed memory (shared between 3xy and 5xy).
+    pub porta_speed: u8,
+    /// 1xy / 2xy memory — last non-zero parameter (shared).
+    pub porta_updown_mem: u8,
+    /// Vibrato sine-table position 0..=63.
+    pub vib_pos: u8,
+    /// Vibrato speed memory (last non-zero 4xy `x` nibble).
+    pub vib_speed: u8,
+    /// Vibrato depth memory (last non-zero 4xy `y` nibble).
+    pub vib_depth: u8,
+    /// Axy volume-slide parameter memory (shared with 5xy / 6xy).
+    pub vol_slide_mem: u8,
+
+    // -------- scheduling --------
+    /// Pending note-cut tick (ECx): if >0, volume forced to 0 on that
+    /// tick.
+    pub note_cut_tick: u8,
+    /// Pending note-delay tick (EDx): if >0, the cell's note is
+    /// triggered on this tick instead of tick 0.
+    pub note_delay_tick: u8,
+    /// Saved trigger data for a pending note-delay.
+    pub pending_note: (u8, u8),
+    pub pending_instrument: u8,
+    pub pending_volume: u8,
+    /// True if the pending note-delay slot is populated.
+    pub has_pending_delay: bool,
 }
 
 /// STM player — owns decoded patterns / samples and a
@@ -61,6 +155,13 @@ pub struct StmPlayerState {
     pub tick_sample_cursor: u32,
     pub ended: bool,
     pub global_volume: u8,
+
+    /// Pending pattern jump (Bxy): set on tick 0 of a row, consumed by
+    /// `next_row`.
+    pub pending_order_jump: Option<u8>,
+    /// Pending pattern-break row (Dxy): set on tick 0, consumed by
+    /// `next_row`.
+    pub pending_break_row: Option<u8>,
 }
 
 impl StmPlayerState {
@@ -92,6 +193,8 @@ impl StmPlayerState {
             tick_sample_cursor: 0,
             ended: false,
             global_volume: header.global_volume.max(1),
+            pending_order_jump: None,
+            pending_break_row: None,
         }
     }
 
@@ -121,6 +224,14 @@ impl StmPlayerState {
             let ch = &mut self.channels[ch_idx];
             ch.effect = cell.command;
             ch.effect_param = cell.command_param;
+            // Reset per-row scheduling.
+            ch.note_cut_tick = 0;
+            ch.note_delay_tick = 0;
+            ch.has_pending_delay = false;
+
+            // Tone-porta detection: 3xy / 5xy turn the note (if any)
+            // into a glide target, not a retrigger.
+            let is_tone_porta_cell = cell.command == 0x3 || cell.command == 0x5;
 
             // Sample change — update the current instrument and pull
             // volume from the sample body.
@@ -131,28 +242,82 @@ impl StmPlayerState {
                 }
             }
 
-            // Cell volume overrides sample default (STM encodes volume
-            // 0..=64 in the combined vol_lo|vol_hi field; the parser
-            // already clamped it to 0..=64).
+            // Cell volume overrides sample default.
             if cell.volume > 0 && cell.volume <= 64 {
                 ch.volume = cell.volume;
+            }
+
+            // Memorise effect parameters (zero nibble = reuse last).
+            let ep = ch.effect_param;
+            match ch.effect {
+                0x1 | 0x2 => {
+                    if ep != 0 {
+                        ch.porta_updown_mem = ep;
+                    }
+                }
+                0x3 => {
+                    if ep != 0 {
+                        ch.porta_speed = ep;
+                    }
+                }
+                0x4 => {
+                    let vx = ep >> 4;
+                    let vy = ep & 0x0F;
+                    if vx != 0 {
+                        ch.vib_speed = vx;
+                    }
+                    if vy != 0 {
+                        ch.vib_depth = vy;
+                    }
+                }
+                0x5 | 0x6 | 0xA => {
+                    if ep != 0 {
+                        ch.vol_slide_mem = ep;
+                    }
+                }
+                _ => {}
             }
 
             // Note trigger.
             match cell.kind() {
                 StmNoteKind::Note { octave, semitone } if semitone <= 11 => {
-                    ch.note = (octave, semitone);
-                    let inst_idx = match (ch.instrument as usize).checked_sub(1) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    if let Some(body) = self.samples.get(inst_idx) {
-                        let pitch = StmC3Pitch {
-                            c3_hz: body.c3_hz as f32,
-                        };
-                        let freq = pitch.note_to_freq(ch.note);
-                        let vol = (ch.volume as f32 / 64.0) * (self.global_volume as f32 / 64.0);
-                        ch.voice.trigger(freq, vol);
+                    let target = note_to_semis(octave, semitone);
+                    if is_tone_porta_cell && ch.voice.active && ch.cur_semis > 0.0 {
+                        // Set glide target without retriggering; keep
+                        // current cur_semis so the slide starts from
+                        // wherever we are.
+                        ch.note = (octave, semitone);
+                        ch.porta_target_semis = target;
+                    } else {
+                        ch.note = (octave, semitone);
+                        let is_delay = cell.command == 0xE
+                            && (cell.command_param >> 4) == 0xD
+                            && (cell.command_param & 0x0F) != 0;
+                        if is_delay {
+                            ch.note_delay_tick = cell.command_param & 0x0F;
+                            ch.pending_note = (octave, semitone);
+                            ch.pending_instrument = cell.instrument;
+                            ch.pending_volume = cell.volume;
+                            ch.has_pending_delay = true;
+                        } else {
+                            let inst_idx = match (ch.instrument as usize).checked_sub(1) {
+                                Some(i) => i,
+                                None => continue,
+                            };
+                            if let Some(body) = self.samples.get(inst_idx) {
+                                let pitch = StmC3Pitch {
+                                    c3_hz: body.c3_hz as f32,
+                                };
+                                let freq = pitch.note_to_freq(ch.note);
+                                let vol =
+                                    (ch.volume as f32 / 64.0) * (self.global_volume as f32 / 64.0);
+                                ch.voice.trigger(freq, vol);
+                                ch.cur_semis = target;
+                                ch.porta_target_semis = target;
+                                // Fresh note resets vibrato phase.
+                                ch.vib_pos = 0;
+                            }
+                        }
                     }
                 }
                 StmNoteKind::DashNote | StmNoteKind::Dots => {
@@ -163,18 +328,33 @@ impl StmPlayerState {
             }
 
             // Tick-0 effects.
-            apply_tick0_effect(ch, cell.command, cell.command_param);
+            apply_tick0_effect(ch);
         }
 
-        // Speed change Axx at tick 0? STM uses ProTracker-like Axx for
-        // volume slide, Fxx for speed. Apply Fxx globally (like MOD).
+        // Row-level song-state effects: Bxy / Dxy / Fxx.
         for ch in self.channels.iter() {
-            if ch.effect == 0xF && ch.effect_param != 0 {
-                if ch.effect_param < 0x20 {
-                    self.speed = ch.effect_param;
-                } else {
-                    self.tempo = ch.effect_param;
+            match ch.effect {
+                0xB => {
+                    self.pending_order_jump = Some(ch.effect_param);
+                    if self.pending_break_row.is_none() {
+                        self.pending_break_row = Some(0);
+                    }
                 }
+                0xD => {
+                    // FT2-style decimal row (matches XM parity).
+                    let row = (ch.effect_param >> 4) * 10 + (ch.effect_param & 0x0F);
+                    self.pending_break_row = Some(row.min((PATTERN_ROWS - 1) as u8));
+                }
+                0xF => {
+                    if ch.effect_param == 0 {
+                        self.ended = true;
+                    } else if ch.effect_param < 0x20 {
+                        self.speed = ch.effect_param;
+                    } else {
+                        self.tempo = ch.effect_param;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -187,9 +367,104 @@ impl StmPlayerState {
                 apply_tickn_effect(ch);
             }
         }
+
+        // Per-tick pitch recompute: vibrato + (schedule-based) note
+        // cut / note delay. Runs on every tick (including tick 0).
+        let cur_tick = self.tick;
+        let global_vol = self.global_volume;
+        for ch_idx in 0..STM_CHANNELS {
+            let ch = &mut self.channels[ch_idx];
+
+            // Note cut: force volume to 0 at tick x.
+            if ch.note_cut_tick > 0 && cur_tick == ch.note_cut_tick {
+                ch.volume = 0;
+            }
+
+            // Note delay: trigger voice at tick x.
+            if ch.has_pending_delay && ch.note_delay_tick > 0 && cur_tick == ch.note_delay_tick {
+                let inst = ch.pending_instrument;
+                if inst != 0 {
+                    ch.instrument = inst;
+                }
+                let (po, ps) = ch.pending_note;
+                let idx = ch.instrument.saturating_sub(1) as usize;
+                if ch.pending_volume > 0 && ch.pending_volume <= 64 {
+                    ch.volume = ch.pending_volume;
+                }
+                if let Some(body) = self.samples.get(idx) {
+                    let pitch = StmC3Pitch {
+                        c3_hz: body.c3_hz as f32,
+                    };
+                    let freq = pitch.note_to_freq((po, ps));
+                    let vol = (ch.volume as f32 / 64.0) * (global_vol as f32 / 64.0);
+                    ch.voice.trigger(freq, vol);
+                    ch.note = (po, ps);
+                    ch.cur_semis = note_to_semis(po, ps);
+                    ch.porta_target_semis = ch.cur_semis;
+                    ch.vib_pos = 0;
+                }
+                ch.has_pending_delay = false;
+                ch.note_delay_tick = 0;
+            }
+
+            // Derive the voice frequency from the current semitone state
+            // plus any live vibrato offset.
+            let mut semis = ch.cur_semis;
+            let vib_active = (ch.effect == 0x4 || ch.effect == 0x6) && ch.vib_depth > 0;
+            if vib_active {
+                let lfo = SINE_TABLE[(ch.vib_pos & 0x3F) as usize] as f32;
+                // Peak deviation: depth * 16 / 128 / SEMITONE_UNITS semitones
+                // Simplify: (lfo / 128) * depth * 16 / SEMITONE_UNITS.
+                // With SEMITONE_UNITS=16, this is (lfo/128)*depth — i.e.
+                // depth=15 gives ≈ ±15/128 ≈ ±0.117 semitones peak which
+                // is much too subtle; XM uses a wider depth. Match XM:
+                // treat (depth * sine / 32) as period-unit offset, convert
+                // period-units-to-semitones by dividing by SEMITONE_UNITS.
+                let off_units = (lfo * ch.vib_depth as f32) / 32.0;
+                let off_semis = off_units / SEMITONE_UNITS;
+                semis += off_semis;
+                if cur_tick > 0 {
+                    ch.vib_pos = ch.vib_pos.wrapping_add(ch.vib_speed.wrapping_mul(4)) & 0x3F;
+                }
+            }
+
+            // If the channel is actively playing, recompute the voice
+            // frequency from the (possibly-modulated) semitone position.
+            let inst_idx = ch.instrument.saturating_sub(1) as usize;
+            if let Some(body) = self.samples.get(inst_idx) {
+                if ch.voice.active && ch.cur_semis > 0.0 {
+                    let new_freq = semis_to_freq(body.c3_hz as f32, semis);
+                    if new_freq > 0.0 {
+                        ch.voice.freq = new_freq;
+                    }
+                }
+            }
+
+            // Update the voice volume scalar (in case Axy / Exx modified
+            // `ch.volume` this tick).
+            ch.voice.volume = (ch.volume as f32 / 64.0) * (global_vol as f32 / 64.0);
+        }
     }
 
     fn next_row(&mut self) {
+        // Consume pending Bxy / Dxy.
+        if let Some(order) = self.pending_order_jump.take() {
+            self.order_index = order as usize;
+            self.row = self.pending_break_row.take().unwrap_or(0);
+            if self.order_index >= self.order.len() {
+                self.ended = true;
+            }
+            return;
+        }
+        if let Some(row) = self.pending_break_row.take() {
+            self.row = row;
+            self.order_index += 1;
+            if self.order_index >= self.order.len() {
+                self.ended = true;
+            }
+            return;
+        }
+
         self.row += 1;
         if (self.row as usize) >= PATTERN_ROWS {
             self.row = 0;
@@ -260,27 +535,130 @@ impl StmPlayerState {
     }
 }
 
-fn apply_tick0_effect(ch: &mut StmChannel, effect: u8, param: u8) {
-    // Cxx: set volume.
-    if effect == 0xC {
-        ch.volume = param.min(64);
-        ch.voice.volume = ch.volume as f32 / 64.0;
+/// Run tick-0 portion of effects: set-volume, Exy subcommands (fine
+/// porta, fine volume slide, note cut/delay scheduling).
+fn apply_tick0_effect(ch: &mut StmChannel) {
+    let ep = ch.effect_param;
+    let x = ep >> 4;
+    let y = ep & 0x0F;
+    match ch.effect {
+        0xC => {
+            // Cxx: set volume.
+            ch.volume = ep.min(64);
+        }
+        0xE => {
+            // Exy subcommands.
+            match x {
+                0x1 => {
+                    // E1x: fine porta up (tick 0 only) — shift
+                    // semitone-position up by `y / SEMITONE_UNITS`.
+                    if y != 0 {
+                        ch.cur_semis += y as f32 / SEMITONE_UNITS;
+                    }
+                }
+                0x2 => {
+                    // E2x: fine porta down.
+                    if y != 0 {
+                        ch.cur_semis = (ch.cur_semis - y as f32 / SEMITONE_UNITS).max(0.0);
+                    }
+                }
+                0xA => {
+                    // EAx: fine volume slide up.
+                    ch.volume = (ch.volume as u16 + y as u16).min(64) as u8;
+                }
+                0xB => {
+                    // EBx: fine volume slide down.
+                    ch.volume = ch.volume.saturating_sub(y);
+                }
+                0xC => {
+                    // ECx: note cut at tick x (0 = immediate).
+                    if y == 0 {
+                        ch.volume = 0;
+                    } else {
+                        ch.note_cut_tick = y;
+                    }
+                }
+                0xD => {
+                    // EDx: note delay — handled in enter_row by routing
+                    // the trigger through `pending_*` + `note_delay_tick`.
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }
 
+/// Run per-tick effects (ticks > 0): continuous pitch slides + volume
+/// slides. Vibrato motion is applied in `advance_tick` alongside the
+/// pitch recompute so it can stack with tone-porta.
 fn apply_tickn_effect(ch: &mut StmChannel) {
     let effect = ch.effect;
-    let param = ch.effect_param;
-    let x = param >> 4;
-    let y = param & 0x0F;
-    // Axy: volume slide. +x or -y per tick.
-    if effect == 0xA {
-        if x != 0 {
-            ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
-        } else if y != 0 {
-            ch.volume = ch.volume.saturating_sub(y);
+    let ep = ch.effect_param;
+    let x = ep >> 4;
+    let y = ep & 0x0F;
+    match effect {
+        0x1 => {
+            // 1xy: porta up.
+            let p = if ep != 0 { ep } else { ch.porta_updown_mem };
+            if p != 0 {
+                ch.cur_semis += p as f32 / SEMITONE_UNITS;
+            }
         }
-        ch.voice.volume = ch.volume as f32 / 64.0;
+        0x2 => {
+            // 2xy: porta down.
+            let p = if ep != 0 { ep } else { ch.porta_updown_mem };
+            if p != 0 {
+                ch.cur_semis = (ch.cur_semis - p as f32 / SEMITONE_UNITS).max(0.0);
+            }
+        }
+        0x3 => {
+            // 3xy: tone porta — glide toward target.
+            let speed = (ch.porta_speed as f32) / SEMITONE_UNITS;
+            if (ch.cur_semis - ch.porta_target_semis).abs() <= speed {
+                ch.cur_semis = ch.porta_target_semis;
+            } else if ch.cur_semis < ch.porta_target_semis {
+                ch.cur_semis += speed;
+            } else {
+                ch.cur_semis -= speed;
+            }
+        }
+        0x5 => {
+            // 5xy: tone porta + volume slide.
+            let speed = (ch.porta_speed as f32) / SEMITONE_UNITS;
+            if (ch.cur_semis - ch.porta_target_semis).abs() <= speed {
+                ch.cur_semis = ch.porta_target_semis;
+            } else if ch.cur_semis < ch.porta_target_semis {
+                ch.cur_semis += speed;
+            } else {
+                ch.cur_semis -= speed;
+            }
+            apply_vol_slide(ch, ch.vol_slide_mem);
+        }
+        0x6 => {
+            // 6xy: vibrato + volume slide. Vibrato motion is in
+            // advance_tick; the vol-slide piece is applied here.
+            apply_vol_slide(ch, ch.vol_slide_mem);
+        }
+        0xA => {
+            // Axy: volume slide.
+            if x != 0 {
+                ch.volume = (ch.volume as u16 + x as u16).min(64) as u8;
+            } else if y != 0 {
+                ch.volume = ch.volume.saturating_sub(y);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_vol_slide(ch: &mut StmChannel, mem: u8) {
+    let hi = mem >> 4;
+    let lo = mem & 0x0F;
+    if hi != 0 {
+        ch.volume = (ch.volume as u16 + hi as u16).min(64) as u8;
+    } else if lo != 0 {
+        ch.volume = ch.volume.saturating_sub(lo);
     }
 }
 
@@ -346,5 +724,20 @@ mod tests {
         assert_eq!(produced, 4410);
         let nonzero = buf.iter().filter(|&&x| x != 0).count();
         assert!(nonzero > 100, "expected audible PCM, got {nonzero} nonzero");
+    }
+
+    #[test]
+    fn note_to_semis_places_c3_at_36() {
+        assert_eq!(note_to_semis(3, 0), 36.0);
+        assert_eq!(note_to_semis(4, 0), 48.0);
+        assert_eq!(note_to_semis(4, 7), 55.0);
+    }
+
+    #[test]
+    fn semis_to_freq_round_trips_c3() {
+        let f = semis_to_freq(8363.0, 36.0);
+        assert!((f - 8363.0).abs() < 0.5);
+        let f = semis_to_freq(8363.0, 48.0);
+        assert!((f - 16726.0).abs() < 1.0);
     }
 }
