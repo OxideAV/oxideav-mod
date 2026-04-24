@@ -50,6 +50,21 @@ pub fn register(reg: &mut CodecRegistry) {
             .capabilities(planar_caps)
             .decoder(make_planar_decoder),
     );
+
+    // STM — parsing-only decoder. Emits a clear `unsupported` error on
+    // `send_packet`; structural inspection (title, patterns, instruments)
+    // is available through `oxideav_mod::stm::parse_header` etc.
+    let stm_caps = CodecCapabilities::audio("stm_sw")
+        .with_lossy(false)
+        .with_lossless(true)
+        .with_intra_only(false)
+        .with_max_channels(4)
+        .with_max_sample_rate(OUTPUT_SAMPLE_RATE);
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::CODEC_ID_STM_STR))
+            .capabilities(stm_caps)
+            .decoder(make_stm_stub_decoder),
+    );
 }
 
 fn make_mixed_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -64,6 +79,59 @@ fn make_planar_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id: CodecId::new(crate::CODEC_ID_PLANAR_STR),
         state: DecoderState::AwaitingPacket,
     }))
+}
+
+fn make_stm_stub_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(StmStubDecoder {
+        codec_id: CodecId::new(crate::CODEC_ID_STM_STR),
+    }))
+}
+
+/// Stub STM decoder: exists so the codec id resolves cleanly, but returns
+/// an explicit `unsupported` error on `send_packet` rather than silently
+/// emitting zeros. STM uses C3-frequency-based sample pitching rather
+/// than the Amiga period model the MOD mixer assumes, so driving the
+/// existing `PlayerState` with STM data would produce nonsense — better
+/// to fail loudly until the mixer abstraction is broadened. Callers that
+/// want to inspect STM files structurally should use
+/// [`crate::stm::parse_header`] / [`crate::stm::parse_patterns`] /
+/// [`crate::stm::extract_samples`] directly off the packet payload.
+struct StmStubDecoder {
+    codec_id: CodecId,
+}
+
+impl Decoder for StmStubDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        // Light validation so `unsupported` is only returned for otherwise
+        // well-formed STM files. If the blob is not recognisable as STM,
+        // surface an `invalid` error instead.
+        if !crate::stm::is_stm(&packet.data) {
+            return Err(Error::invalid(
+                "STM: packet does not carry a valid Scream Tracker v1 header",
+            ));
+        }
+        Err(Error::unsupported(
+            "STM playback is not yet wired through the MOD mixer; use \
+             oxideav_mod::stm::parse_header() / parse_patterns() / extract_samples() \
+             directly for structural access",
+        ))
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        Err(Error::Eof)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct ModDecoder {
