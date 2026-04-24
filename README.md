@@ -14,9 +14,10 @@ wrappers, no `*-sys` crates.
   channels). Populates stream metadata (title, sample names, pattern /
   channel counts) and an upper-bound duration.
 - **Decoder**: parses the header, patterns, and raw signed-8-bit sample
-  bodies; drives a `PlayerState` (rows → ticks, Paula periods, volume / volume
-  slide, portamento, arpeggio, `Cxx` set-volume, `Bxx` position jump, `Dxy`
-  pattern break, `Fxx` speed / BPM); mixes samples with linear interpolation.
+  bodies; drives a `PlayerState` (rows → ticks, Paula periods, Protracker
+  sine-table vibrato / tremolo, sample-offset, tone portamento, pattern
+  loop, note-delay / note-cut, pattern-delay, full 16-finetune × 36-note
+  period table); mixes samples with linear interpolation.
 - **Decode only** — there is no MOD encoder, by design.
 
 ## Output modes
@@ -65,12 +66,38 @@ oxideav_mod::register_codecs(&mut codecs);
 
 ## Status
 
-Early but functional. The effect set is a practical subset (arpeggio, 1/2
-portamento up/down, Axy volume slide, Bxx position jump, Cxx set-volume, Dxy
-pattern break, Fxx speed / BPM). More exotic effects (vibrato 4/6, tone
-portamento 3, tremolo 7, fine slides E-commands, sample offset 9, pattern
-loop E6) are not yet implemented — samples on patterns that use them will
-still play, but without those effect modulations.
+Spec-level effect coverage per
+[Protracker-v1.1B-mod.txt](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/mod):
+
+| Slot | Effect | Status |
+| ---- | ------ | ------ |
+| 0xy  | Arpeggio | implemented (period-table walk with finetune-aware semitone steps) |
+| 1xx / 2xx | Portamento up / down (with last-param memory) | implemented |
+| 3xy / 5xy | Tone portamento, with volume slide | implemented; E3x glissando snaps to nearest semitone |
+| 4xy / 6xy | Vibrato, with volume slide | implemented (32-entry Protracker sine + ramp-down + square) |
+| 7xy | Tremolo | implemented |
+| 9xx | Sample offset (`param << 8`) with memory | implemented |
+| Axy | Volume slide | implemented |
+| Bxx | Position jump | implemented |
+| Cxx | Set volume | implemented |
+| Dxy | Pattern break (decimal `x*10 + y`) | implemented |
+| Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM) | implemented |
+| E0x | Filter on/off | accepted, no-op (hardware only) |
+| E1x / E2x | Fine portamento up / down (tick-0 one-shot) | implemented |
+| E3x | Glissando control | implemented |
+| E4x / E7x | Vibrato / tremolo waveform (sine / ramp-down / square / retrig bit) | implemented |
+| E5x | Set finetune (also re-derives period on same-row note trigger) | implemented |
+| E6x | Pattern loop (per-channel start + count) | implemented |
+| E9x | Retrigger note every *x* ticks | implemented |
+| EAx / EBx | Fine volume slide up / down | implemented |
+| ECx | Note cut | implemented |
+| EDx | Note delay | implemented |
+| EEx | Pattern delay | implemented |
+| EFx | Invert loop | deliberately not implemented per spec ("don't bother") |
+| 8xx | Set pan | not implemented (ProTracker ignores; Amiga uses hard-pan LRRL) |
+
+Loop handling is forward-only per MOD spec — ping-pong / bidi loops are an
+XM/IT/S3M-era extension and are deliberately not used here.
 
 ## License
 
