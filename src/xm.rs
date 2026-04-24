@@ -257,6 +257,49 @@ impl XmSampleLoopMode {
     }
 }
 
+impl crate::mixer::SampleSource for XmSampleHeader {
+    fn len(&self) -> usize {
+        if self.is_16_bit {
+            self.pcm16.len()
+        } else {
+            self.pcm8.len()
+        }
+    }
+    fn loop_start(&self) -> usize {
+        // loop_start/loop_length are byte offsets in the XM file; for
+        // 16-bit samples convert to frame indices.
+        let div = if self.is_16_bit { 2 } else { 1 };
+        if matches!(self.loop_mode, XmSampleLoopMode::None) {
+            0
+        } else {
+            (self.loop_start as usize / div).min(self.len())
+        }
+    }
+    fn loop_end(&self) -> usize {
+        let div = if self.is_16_bit { 2 } else { 1 };
+        if matches!(self.loop_mode, XmSampleLoopMode::None) {
+            self.len()
+        } else {
+            let end = (self.loop_start + self.loop_length) as usize / div;
+            end.min(self.len())
+        }
+    }
+    fn loop_kind(&self) -> crate::mixer::LoopKind {
+        match self.loop_mode {
+            XmSampleLoopMode::None => crate::mixer::LoopKind::None,
+            XmSampleLoopMode::Forward => crate::mixer::LoopKind::Forward,
+            XmSampleLoopMode::PingPong => crate::mixer::LoopKind::PingPong,
+        }
+    }
+    fn at(&self, idx: usize) -> f32 {
+        if self.is_16_bit {
+            self.pcm16.get(idx).copied().unwrap_or(0) as f32 / 32768.0
+        } else {
+            self.pcm8.get(idx).copied().unwrap_or(0) as f32 / 128.0
+        }
+    }
+}
+
 /// Decoded sample header (40 bytes + variable-length PCM body following
 /// all sample headers of the instrument).
 #[derive(Clone, Debug, Default)]

@@ -31,6 +31,36 @@ impl SampleBody {
     }
 }
 
+impl crate::mixer::SampleSource for SampleBody {
+    fn len(&self) -> usize {
+        self.pcm.len()
+    }
+    fn loop_start(&self) -> usize {
+        if self.is_looped() {
+            self.loop_start as usize
+        } else {
+            0
+        }
+    }
+    fn loop_end(&self) -> usize {
+        if self.is_looped() {
+            (self.loop_start + self.loop_length) as usize
+        } else {
+            self.pcm.len()
+        }
+    }
+    fn loop_kind(&self) -> crate::mixer::LoopKind {
+        if self.is_looped() {
+            crate::mixer::LoopKind::Forward
+        } else {
+            crate::mixer::LoopKind::None
+        }
+    }
+    fn at(&self, idx: usize) -> f32 {
+        self.pcm.get(idx).copied().unwrap_or(0) as f32 / 128.0
+    }
+}
+
 /// Extract all 31 sample bodies from the module bytes.
 ///
 /// Samples declared longer than the remaining file are clamped to what's

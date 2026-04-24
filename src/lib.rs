@@ -24,13 +24,15 @@
 //! - A **container** (`stm`) that recognises Scream Tracker v1 modules
 //!   (pre-S3M, 4-channel-fixed), parses the header + instrument table +
 //!   pattern data + sample bodies, and exposes them for downstream
-//!   consumers. Playback through the MOD mixer is not currently wired
-//!   (STM uses C3-frequency sample pitching rather than Amiga periods),
-//!   so the associated codec id [`CODEC_ID_STM_STR`] = `"stm"` is a
-//!   parsing-only entry point today — the decoder returns an explicit
-//!   `unsupported` error and callers should drive playback off the
-//!   [`stm::parse_header`] / [`stm::parse_patterns`] / [`stm::extract_samples`]
-//!   helpers directly.
+//!   consumers. A minimum STM playback engine is wired via the shared
+//!   [`mixer::MixerVoice`] core and [`mixer::StmC3Pitch`] pitch model;
+//!   drive it via [`stm_player::StmPlayerState::render`]. The associated
+//!   codec id [`CODEC_ID_STM_STR`] = `"stm"` is still a parsing-only
+//!   decoder registration (it validates the packet then returns an
+//!   explicit `unsupported`), because effect support and global mixer
+//!   parameters are not yet feature-complete; callers wiring STM into
+//!   the broader oxideav pipeline should hook up
+//!   `StmPlayerState::render` directly for now.
 //! - A **container** (`xm`) that recognises FastTracker 2 Extended
 //!   Module files by the 17-byte `"Extended Module: "` ASCII banner at
 //!   offset 0. Parses the 336-byte file header (banner, module/tracker
@@ -41,11 +43,16 @@
 //!   effect-param, each optional per mask byte), and the instrument
 //!   table (per-note sample mapping, volume + panning envelopes, vibrato
 //!   state, fadeout, multiple samples per instrument with delta-encoded
-//!   8- or 16-bit PCM bodies). Playback is not wired through the MOD
-//!   mixer yet (XM has a broader pitch / envelope model than MOD), so
-//!   [`CODEC_ID_XM_STR`] = `"xm"` is a parsing-only entry point — use
+//!   8- or 16-bit PCM bodies). A minimum XM playback engine is wired via
+//!   the shared [`mixer::MixerVoice`] core and [`mixer::XmPitch`] pitch
+//!   model (both Amiga and Linear frequency tables supported); drive it
+//!   via [`xm_player::XmPlayerState::render`]. Envelopes, fadeout,
+//!   vibrato, and the bulk of the Axy/Dxy/Exy/Fxy effect space are not
+//!   yet implemented. The codec id [`CODEC_ID_XM_STR`] = `"xm"` remains
+//!   a parsing-only decoder pending effect-set completeness — use
 //!   [`xm::parse_header`] / [`xm::parse_patterns`] / [`xm::parse_instruments`]
-//!   / [`xm::extract_sample_bodies`] directly for structural access.
+//!   / [`xm::extract_sample_bodies`] for structural access, or drive
+//!   `XmPlayerState` directly for PCM output.
 //!
 //! The tracker convention of exposing per-channel streams alongside a
 //! mixed stereo mix is shared across tracker formats — see
@@ -56,10 +63,13 @@
 pub mod container;
 pub mod decoder;
 pub mod header;
+pub mod mixer;
 pub mod player;
 pub mod samples;
 pub mod stm;
+pub mod stm_player;
 pub mod xm;
+pub mod xm_player;
 
 use oxideav_codec::CodecRegistry;
 use oxideav_container::ContainerRegistry;

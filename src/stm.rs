@@ -180,6 +180,45 @@ pub struct StmSampleBody {
     pub c3_hz: u16,
 }
 
+impl StmSampleBody {
+    /// True if this body carries a valid forward loop. STM signals
+    /// "no loop" either with `loop_end == 0xFFFF` or by having
+    /// `loop_end <= loop_start`.
+    pub fn is_looped(&self) -> bool {
+        self.loop_end != 0xFFFF && (self.loop_end as usize) > (self.loop_start as usize)
+    }
+}
+
+impl crate::mixer::SampleSource for StmSampleBody {
+    fn len(&self) -> usize {
+        self.pcm.len()
+    }
+    fn loop_start(&self) -> usize {
+        if self.is_looped() {
+            (self.loop_start as usize).min(self.pcm.len())
+        } else {
+            0
+        }
+    }
+    fn loop_end(&self) -> usize {
+        if self.is_looped() {
+            (self.loop_end as usize).min(self.pcm.len())
+        } else {
+            self.pcm.len()
+        }
+    }
+    fn loop_kind(&self) -> crate::mixer::LoopKind {
+        if self.is_looped() {
+            crate::mixer::LoopKind::Forward
+        } else {
+            crate::mixer::LoopKind::None
+        }
+    }
+    fn at(&self, idx: usize) -> f32 {
+        self.pcm.get(idx).copied().unwrap_or(0) as f32 / 128.0
+    }
+}
+
 /// Test whether a byte slice looks like an STM file. Returns `true` iff
 /// the mandatory ID byte at offset 0x1C is 0x1A and the file type byte
 /// at 0x1D is 1 or 2 (Song / Module). The 8-byte tracker-name field is
