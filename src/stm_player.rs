@@ -250,15 +250,11 @@ impl StmPlayerState {
             // Memorise effect parameters (zero nibble = reuse last).
             let ep = ch.effect_param;
             match ch.effect {
-                0x1 | 0x2 => {
-                    if ep != 0 {
-                        ch.porta_updown_mem = ep;
-                    }
+                0x1 | 0x2 if ep != 0 => {
+                    ch.porta_updown_mem = ep;
                 }
-                0x3 => {
-                    if ep != 0 {
-                        ch.porta_speed = ep;
-                    }
+                0x3 if ep != 0 => {
+                    ch.porta_speed = ep;
                 }
                 0x4 => {
                     let vx = ep >> 4;
@@ -270,10 +266,8 @@ impl StmPlayerState {
                         ch.vib_depth = vy;
                     }
                 }
-                0x5 | 0x6 | 0xA => {
-                    if ep != 0 {
-                        ch.vol_slide_mem = ep;
-                    }
+                0x5 | 0x6 | 0xA if ep != 0 => {
+                    ch.vol_slide_mem = ep;
                 }
                 _ => {}
             }
@@ -549,19 +543,17 @@ fn apply_tick0_effect(ch: &mut StmChannel) {
         0xE => {
             // Exy subcommands.
             match x {
-                0x1 => {
+                0x1
                     // E1x: fine porta up (tick 0 only) — shift
                     // semitone-position up by `y / SEMITONE_UNITS`.
-                    if y != 0 {
+                    if y != 0 => {
                         ch.cur_semis += y as f32 / SEMITONE_UNITS;
                     }
-                }
-                0x2 => {
+                0x2
                     // E2x: fine porta down.
-                    if y != 0 {
+                    if y != 0 => {
                         ch.cur_semis = (ch.cur_semis - y as f32 / SEMITONE_UNITS).max(0.0);
                     }
-                }
                 0xA => {
                     // EAx: fine volume slide up.
                     ch.volume = (ch.volume as u16 + y as u16).min(64) as u8;

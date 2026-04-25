@@ -875,24 +875,21 @@ fn apply_tick0_effect(
             // needed on tick 0 beyond setting the arp base period (done in
             // enter_row) and remembering the param for subsequent ticks.
         }
-        0x1 => {
+        0x1
             // Portamento up: remember param for tick-N dispatch.
-            if param != 0 {
+            if param != 0 => {
                 ch.mem_porta_up = param;
             }
-        }
-        0x2 => {
+        0x2
             // Portamento down: remember param.
-            if param != 0 {
+            if param != 0 => {
                 ch.mem_porta_down = param;
             }
-        }
-        0x3 => {
+        0x3
             // Tone portamento: speed 0 reuses the stored value.
-            if param != 0 {
+            if param != 0 => {
                 ch.tone_porta_speed = param;
             }
-        }
         0x4 => {
             // Vibrato: nibble param memory (0 nibbles reuse previous values).
             let mut rate = x;
@@ -905,19 +902,17 @@ fn apply_tick0_effect(
             }
             ch.mem_vibrato = (rate << 4) | depth;
         }
-        0x5 => {
+        0x5
             // Tone portamento + volume slide. Reuse stored tone-porta speed;
             // param here is the volume-slide nibble pair.
-            if param != 0 {
+            if param != 0 => {
                 ch.mem_volslide = param;
             }
-        }
-        0x6 => {
+        0x6
             // Vibrato + volume slide. Vibrato params are inherited.
-            if param != 0 {
+            if param != 0 => {
                 ch.mem_volslide = param;
             }
-        }
         0x7 => {
             // Tremolo: nibble param memory.
             let mut rate = x;
@@ -934,12 +929,11 @@ fn apply_tick0_effect(
             // 9xx: handled at note-trigger time (enter_row). Nothing to do here
             // since we already latched the memory and the position.
         }
-        0xA => {
+        0xA
             // Volume slide — per-tick param memory.
-            if param != 0 {
+            if param != 0 => {
                 ch.mem_volslide = param;
             }
-        }
         0xB => {
             // Position jump.
             *pending_jump = Some(Jump {
@@ -1124,9 +1118,9 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
     }
 
     match effect {
-        0x0 => {
+        0x0
             // Arpeggio: tick%3 cycles 0 / +x / +y semitones.
-            if param != 0 {
+            if param != 0 => {
                 let semis = match tick % 3 {
                     0 => 0,
                     1 => x as i32,
@@ -1159,7 +1153,6 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
                     }
                 }
             }
-        }
         0x1 => {
             let used = if param == 0 { ch.mem_porta_up } else { param };
             ch.period = ch.period.saturating_sub(used as u16).max(PERIOD_MIN);

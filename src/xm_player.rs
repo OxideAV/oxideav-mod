@@ -388,16 +388,14 @@ impl XmPlayerState {
             // Memorize effect parameters (for "zero nibble = use last").
             let ep = ch.effect_param;
             match ch.effect {
-                0x01 | 0x02 => {
-                    if ep != 0 {
+                0x01 | 0x02
+                    if ep != 0 => {
                         ch.porta_updown_mem = ep;
                     }
-                }
-                0x03 => {
-                    if ep != 0 {
+                0x03
+                    if ep != 0 => {
                         ch.porta_speed = ep;
                     }
-                }
                 0x04 => {
                     // 4xy: x=speed, y=depth, each nibble has independent
                     // memory per FT2.
@@ -410,12 +408,11 @@ impl XmPlayerState {
                         ch.vib_depth = vy;
                     }
                 }
-                0x05 | 0x06 | 0x0A => {
+                0x05 | 0x06 | 0x0A
                     // 5xy / 6xy / Axy: volume-slide param shares memory.
-                    if ep != 0 {
+                    if ep != 0 => {
                         ch.vol_slide_mem = ep;
                     }
-                }
                 _ => {}
             }
 
@@ -850,18 +847,16 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
         0x0E => {
             // Exy subcommands.
             match x {
-                0x01 => {
+                0x01
                     // E1x: Fine porta up, by y period units * 4.
-                    if y != 0 {
+                    if y != 0 => {
                         ch.period = (ch.period - (y as f32) * 4.0).max(1.0);
                     }
-                }
-                0x02 => {
+                0x02
                     // E2x: Fine porta down.
-                    if y != 0 {
+                    if y != 0 => {
                         ch.period += (y as f32) * 4.0;
                     }
-                }
                 0x0A => {
                     // EAx: Fine volume slide up.
                     ch.volume = (ch.volume as u16 + y as u16).min(64) as u8;
@@ -903,17 +898,15 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
             // uses 0x21 for "extra-fine porta"); it's handled by the
             // caller-specific mapping if the file uses it.
             match x {
-                0x01 => {
+                0x01
                     // X1x: Extra-fine porta up by y (1 unit = 1/4 semitone).
-                    if y != 0 {
+                    if y != 0 => {
                         ch.period = (ch.period - y as f32).max(1.0);
                     }
-                }
-                0x02 => {
-                    if y != 0 {
+                0x02
+                    if y != 0 => {
                         ch.period += y as f32;
                     }
-                }
                 _ => {}
             }
         }
