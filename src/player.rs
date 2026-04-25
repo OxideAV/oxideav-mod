@@ -499,6 +499,17 @@ pub struct PlayerState {
     /// EEx pattern-delay: rows to repeat after the current one completes.
     pattern_delay: u8,
 
+    /// True while we're inside an EE-induced repeat of the current row.
+    /// Per Pro-Noise-Soundtracker-rev4.txt §[14][14] ("Delay pattern"):
+    /// "all effects and previous notes continue during delay" — i.e. the
+    /// note must NOT re-trigger and tick-0 effects must NOT re-fire on the
+    /// repeated passes; only the per-tick (tick > 0) effect handler keeps
+    /// running. Without this flag, `enter_row` would re-execute on every
+    /// repeat and reset `sample_pos` / fine-volume slides would compound
+    /// once per repeat — both audible regressions on real-world MODs that
+    /// use EE for held-note textures.
+    in_pattern_delay_repeat: bool,
+
     /// Amiga LED filter state. When ON, the mixer applies a 1-pole
     /// low-pass to all output streams (`Protracker-v1.1B-mod.txt` Cmd
     /// E0: "C-300E00 connects filter (turns power LED on)" — i.e.
@@ -550,6 +561,7 @@ impl PlayerState {
             loop_rows: vec![0; n_ch],
             loop_counts: vec![0; n_ch],
             pattern_delay: 0,
+            in_pattern_delay_repeat: false,
             // LED ON is the Amiga default at power-up — and the
             // ProTracker replayer leaves it on unless an explicit E01
             // toggles it off. See `Protracker-v1.1B-mod.txt` Cmd E0
@@ -808,7 +820,16 @@ impl PlayerState {
     /// Advance one tick (called at the start of every tick).
     fn advance_tick(&mut self) {
         if self.tick == 0 {
-            self.enter_row();
+            // Pattern-delay repeat: per Pro-Noise §[14][14] ("all effects
+            // and previous notes continue during delay") we must NOT
+            // re-execute `enter_row` on the repeated passes — that would
+            // re-trigger notes (resetting sample_pos to 0) and re-fire
+            // tick-0 effects (compounding fine vol slides etc.). The
+            // currently-playing notes simply continue; tick-N effects on
+            // the inbetween ticks still run normally below.
+            if !self.in_pattern_delay_repeat {
+                self.enter_row();
+            }
         } else {
             // Tick-N effects run per channel.
             for ch_idx in 0..self.channels.len() {
@@ -819,11 +840,18 @@ impl PlayerState {
 
     /// Move to next row (or jump).
     fn next_row(&mut self) {
-        // EEx pattern delay: repeat the current row `pattern_delay` more times.
+        // EEx pattern delay: repeat the current row `pattern_delay` more
+        // times. Set `in_pattern_delay_repeat` so the next pass through
+        // tick 0 skips `enter_row` (no note re-trigger, no tick-0 effect
+        // re-fire) per Pro-Noise-Soundtracker-rev4.txt §[14][14].
         if self.pattern_delay > 0 {
             self.pattern_delay -= 1;
+            self.in_pattern_delay_repeat = true;
             return;
         }
+        // Real row advance — clear the repeat flag so the next row's
+        // tick-0 processing runs normally.
+        self.in_pattern_delay_repeat = false;
         if let Some(jump) = self.pending_jump.take() {
             if let Some(order) = jump.order {
                 self.order_index = order;
@@ -2236,9 +2264,16 @@ pub mod tests {
     }
 
     #[test]
-    fn pattern_delay_ee_repeats_row() {
-        // EE1 with a trigger that increments volume on each row via EA1;
-        // the row should "play" twice before advancing to the next.
+    fn pattern_delay_ee_repeats_row_without_retriggering_effects() {
+        // Per `Pro-Noise-Soundtracker-rev4.txt` §[14][14] ("Delay
+        // pattern"): "all effects and previous notes continue during
+        // delay". The row's tick-0 effects (e.g. EAx fine vol slide,
+        // Cxx set volume, note triggers) must NOT re-fire on the
+        // repeated passes — only per-tick effects (vol slides, vibrato,
+        // tone porta) keep ticking. Without this guarantee a held note
+        // on the row would re-trigger from sample_pos=0 on every repeat
+        // and EAx would compound, both audible regressions on real-
+        // world MODs that use EE for held-note textures.
         let bytes = synth_mod_with_pattern(&[
             (
                 0,
@@ -2285,12 +2320,89 @@ pub mod tests {
         for _ in 0..5 {
             step_one_tick(&mut player);
         }
-        // Row "1 again" tick 0: EA2 increments volume from 2 → 4.
+        // Row "1 again" tick 0: per spec, EA2 must NOT re-fire — volume
+        // stays at 2, not 4.
         step_one_tick(&mut player);
         assert_eq!(
-            player.channels[0].volume, 4,
-            "EE1 must cause row 1 to play twice"
+            player.channels[0].volume, 2,
+            "EEx pattern-delay repeat must not re-fire EA2 (volume must stay 2)"
         );
+    }
+
+    #[test]
+    fn pattern_delay_ee_does_not_retrigger_held_note() {
+        // Trigger a long, looping sample on row 0, then on row 1 emit
+        // EE2 (delay 2 row passes) with no note. Across the two delay
+        // repeats, the channel's `sample_pos` must keep advancing
+        // monotonically (the previous note "continues during delay" per
+        // spec). If `enter_row` were re-invoked it would not reset the
+        // sample (no note in row 1) but the tick-0 effect machinery
+        // would fire again — for the bug we're really chasing, drop a
+        // note onto row 1 and confirm it does NOT re-trigger across the
+        // repeats either.
+        let bytes = synth_mod_with_pattern(&[
+            // Row 0: trigger.
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            // Row 1: a note + EE3. The note must trigger on the first
+            // pass (and only the first pass).
+            (
+                1,
+                0,
+                Note {
+                    period: 339,
+                    sample: 1,
+                    effect: 0xE,
+                    effect_param: 0xE3,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+
+        // Walk row 0 (6 ticks).
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        // Row 1 tick 0: note triggers (sample_pos resets to 0), EE3
+        // sets pattern_delay = 3.
+        step_one_tick(&mut player);
+        assert_eq!(player.channels[0].period, 339, "row 1 note must trigger");
+        let pos_after_first_trigger = player.channels[0].sample_pos;
+
+        // Walk the rest of row 1's ticks plus all 3 delay repeats. Each
+        // pass has 6 ticks; we've consumed 1 of the first pass, leaving
+        // 5 + 3*6 = 23 ticks before the song advances out of row 1.
+        let mut prev_pos = pos_after_first_trigger;
+        for tick_idx in 0..23 {
+            step_one_tick(&mut player);
+            let cur_pos = player.channels[0].sample_pos;
+            // Sample is a 32-frame loop; the position wraps inside the
+            // loop region. We just need to confirm we never reset to 0
+            // (which would happen if enter_row were re-invoked on the
+            // repeats and re-triggered the note).
+            // Allow position == 0 only on the very first iteration (none
+            // here, so flag any zero immediately). Account for the loop
+            // wrap by checking we don't drop to a value strictly less
+            // than the loop_start (which is 0 — so the only invalid
+            // state is sample_pos == 0.0 followed by another 0.0, i.e.
+            // an enforced reset, not a wrap).
+            assert!(
+                cur_pos != 0.0 || prev_pos == 0.0,
+                "tick {tick_idx}: sample_pos jumped back to 0 \
+                 (prev={prev_pos}, cur={cur_pos}) — the EE pattern-delay \
+                 repeat must NOT re-trigger a note that was already \
+                 played on the first pass through the row"
+            );
+            prev_pos = cur_pos;
+        }
     }
 
     /// Build a 1-channel-style synthetic MOD with a custom sample body so
