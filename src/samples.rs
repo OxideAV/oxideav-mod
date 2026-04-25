@@ -87,9 +87,20 @@ pub fn extract_samples(header: &ModHeader, bytes: &[u8]) -> Vec<SampleBody> {
 
         cursor += take;
 
-        // A loop_length of 0 or 2 means "no loop" per the ProTracker spec.
+        // A loop_length of 0 or 2 means "no loop" per the ProTracker spec
+        // (Protracker-effects-MODFIL12.txt §2.2 and Protracker-2.3A-misc-info.txt).
+        // Real-world MOD rips occasionally have loop metadata that exceeds
+        // the actual sample length; clamp to keep the mixer from reading
+        // past the buffer.
         let (loop_start, loop_length) = if sample.repeat_length > 2 {
-            (sample.repeat_start, sample.repeat_length)
+            let pcm_len = pcm.len() as u32;
+            let start = sample.repeat_start.min(pcm_len);
+            let len = sample.repeat_length.min(pcm_len.saturating_sub(start));
+            if len > 2 {
+                (start, len)
+            } else {
+                (0, 0)
+            }
         } else {
             (0, 0)
         };

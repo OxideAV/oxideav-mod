@@ -99,6 +99,53 @@ Spec-level effect coverage per
 Loop handling is forward-only per MOD spec — ping-pong / bidi loops are an
 XM/IT/S3M-era extension and are deliberately not used here.
 
+## Real-world MOD fidelity
+
+Spec coverage above is one half of the story; the other half is matching
+the *Protracker replayer's well-known quirks* that real-world MODs target.
+The following PT-vs-spec divergences are honoured by this crate (each has
+a unit test in `src/player.rs`):
+
+- **Loop boundary** — sample playback wraps at `loop_start + loop_length`,
+  not at `pcm.len()`. The data past `loop_end` is the one-shot tail that
+  PT discards; reading into it produced audible glitches on samples whose
+  loop region is shorter than the declared length. Cited in
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` §2.2 + §2.8.
+- **Loop metadata clamp** — out-of-range repeat start/length in real-world
+  rips is clamped to `pcm.len()` so the mixer never reads past the buffer.
+- **Sample swap without note** — when a sample number appears on a row
+  without a note, PT loads the new sample's default volume + finetune
+  immediately but defers the actual sample-PCM swap until the next
+  note-on. Latching the sample index too early caused wrong-instrument
+  artefacts on common idioms like setting up the next note's volume one
+  row early. Cited in `Protracker-effects-MODFIL12.txt` §3.2 +
+  `Pro-Noise-Soundtracker-rev4.txt:113-118`.
+
+### Known remaining fidelity gaps
+
+These are documented but not yet fixed. PRs welcome:
+
+- **Amiga LED filter (E00 / E01)** — currently a no-op. Real PT applies
+  a one-pole 6 dB/oct lowpass at ~3.3 kHz when LED is off (E00), giving
+  classic AMIGA-era warmth. Some songs (especially demoscene tracks)
+  rely on it being on by default at song start. Implementing this needs
+  a per-output-rate biquad in the mix path.
+- **Vibrato sign convention** — the FireLight tutorial pseudocode and the
+  reference C snippet disagree on whether `vibrato_pos >= 0` should
+  *raise* or *lower* the period. Our implementation follows one of the
+  two. Songs that depend on the exact phase of vibrato may sound 180°
+  out of phase. Audibly indistinguishable in most cases.
+- **Period clamping at finetune extremes** — current clamp is
+  `[113, 856]`. Per `Protracker-effects-MODFIL12.txt` the "normal"
+  range extends to `[108, 907]` for finetune ±8. Songs that legitimately
+  use finetune -8 with low B-3 can get slightly stuck at the wrong limit.
+- **Pattern-loop + pattern-break interaction** — when E6x and Dxy land on
+  the same row (rare), PT processes E6x first. Current code may not
+  honour the exact order; needs a synthetic test.
+- **Fxx==0x20 boundary** — current split is `<0x20 = speed`, `>=0x20 = BPM`.
+  Some sources say `<=0x1F = speed`, `>=0x20 = BPM` (same), but a few
+  legacy implementations off-by-one at exactly 0x1F. Needs verification.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

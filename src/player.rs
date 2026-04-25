@@ -301,6 +301,11 @@ pub struct Channel {
     /// Glissando flag (E3x): if set, tone portamento snaps to nearest
     /// semitone each tick rather than sliding smoothly.
     pub glissando: bool,
+
+    /// Sample number written on a row that did not also trigger a note —
+    /// the swap is deferred until the next note-on per Protracker quirk
+    /// (see `enter_row` for the citation). 0 means no pending swap.
+    pub pending_sample: u8,
 }
 
 /// Stores the note/sample/effect details of an EDy-delayed trigger so we
@@ -343,14 +348,36 @@ impl Channel {
             return 0.0;
         }
 
+        // Loop / end-of-sample wrap.
+        //
+        // Protracker quirk (Protracker-effects-MODFIL12.txt §2.2 + §2.8 +
+        // Protracker-2.3A-misc-info.txt "Repeat point/length" notes):
+        // for a looped sample the playable region is exactly
+        // `loop_start..loop_start+loop_length`. Once the cursor reaches
+        // `loop_end`, it wraps back into the loop region — it must NOT
+        // continue reading past `loop_end` into the sample's "tail" (the
+        // tail bytes are an artefact of how trackers store one-shot data
+        // before the loop region starts and the looped tail; PT discards
+        // them). The previous implementation only wrapped when
+        // `pos >= pcm.len()`, which let the player read garbage past the
+        // declared loop and produce audible glitches on real-world MODs
+        // where loop_end < pcm.len().
+        //
+        // For a looped sample, also clamp loop_end to pcm.len() — some
+        // real-world rips have slightly out-of-range repeat metadata.
+        let pcm_len = body.pcm.len();
+        let looped = body.is_looped();
+        let effective_end_f = if looped {
+            ((body.loop_start as usize + body.loop_length as usize).min(pcm_len)) as f32
+        } else {
+            pcm_len as f32
+        };
+
         let pos = self.sample_pos;
-        let len = body.pcm.len() as f32;
-        if pos >= len {
-            // Either loop or stop.
-            if body.is_looped() {
-                let loop_end = (body.loop_start + body.loop_length) as f32;
+        if pos >= effective_end_f {
+            if looped {
                 let loop_start = body.loop_start as f32;
-                let span = loop_end - loop_start;
+                let span = effective_end_f - loop_start;
                 if span > 0.0 {
                     let over = pos - loop_start;
                     self.sample_pos = loop_start + over.rem_euclid(span);
@@ -364,18 +391,23 @@ impl Channel {
             }
         }
 
-        // Linear interpolation between two nearest samples.
+        // Linear interpolation between two nearest samples. The next-sample
+        // fetch must respect the loop boundary: if `i+1` lands on or past
+        // `loop_end`, wrap to `loop_start` (looped) rather than reading the
+        // tail.
+        let effective_end_idx = effective_end_f as usize;
         let i = self.sample_pos as usize;
         let frac = self.sample_pos - i as f32;
-        let s0 = body.pcm[i.min(body.pcm.len() - 1)] as f32 / 128.0;
-        let s1_idx = if i + 1 < body.pcm.len() {
+        let s0_idx = i.min(pcm_len.saturating_sub(1));
+        let s0 = body.pcm[s0_idx] as f32 / 128.0;
+        let s1_idx = if i + 1 < effective_end_idx {
             i + 1
-        } else if body.is_looped() {
+        } else if looped {
             body.loop_start as usize
         } else {
-            i
+            s0_idx
         };
-        let s1 = body.pcm[s1_idx.min(body.pcm.len() - 1)] as f32 / 128.0;
+        let s1 = body.pcm[s1_idx.min(pcm_len.saturating_sub(1))] as f32 / 128.0;
         let interp = s0 + (s1 - s0) * frac;
 
         // Apply tremolo to the effective volume; clamp 0..=64.
@@ -507,16 +539,45 @@ impl PlayerState {
             ch.delay = None;
             ch.retrig_ticks = 0;
 
-            // Sample change: loads default volume + finetune even without a
-            // note. The new sample starts playing only if a note is present
-            // on the same row (standard PT behaviour).
+            // Sample change.
+            //
+            // Protracker quirk (Protracker-effects-MODFIL12.txt §3.2 +
+            // Pro-Noise-Soundtracker-rev4.txt:113-118): when a sample
+            // number is specified WITHOUT a note, PT loads the new
+            // sample's default volume + finetune immediately, but does
+            // NOT swap the currently-playing sample on the channel —
+            // the swap happens at the next note trigger. Loading the
+            // sample index too early was an audible bug: a row with
+            // "C-2 05 ___ : --- 03" would suddenly play sample 3's PCM
+            // at sample 5's pitch, producing wrong-instrument artefacts
+            // on real-world MODs that use this idiom (e.g. setting up
+            // the next note's volume on the row before the trigger).
+            //
+            // We track the "pending" sample number in `sample_index`
+            // separately from the actively-playing sample, but since the
+            // mixer reads `sample_index`, the safest fix is: only update
+            // `sample_index` when a note also triggers (or on a tone-
+            // portamento / note-delay row, where the trigger is
+            // explicit). Otherwise, defer the swap and only latch the
+            // default volume + finetune (used by the next note).
+            let has_note = note.period != 0;
+            let is_note_delay_pre = note.effect == 0xE && (note.effect_param >> 4) == 0xD;
             if note.sample != 0 {
                 let idx = note.sample as usize;
-                ch.sample_index = note.sample;
                 if idx >= 1 && idx <= self.samples.len() {
                     let body = &self.samples[idx - 1];
                     ch.volume = body.volume;
                     ch.finetune = body.finetune;
+                }
+                if has_note || is_note_delay_pre {
+                    // A trigger is happening on this row — latch the
+                    // sample index so the new note plays the new sample.
+                    ch.sample_index = note.sample;
+                } else {
+                    // No trigger: remember the requested swap for the
+                    // next note. Volume + finetune are already applied
+                    // (PT behaviour); the active sample stays.
+                    ch.pending_sample = note.sample;
                 }
             }
 
@@ -557,6 +618,13 @@ impl PlayerState {
                     }
                 }
                 ch.period = note_period;
+
+                // Consume any deferred sample swap from a previous row
+                // that wrote a sample number without a note.
+                if note.sample == 0 && ch.pending_sample != 0 {
+                    ch.sample_index = ch.pending_sample;
+                }
+                ch.pending_sample = 0;
 
                 // 9xx: start from an offset instead of the sample start.
                 let mut offset_frames: u32 = 0;
@@ -1091,7 +1159,11 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
                     ch.volume = body.volume;
                     ch.finetune = body.finetune;
                 }
+            } else if ch.pending_sample != 0 {
+                // Consume any deferred sample swap from a previous row.
+                ch.sample_index = ch.pending_sample;
             }
+            ch.pending_sample = 0;
             ch.period = delayed.period;
             ch.sample_pos = 0.0;
             ch.active = true;
@@ -1667,8 +1739,12 @@ pub mod tests {
                 effect_param: 0x01,
             },
         )]);
-        // Patch sample 1 length to 256 words (512 frames). Keep loop at 0/16.
+        // Patch sample 1 length to 256 words (512 frames).
         bytes[20 + 22..20 + 24].copy_from_slice(&256u16.to_be_bytes());
+        // Disable the loop (repeat length 0) so the 9xx offset does not
+        // immediately wrap into the loop region — see the loop-boundary
+        // PT quirk fix in `mix_one`.
+        bytes[20 + 28..20 + 30].copy_from_slice(&0u16.to_be_bytes());
         // Append 480 more bytes (512 total) to the sample body at the tail.
         bytes.extend(std::iter::repeat_n(0u8, 480));
 
@@ -2060,6 +2136,245 @@ pub mod tests {
         assert_eq!(
             player.channels[0].volume, 4,
             "EE1 must cause row 1 to play twice"
+        );
+    }
+
+    /// Build a 1-channel-style synthetic MOD with a custom sample body so
+    /// we can probe the mixer's loop-wrap behaviour. The sample is given a
+    /// loop region from `loop_start` to `loop_start + loop_length`; the
+    /// PCM tail past `loop_end` is filled with a sentinel value so test
+    /// code can detect any read past the loop boundary.
+    fn synth_mod_with_loop_sample(
+        pcm: &[i8],
+        loop_start_words: u16,
+        loop_length_words: u16,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        out[0..4].copy_from_slice(b"loop");
+        let length_words = (pcm.len() / 2) as u16;
+        out[20 + 22..20 + 24].copy_from_slice(&length_words.to_be_bytes());
+        out[20 + 24] = 0;
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&loop_start_words.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&loop_length_words.to_be_bytes());
+        out[950] = 1;
+        out[951] = 0x7F;
+        out[952] = 0;
+        out[1080..1084].copy_from_slice(b"M.K.");
+
+        let mut pat = vec![0u8; 64 * 4 * 4];
+        // Row 0, ch 0: trigger sample 1 at C-2 (period 428).
+        let p_hi = ((428u16 >> 8) & 0x0F) as u8;
+        let p_lo = (428u16 & 0xFF) as u8;
+        pat[0] = p_hi;
+        pat[1] = p_lo;
+        pat[2] = 1u8 << 4;
+        pat[3] = 0;
+        out.extend(pat);
+        out.extend(pcm.iter().map(|&s| s as u8));
+        out
+    }
+
+    #[test]
+    fn loop_wrap_stays_inside_loop_region() {
+        // Protracker-effects-MODFIL12.txt §2.2: looped samples play only
+        // the loop_start..loop_start+loop_length region. The "tail" past
+        // loop_end is decay data that PT discards. Before the fix in
+        // mix_one, the mixer wrapped only when sample_pos >= pcm.len(),
+        // producing audible glitches when loop_end < pcm.len(). This
+        // test sets up loop_end = 64 and pcm.len() = 200, fills the tail
+        // 64..200 with a distinct sentinel, and verifies that the mixer
+        // never reads any sample whose magnitude matches the sentinel.
+        //
+        // Sample layout (200 bytes total, all i8):
+        //   0..64   : value +50 (signal in the loop region)
+        //   64..200 : value -100 (sentinel — must NEVER be read)
+        // Loop: start=0, length=64.
+        let mut pcm: Vec<i8> = vec![50; 64];
+        pcm.extend(std::iter::repeat_n(-100i8, 136));
+        // pcm.len() must be even (the header stores length in words).
+        assert!(pcm.len().is_multiple_of(2));
+        let bytes = synth_mod_with_loop_sample(&pcm, 0, 32);
+        let mut player = make_player(&bytes);
+
+        // Render ~0.05 seconds (2205 frames). At C-2 (period 428) the
+        // playback rate is PAULA_CLOCK / 428 ≈ 8287 Hz, so this renders
+        // ~414 sample frames of the source — well past the 64-frame loop
+        // boundary, exercising several wrap cycles.
+        let n_frames = 2205;
+        let mut planes: Vec<Vec<i16>> = (0..player.channels.len())
+            .map(|_| vec![0i16; n_frames])
+            .collect();
+        let _ = {
+            let mut views: Vec<&mut [i16]> = planes.iter_mut().map(|v| v.as_mut_slice()).collect();
+            player.render_per_channel(&mut views, n_frames)
+        };
+
+        // Channel 0 carries the signal. Each output frame is a linear
+        // interpolation of two adjacent sample values; if both are inside
+        // the loop region they sit around +50/128 ≈ +0.39 (i16 ≈ +12800).
+        // If the mixer ever reads the sentinel (-100) we would see a
+        // strongly negative sample. Allow a small slop for interpolation
+        // around the loop seam (where +50 interpolates with the next +50,
+        // not with the tail's -100, *if* the wrap is correct).
+        for (i, &v) in planes[0].iter().enumerate() {
+            assert!(
+                v >= 8000,
+                "frame {i}: expected +50/128 sample (≈12800), got {v} \
+                 — mixer leaked past loop boundary into sentinel tail"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_wrap_handles_loop_end_at_pcm_end() {
+        // Sanity: the classic case where loop_end == pcm.len() must
+        // continue to work. Sample is a 32-byte square wave looping for
+        // its full length.
+        let mut pcm: Vec<i8> = (0..16).map(|_| 100).collect();
+        pcm.extend(std::iter::repeat_n(-100i8, 16));
+        let bytes = synth_mod_with_loop_sample(&pcm, 0, 16);
+        let mut player = make_player(&bytes);
+        let mut buf = vec![0i16; 4410 * 2];
+        let produced = player.render(&mut buf);
+        assert_eq!(produced, 4410);
+        let nonzero = buf.iter().filter(|&&x| x != 0).count();
+        assert!(nonzero > 4000, "expected loud square wave output");
+    }
+
+    #[test]
+    fn sample_swap_without_note_is_deferred() {
+        // PT quirk (Protracker-effects-MODFIL12.txt §3.2 +
+        // Pro-Noise-Soundtracker-rev4.txt:113-118): writing a sample
+        // number on a row that has NO note must NOT swap the active
+        // sample on the channel — the swap is deferred until the next
+        // note-on. The row's volume + finetune are still updated.
+        //
+        // Setup: two samples in the file. Row 0 triggers sample 1 at
+        // C-2. Row 1 writes "sample 2" with no note — the channel must
+        // continue mixing sample 1 (the active one), with sample 2's
+        // default volume now applied. Row 2 retriggers (no sample
+        // number, just a note) — this must consume the pending swap and
+        // start playing sample 2.
+        let mut bytes = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        bytes[0..4].copy_from_slice(b"swap");
+        // Sample 1: 32 frames, finetune 0, volume 64, no loop.
+        bytes[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        bytes[20 + 24] = 0;
+        bytes[20 + 25] = 64;
+        bytes[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&0u16.to_be_bytes());
+        // Sample 2: 32 frames, finetune +3, volume 32, no loop.
+        bytes[50 + 22..50 + 24].copy_from_slice(&16u16.to_be_bytes());
+        bytes[50 + 24] = 3;
+        bytes[50 + 25] = 32;
+        bytes[50 + 26..50 + 28].copy_from_slice(&0u16.to_be_bytes());
+        bytes[50 + 28..50 + 30].copy_from_slice(&0u16.to_be_bytes());
+
+        bytes[950] = 1;
+        bytes[951] = 0x7F;
+        bytes[952] = 0;
+        bytes[1080..1084].copy_from_slice(b"M.K.");
+
+        // Pattern.
+        let mut pat = vec![0u8; 64 * 4 * 4];
+        // Row 0, ch 0: C-2 (428) sample 1.
+        let off = 0;
+        pat[off] = ((428u16 >> 8) & 0x0F) as u8;
+        pat[off + 1] = (428u16 & 0xFF) as u8;
+        pat[off + 2] = 1u8 << 4;
+        // Row 1, ch 0: sample 2, no period.
+        let off = 4 * 4;
+        pat[off] = 0; // no period high nibble, no sample high nibble
+        pat[off + 1] = 0;
+        pat[off + 2] = 2u8 << 4; // sample lo = 2, effect 0
+        pat[off + 3] = 0;
+        // Row 2, ch 0: D-2 (381), no sample number — should consume pending swap.
+        let off = 2 * 4 * 4;
+        pat[off] = ((381u16 >> 8) & 0x0F) as u8;
+        pat[off + 1] = (381u16 & 0xFF) as u8;
+        pat[off + 2] = 0; // no sample number
+        pat[off + 3] = 0;
+        bytes.extend(pat);
+
+        // Sample 1 body: 32 bytes of +50.
+        bytes.extend(std::iter::repeat_n(50i8 as u8, 32));
+        // Sample 2 body: 32 bytes of -50.
+        bytes.extend(std::iter::repeat_n((-50i8) as u8, 32));
+
+        let mut player = make_player(&bytes);
+
+        // After row 0: channel plays sample 1, volume 64.
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(player.channels[0].sample_index, 1, "row 0: sample 1 active");
+        assert_eq!(player.channels[0].volume, 64, "row 0: vol from sample 1");
+
+        // Row 1: sample 2 written, no note. Active sample stays at 1,
+        // but volume + finetune update to sample 2's defaults.
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].sample_index, 1,
+            "row 1: sample 2 written without note — active sample MUST still be 1"
+        );
+        assert_eq!(
+            player.channels[0].volume, 32,
+            "row 1: sample 2's default volume must apply immediately"
+        );
+        assert_eq!(
+            player.channels[0].finetune, 3,
+            "row 1: sample 2's finetune must apply immediately"
+        );
+        assert_eq!(
+            player.channels[0].pending_sample, 2,
+            "row 1: pending sample swap should be queued"
+        );
+
+        // Row 2: D-2 with no sample number — consumes the pending swap.
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].sample_index, 2,
+            "row 2: pending sample 2 swap must be consumed by note trigger"
+        );
+        assert_eq!(
+            player.channels[0].pending_sample, 0,
+            "row 2: pending_sample must clear on consumption"
+        );
+    }
+
+    #[test]
+    fn loop_metadata_clamped_when_out_of_range() {
+        // Defensive: real-world MOD rips sometimes have repeat metadata
+        // that extends past the actual sample length. extract_samples
+        // must clamp to keep the mixer from reading past the buffer.
+        let mut bytes = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        bytes[0..4].copy_from_slice(b"clmp");
+        // Sample length = 16 words = 32 frames.
+        bytes[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        bytes[20 + 25] = 64;
+        // Repeat start = 100 words (way past the sample). Repeat length = 200.
+        bytes[20 + 26..20 + 28].copy_from_slice(&100u16.to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&200u16.to_be_bytes());
+        bytes[950] = 1;
+        bytes[951] = 0x7F;
+        bytes[952] = 0;
+        bytes[1080..1084].copy_from_slice(b"M.K.");
+        bytes.extend(std::iter::repeat_n(0u8, 64 * 4 * 4));
+        bytes.extend(std::iter::repeat_n(0u8, 32));
+        let header = crate::header::parse_header(&bytes).unwrap();
+        let samples = crate::samples::extract_samples(&header, &bytes);
+        // After clamping, loop_start/length must fit within pcm.len() = 32.
+        let s = &samples[0];
+        let end = s.loop_start + s.loop_length;
+        assert!(
+            end as usize <= s.pcm.len(),
+            "loop_end ({end}) must be clamped to pcm.len() ({})",
+            s.pcm.len()
         );
     }
 }
