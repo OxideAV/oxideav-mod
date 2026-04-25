@@ -38,14 +38,28 @@ pub const DEFAULT_SPEED: u8 = 6;
 pub const DEFAULT_BPM: u8 = 125;
 pub const CHANNELS_PER_MOD: usize = 4;
 
-/// Protracker period floor: B-3 at finetune 0 is 113. `1xx` and `3xy`
-/// must not slide below this value.
+/// Protracker porta-up floor: B-3 at finetune 0 is 113. Effects `1xx`
+/// (porta up) and `E1x` (fine porta up) must not slide below this value
+/// per `Protracker-v1.1B-mod.txt` ("You can NOT slide higher than B-3!
+/// (Period 113)") and `Protracker-effects-MODFIL12.txt` §1
+/// ("usually cannot slide past note B-3 unless you have implemented
+/// octave 4 (NON-STANDARD!)").
 pub const PERIOD_MIN: u16 = 113;
-/// Period ceiling used by `2xx` clamps. Classic C-1 at finetune 0 is 856.
-/// Protracker's replayer further allows down-slides into the
-/// extended-period region; we keep the spec-documented upper bound for
-/// clean playback (FireLight §5.3 suggests "stop at C-1 or C-0").
+/// Protracker porta-down ceiling: C-1 at finetune 0 is 856. Effects
+/// `2xx` (porta down) and `E2x` (fine porta down) clamp at this value
+/// per `Protracker-v1.1B-mod.txt` ("You can NOT slide lower than C-1!
+/// (Period 856)").
 pub const PERIOD_MAX: u16 = 856;
+/// Extended period floor — finetune +7 B-3 = 108. Per
+/// `Protracker-effects-MODFIL12.txt` §3.2 the "Normal Minimum Period =
+/// 108", and the period table includes 108 as the lowest legitimate
+/// value (finetune +7 row 35). The mixer must accept this without
+/// further clamping so finetune extremes play cleanly.
+pub const PERIOD_MIN_EXT: u16 = 108;
+/// Extended period ceiling — finetune -8 C-1 = 907. Per
+/// `Protracker-effects-MODFIL12.txt` §3.2 the "Normal Maximum Period =
+/// 907", and the period table's finetune -8 row begins with 907.
+pub const PERIOD_MAX_EXT: u16 = 907;
 
 /// 32-entry Protracker vibrato / tremolo sine table (half-wave positive
 /// quadrant; the sign is applied based on the LFO position register per
@@ -306,6 +320,13 @@ pub struct Channel {
     /// the swap is deferred until the next note-on per Protracker quirk
     /// (see `enter_row` for the citation). 0 means no pending swap.
     pub pending_sample: u8,
+
+    /// Pending LED-filter state from an `E0x` on this channel's row.
+    /// `Some(true)` = filter ON (E00, LED on). `Some(false)` = filter
+    /// OFF (E01, LED off). `None` = no E0 this row. Resolved at the
+    /// end of `enter_row` after all four channels' tick-0 effects are
+    /// processed: like Fxx, a later channel's E0 wins on the same row.
+    pub pending_led: Option<bool>,
 }
 
 /// Stores the note/sample/effect details of an EDy-delayed trigger so we
@@ -322,9 +343,16 @@ impl Channel {
     /// only for the mixer step calculation; the raw `period` field is the
     /// un-modulated value (so chained effects like tone-porta keep
     /// compounding cleanly).
+    ///
+    /// We clamp to the *extended* period range `[108, 907]` here
+    /// (`Protracker-effects-MODFIL12.txt` §3.2) rather than the porta
+    /// limits `[113, 856]`: a vibrato peak / a finetune-extreme note
+    /// must be free to land at e.g. period 108 (FT +7 B-3) without being
+    /// re-clamped to 113. The mixer needs a positive period for the
+    /// PAULA_CLOCK divide.
     fn effective_period(&self, vib_offset: i16) -> u16 {
         let p = self.period as i32 + vib_offset as i32;
-        p.clamp(PERIOD_MIN as i32, 10_000) as u16
+        p.clamp(PERIOD_MIN_EXT as i32, PERIOD_MAX_EXT as i32) as u16
     }
 
     /// Mix one sample from this channel into the float accumulator.
@@ -470,6 +498,27 @@ pub struct PlayerState {
 
     /// EEx pattern-delay: rows to repeat after the current one completes.
     pattern_delay: u8,
+
+    /// Amiga LED filter state. When ON, the mixer applies a 1-pole
+    /// low-pass to all output streams (`Protracker-v1.1B-mod.txt` Cmd
+    /// E0: "C-300E00 connects filter (turns power LED on)" — i.e.
+    /// LED ON is the *default* on real Amigas, and the filter
+    /// attenuates HF content). E01 disconnects the filter.
+    led_filter: bool,
+    /// One filter accumulator per output channel. For mixed stereo
+    /// output the first two slots hold L/R state. For planar
+    /// per-channel output we allocate one slot per MOD tracker
+    /// channel. The vec is grown lazily on first render. Don't mix
+    /// `render` and `render_per_channel` calls on the same instance —
+    /// the slot semantics differ and the filter state would smear
+    /// across modes.
+    led_filter_state: Vec<f32>,
+    /// Pre-computed filter coefficient — the per-sample lerp factor of
+    /// the 1-pole IIR lowpass. Computed lazily on first render once
+    /// `sample_rate` is known (NaN = "not yet computed"). Per
+    /// `multimedia-cx-protracker.html` E0x: "For a simple 1-pole
+    /// low-pass filter, 11500Hz gives a fairly decent estimation."
+    led_filter_alpha: f32,
 }
 
 impl PlayerState {
@@ -501,7 +550,54 @@ impl PlayerState {
             loop_rows: vec![0; n_ch],
             loop_counts: vec![0; n_ch],
             pattern_delay: 0,
+            // LED ON is the Amiga default at power-up — and the
+            // ProTracker replayer leaves it on unless an explicit E01
+            // toggles it off. See `Protracker-v1.1B-mod.txt` Cmd E0
+            // ("C-300E00 connects filter (turns power LED on)").
+            led_filter: true,
+            led_filter_state: Vec::new(),
+            led_filter_alpha: f32::NAN,
         }
+    }
+
+    /// Cutoff frequency, in Hz, of the Amiga LED low-pass filter as
+    /// modelled here. Per `multimedia-cx-protracker.html` E0x.
+    pub const LED_FILTER_CUTOFF_HZ: f32 = 11_500.0;
+
+    /// Compute the filter alpha for the given output sample rate. A
+    /// 1-pole exponential lowpass: `y[n] = a*x[n] + (1-a)*y[n-1]`
+    /// with `a = 1 - exp(-2*pi*fc/fs)`.
+    fn compute_led_alpha(sample_rate: u32) -> f32 {
+        let fs = sample_rate as f32;
+        let fc = Self::LED_FILTER_CUTOFF_HZ;
+        let two_pi = 2.0 * std::f32::consts::PI;
+        1.0 - (-two_pi * fc / fs).exp()
+    }
+
+    /// Ensure `led_filter_state` has at least `n_outputs` slots (one
+    /// per output channel: 2 for the stereo mix, N for planar) and
+    /// `led_filter_alpha` is initialised.
+    fn ensure_led_filter(&mut self, n_outputs: usize) {
+        if self.led_filter_state.len() < n_outputs {
+            self.led_filter_state.resize(n_outputs, 0.0);
+        }
+        if self.led_filter_alpha.is_nan() {
+            self.led_filter_alpha = Self::compute_led_alpha(self.sample_rate);
+        }
+    }
+
+    /// Apply the LED low-pass filter to a single output sample on slot
+    /// `idx`. When the filter is disabled (E01) this is a passthrough.
+    #[inline]
+    fn led_filter_step(&mut self, idx: usize, x: f32) -> f32 {
+        if !self.led_filter {
+            return x;
+        }
+        let a = self.led_filter_alpha;
+        let prev = self.led_filter_state[idx];
+        let y = a * x + (1.0 - a) * prev;
+        self.led_filter_state[idx] = y;
+        y
     }
 
     /// Samples-per-tick rounded down. Classic formula is
@@ -669,7 +765,18 @@ impl PlayerState {
         }
 
         // Fxx applies immediately on tick 0 — handle after per-channel dispatch.
-        // A later channel's Fxx supersedes an earlier one (PT behaviour).
+        // A later channel's Fxx supersedes an earlier one (PT behaviour, per
+        // `Pro-Noise-Soundtracker-rev4.txt:375-377`: "the ones on
+        // higher-numbered channels take precedence over the
+        // ones on lower-numbered channels").
+        //
+        // Boundary check (Pro-Noise-Soundtracker-rev4.txt:362-365): the
+        // doc reads "If z<=32, then it means 'set ticks/division to z'
+        // otherwise it means 'set beats/minute to z' (convention says
+        // that this should read 'If z<32...')". We follow the
+        // convention (z < 0x20 → speed, else BPM), so 0x20 (= 32) is
+        // the smallest BPM value, matching `Protracker-v1.1B-mod.txt`
+        // and the FireLight tutorial. 0x1F is the largest speed value.
         for ch in &self.channels {
             if ch.effect == 0xF {
                 let p = ch.effect_param;
@@ -682,6 +789,19 @@ impl PlayerState {
                     self.bpm = p;
                 }
             }
+        }
+
+        // E0x LED filter: same per-row last-channel-wins resolution.
+        // `Protracker-v1.1B-mod.txt` Cmd E0: E00 connects filter (LED on),
+        // E01 disconnects (LED off).
+        let mut new_led: Option<bool> = None;
+        for ch in &mut self.channels {
+            if let Some(new_state) = ch.pending_led.take() {
+                new_led = Some(new_state);
+            }
+        }
+        if let Some(s) = new_led {
+            self.led_filter = s;
         }
     }
 
@@ -820,6 +940,13 @@ impl PlayerState {
     fn render_one(&mut self, out: &mut [i16]) {
         let mut per_channel = vec![0.0f32; self.channels.len()];
         let (l, r) = self.sample_all_channels(&mut per_channel);
+        // Amiga LED low-pass filter — applied post-mix on the L/R bus
+        // (the real Amiga filter sits between Paula's DAC and the audio
+        // jacks, common to both stereo channels). See
+        // `multimedia-cx-protracker.html` E0x.
+        self.ensure_led_filter(2);
+        let l = self.led_filter_step(0, l);
+        let r = self.led_filter_step(1, r);
         let l = l.clamp(-1.0, 1.0);
         let r = r.clamp(-1.0, 1.0);
         out[0] = (l * 32767.0) as i16;
@@ -894,11 +1021,20 @@ impl PlayerState {
             let remaining_in_tick = spt.saturating_sub(self.tick_sample_cursor);
             let want = (n_frames - produced).min(remaining_in_tick as usize);
 
+            // For per-channel output the Amiga LED filter is applied
+            // independently on each plane — a downstream consumer that
+            // re-mixes the planes still sees the same global filter
+            // shape that mixed playback would produce. We allocate one
+            // filter slot per plane.
+            let n_planes = planes.len();
             for _ in 0..want {
                 // Discard the stereo mix; we only need per-channel here.
                 let _ = self.sample_all_channels(&mut scratch);
+                self.ensure_led_filter(n_planes);
                 for (ch_idx, plane) in planes.iter_mut().enumerate() {
-                    let v = scratch[ch_idx].clamp(-1.0, 1.0);
+                    let raw = scratch[ch_idx];
+                    let filtered = self.led_filter_step(ch_idx, raw);
+                    let v = filtered.clamp(-1.0, 1.0);
                     plane[produced] = (v * 32767.0) as i16;
                 }
                 produced += 1;
@@ -1055,14 +1191,27 @@ fn apply_extended_tick0(
 ) {
     let ch = &mut channels[ch_idx];
     match x {
-        0x0 => { /* E0x set filter — audible only on real A500 hardware. */ }
+        0x0 => {
+            // E0x: set Amiga LED filter on/off. Per
+            // `Protracker-v1.1B-mod.txt` Cmd E0:
+            //   E00 = "connects filter (turns power LED on)"
+            //   E01 = "disconnects filter (turns power LED off)"
+            // Real-world MODs use this for tonal contrast (filter ON
+            // gives warmth via a 1-pole lowpass at ~11.5 kHz). We can't
+            // reach the song-level state from here, so we annotate the
+            // channel and the caller propagates it after the per-channel
+            // dispatch loop completes.
+            ch.pending_led = Some(y == 0);
+        }
         0x1 => {
             // E1x: fine portamento up — one-shot slide on tick 0.
             ch.period = ch.period.saturating_sub(y as u16).max(PERIOD_MIN);
         }
         0x2 => {
-            // E2x: fine portamento down.
-            ch.period = (ch.period + y as u16).min(1023);
+            // E2x: fine portamento down — clamp at C-1 (period 856) per
+            // `Protracker-v1.1B-mod.txt` Cmd E2 ("works just like the
+            // normal portamento down" -> 2xx limit applies).
+            ch.period = (ch.period + y as u16).min(PERIOD_MAX);
         }
         0x3 => {
             // E3x: glissando control.
@@ -1284,7 +1433,12 @@ fn tone_porta_step(ch: &mut Channel) {
     } else {
         cur
     };
-    ch.period = new.clamp(PERIOD_MIN as i32, PERIOD_MAX as i32) as u16;
+    // Tone porta clamps only to the extended period range
+    // `[108, 907]`. Tightening to `[113, 856]` would break finetune
+    // extremes — e.g. a slide whose target is FT +7 B-3 (period 108)
+    // would otherwise clamp short at 113 (`Protracker-effects-MODFIL12.txt`
+    // §3.2 "Normal Min Period = 108 / Max = 907").
+    ch.period = new.clamp(PERIOD_MIN_EXT as i32, PERIOD_MAX_EXT as i32) as u16;
 
     if ch.glissando {
         // Snap to the nearest note in the current finetune row.
@@ -2344,6 +2498,412 @@ pub mod tests {
         assert_eq!(
             player.channels[0].pending_sample, 0,
             "row 2: pending_sample must clear on consumption"
+        );
+    }
+
+    // ---------- Round-15 PT-fidelity regression tests ----------
+
+    #[test]
+    fn period_clamp_constants_match_pt_spec() {
+        // Cross-check the four published period limits.
+        // Standard porta range: B-3 = 113, C-1 = 856 (Protracker-v1.1B-mod.txt
+        // Cmd 1/2). Extended range covering finetune ±8: 108..907 per
+        // Protracker-effects-MODFIL12.txt §3.2 + the period table's
+        // first/last cells.
+        assert_eq!(PERIOD_MIN, 113);
+        assert_eq!(PERIOD_MAX, 856);
+        assert_eq!(PERIOD_MIN_EXT, 108);
+        assert_eq!(PERIOD_MAX_EXT, 907);
+        // Period table corners must agree.
+        assert_eq!(PERIOD_TABLE[7][35], 108, "FT +7 B-3 must equal 108");
+        assert_eq!(PERIOD_TABLE[8][0], 907, "FT -8 C-1 must equal 907");
+    }
+
+    #[test]
+    fn porta_up_clamps_at_period_113() {
+        // Trigger a note near B-3 (period 120, A#3), then porta-up
+        // aggressively for a couple of rows. The period must clamp at
+        // 113 (B-3) and not overshoot below it. Per
+        // `Protracker-v1.1B-mod.txt` Cmd 1: "You can NOT slide higher
+        // than B-3! (Period 113)".
+        let bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 120,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            // 1xx with param 0xFF: tries to slide period down by 255
+            // every tick — would overshoot massively without the clamp.
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0x1,
+                    effect_param: 0xFF,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        for _ in 0..12 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].period, 113,
+            "1xx must clamp at period 113 (B-3)"
+        );
+    }
+
+    #[test]
+    fn porta_down_clamps_at_period_856() {
+        // Symmetric test for 2xx — must clamp at 856 (C-1).
+        let bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 800,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0x2,
+                    effect_param: 0xFF,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        for _ in 0..12 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].period, 856,
+            "2xx must clamp at period 856 (C-1)"
+        );
+    }
+
+    #[test]
+    fn effective_period_accepts_finetune_extreme_below_113() {
+        // A note at FT +7 B-3 has period 108. Without the extended
+        // clamp the mixer would force-clamp to 113 and detune the note
+        // by ~5%. With the new clamp at PERIOD_MIN_EXT = 108 the
+        // effective_period must pass 108 through unchanged.
+        let mut ch = Channel {
+            period: 108,
+            ..Channel::default()
+        };
+        // No vibrato active.
+        ch.effect = 0;
+        ch.mem_vibrato = 0;
+        let eff = ch.effective_period(0);
+        assert_eq!(eff, 108, "FT +7 B-3 (period 108) must not be clamped");
+    }
+
+    #[test]
+    fn led_filter_alpha_matches_one_pole_lowpass_at_11500hz() {
+        // Sanity-check the analytical filter coefficient. At 44.1 kHz
+        // and 11.5 kHz cutoff, alpha = 1 - exp(-2*pi*11500/44100).
+        let a = PlayerState::compute_led_alpha(44_100);
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let expected = 1.0 - (-two_pi * 11_500.0 / 44_100.0).exp();
+        let diff = (a - expected).abs();
+        assert!(
+            diff < 1e-6,
+            "LED alpha mismatch: got {a}, expected {expected}"
+        );
+        // The 1-pole IIR is stable iff 0 < alpha <= 1.
+        assert!(a > 0.0 && a <= 1.0, "alpha {a} outside (0, 1]");
+    }
+
+    #[test]
+    fn led_filter_attenuates_nyquist_input() {
+        // Drive a +1/-1 alternating signal (the worst-case Nyquist
+        // content at 44.1 kHz) through the filter directly. With the
+        // 1-pole IIR at fc=11.5 kHz the steady-state magnitude of the
+        // alternating signal must be substantially reduced (the filter's
+        // 22.05 kHz response is ~ 1 / sqrt(1 + (22050/11500)^2) ≈ 0.46).
+        // With the filter OFF the magnitude passes through unchanged.
+        let make_player_with_led = |led: bool| -> PlayerState {
+            let bytes = synth_square_mod();
+            let mut player = make_player(&bytes);
+            player.led_filter = led;
+            player.led_filter_state.clear();
+            player.led_filter_alpha = f32::NAN;
+            // Force alpha computation now.
+            player.ensure_led_filter(2);
+            player
+        };
+
+        let drive = |player: &mut PlayerState, n: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let x = if i % 2 == 0 { 1.0 } else { -1.0 };
+                out.push(player.led_filter_step(0, x));
+            }
+            out
+        };
+
+        let mut p_on = make_player_with_led(true);
+        let mut p_off = make_player_with_led(false);
+        let on = drive(&mut p_on, 256);
+        let off = drive(&mut p_off, 256);
+
+        // Use the second half of the trace (after transient).
+        let on_pp: f32 = on[128..].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let off_pp: f32 = off[128..].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+
+        // Filter-off must be ~1.0 (passthrough); filter-on at Nyquist
+        // is |H(fs/2)| = a / (2-a) for a 1-pole IIR — with a≈0.806 at
+        // 11.5 kHz / 44.1 kHz that's ≈0.675. So the filtered magnitude
+        // must be measurably smaller (we allow 0.8 as headroom).
+        assert!(
+            off_pp > 0.99,
+            "filter-off magnitude {off_pp} should pass through"
+        );
+        assert!(
+            on_pp < off_pp * 0.8,
+            "filter-on magnitude {on_pp} should be < 80% of filter-off {off_pp}"
+        );
+    }
+
+    #[test]
+    fn led_filter_default_is_on_at_song_start() {
+        // Real Amiga power-on default leaves LED on. PT inherits this
+        // and assumes the filter is engaged for the very first note.
+        // See `Protracker-v1.1B-mod.txt` Cmd E0 ("E00 connects filter
+        // (turns power LED on)").
+        let bytes = synth_square_mod();
+        let player = make_player(&bytes);
+        assert!(
+            player.led_filter,
+            "LED filter must default to ON (Amiga power-on state)"
+        );
+    }
+
+    #[test]
+    fn e0x_toggles_led_filter() {
+        // Row 0: trigger a note. Row 1: E01 (LED OFF). Row 2: E00
+        // (LED ON). The player.led_filter flag should follow.
+        let bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xE,
+                    effect_param: 0x01,
+                },
+            ),
+            (
+                2,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xE,
+                    effect_param: 0x00,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        // Row 0 — LED should remain ON (default).
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert!(player.led_filter, "row 0: LED still ON");
+        // Row 1 — E01 fires on tick 0, LED goes OFF.
+        step_one_tick(&mut player);
+        assert!(!player.led_filter, "row 1: E01 must clear LED");
+        for _ in 0..5 {
+            step_one_tick(&mut player);
+        }
+        // Row 2 — E00 fires, LED back ON.
+        step_one_tick(&mut player);
+        assert!(player.led_filter, "row 2: E00 must restore LED");
+    }
+
+    #[test]
+    fn fxx_speed_bpm_split_at_0x20() {
+        // Per the convention noted in `Pro-Noise-Soundtracker-rev4.txt`
+        // (lines 362-365) and `Protracker-v1.1B-mod.txt` Cmd F:
+        //   z < 0x20 → set ticks/division (speed)
+        //   z >= 0x20 → set BPM
+        // 0x1F (= 31) is the largest speed value, 0x20 (= 32) is the
+        // smallest BPM value. Verify both by running the song-level
+        // resolution path from `enter_row`.
+        let bytes_speed = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0xF,
+                effect_param: 0x1F,
+            },
+        )]);
+        let mut player = make_player(&bytes_speed);
+        step_one_tick(&mut player);
+        assert_eq!(player.speed, 0x1F, "F1F must set speed to 31");
+        assert_eq!(player.bpm, DEFAULT_BPM, "F1F must NOT touch BPM");
+
+        let bytes_bpm = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0xF,
+                effect_param: 0x20,
+            },
+        )]);
+        let mut player = make_player(&bytes_bpm);
+        step_one_tick(&mut player);
+        assert_eq!(player.bpm, 0x20, "F20 must set BPM to 32");
+        assert_eq!(player.speed, DEFAULT_SPEED, "F20 must NOT touch speed");
+    }
+
+    #[test]
+    fn e6_dxy_same_row_last_channel_wins() {
+        // Place E6x on channel 0 (would loop) and Dxy on channel 1
+        // (forces pattern break to specified row). Per the per-channel
+        // dispatch in `apply_tick0_effect`, both write to
+        // `pending_jump`; the later channel wins (PT idiom).
+        // Verify Dxy on a higher channel takes precedence over E6 on
+        // a lower channel — the song advances to the break-row, not
+        // to the loop-target.
+        let bytes = synth_mod_with_pattern(&[
+            // Row 0: trigger note on ch0.
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            // Row 1: E60 on ch0 (set loop start = row 1).
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xE,
+                    effect_param: 0x60,
+                },
+            ),
+            // Row 2: E61 on ch0 + D05 on ch1. E61 would loop to row 1
+            // (jump to row 1 in current order); D05 jumps to row 5 in
+            // next order. Per PT (channel 1 > channel 0), Dxy wins.
+            (
+                2,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xE,
+                    effect_param: 0x61,
+                },
+            ),
+            (
+                2,
+                1,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xD,
+                    effect_param: 0x05,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        // Walk rows 0..=2 (3 rows × 6 ticks).
+        for _ in 0..18 {
+            step_one_tick(&mut player);
+        }
+        // Then advance one more tick to fire next_row().
+        step_one_tick(&mut player);
+        // Pattern-break wins: we should now be on row 5 of the next
+        // order (and `ended` since there's only one pattern).
+        // For our 1-pattern synth, advancing past order 0 sets `ended`.
+        assert!(
+            player.ended || player.row == 5,
+            "Dxy must override E6x when on a higher-numbered channel; \
+             got row={}, order={}, ended={}",
+            player.row,
+            player.order_index,
+            player.ended,
+        );
+    }
+
+    #[test]
+    fn vibrato_first_half_lowers_pitch_per_firelight_pseudocode() {
+        // FireLight §5.5 says the sine-table values are ADDED to the
+        // "AMIGA frequency" (= the period) in the first half-cycle,
+        // and SUBTRACTED in the second. Adding to the period LOWERS
+        // the audible pitch (pitch ∝ PAULA_CLOCK / period). Verify
+        // our implementation matches this convention.
+        //
+        // This test pins down the canonical interpretation we follow,
+        // disambiguating against the alternative C-snippet reading
+        // some legacy docs cite.
+        let mut ch = Channel {
+            period: 428,
+            sample_index: 1,
+            volume: 64,
+            active: true,
+            effect: 0x4,
+            mem_vibrato: 0x84, // rate=8, depth=4
+            vib_pos: 8,        // mid first half-cycle (positive)
+            ..Channel::default()
+        };
+        ch.vib_wave.shape = 0; // sine
+        let off = PlayerState::vibrato_offset(&ch);
+        assert!(
+            off > 0,
+            "Per FireLight §5.5: positive vib_pos must ADD to period \
+             (lowering pitch). Got offset {off}."
+        );
+        // Effective period should be > base period.
+        let eff = ch.effective_period(off);
+        assert!(
+            eff > ch.period,
+            "effective_period must rise on positive vib_pos"
+        );
+
+        // Now drive it negative — second half-cycle subtracts.
+        ch.vib_pos = -8;
+        let off = PlayerState::vibrato_offset(&ch);
+        assert!(
+            off < 0,
+            "Per FireLight §5.5: negative vib_pos must SUBTRACT from period \
+             (raising pitch). Got offset {off}."
         );
     }
 

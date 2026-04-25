@@ -82,7 +82,7 @@ Spec-level effect coverage per
 | Cxx | Set volume | implemented |
 | Dxy | Pattern break (decimal `x*10 + y`) | implemented |
 | Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM) | implemented |
-| E0x | Filter on/off | accepted, no-op (hardware only) |
+| E0x | Filter on/off | implemented (1-pole IIR lowpass at 11.5 kHz; LED defaults ON) |
 | E1x / E2x | Fine portamento up / down (tick-0 one-shot) | implemented |
 | E3x | Glissando control | implemented |
 | E4x / E7x | Vibrato / tremolo waveform (sine / ramp-down / square / retrig bit) | implemented |
@@ -120,31 +120,37 @@ a unit test in `src/player.rs`):
   artefacts on common idioms like setting up the next note's volume one
   row early. Cited in `Protracker-effects-MODFIL12.txt` §3.2 +
   `Pro-Noise-Soundtracker-rev4.txt:113-118`.
-
-### Known remaining fidelity gaps
-
-These are documented but not yet fixed. PRs welcome:
-
-- **Amiga LED filter (E00 / E01)** — currently a no-op. Real PT applies
-  a one-pole 6 dB/oct lowpass at ~3.3 kHz when LED is off (E00), giving
-  classic AMIGA-era warmth. Some songs (especially demoscene tracks)
-  rely on it being on by default at song start. Implementing this needs
-  a per-output-rate biquad in the mix path.
-- **Vibrato sign convention** — the FireLight tutorial pseudocode and the
-  reference C snippet disagree on whether `vibrato_pos >= 0` should
-  *raise* or *lower* the period. Our implementation follows one of the
-  two. Songs that depend on the exact phase of vibrato may sound 180°
-  out of phase. Audibly indistinguishable in most cases.
-- **Period clamping at finetune extremes** — current clamp is
-  `[113, 856]`. Per `Protracker-effects-MODFIL12.txt` the "normal"
-  range extends to `[108, 907]` for finetune ±8. Songs that legitimately
-  use finetune -8 with low B-3 can get slightly stuck at the wrong limit.
-- **Pattern-loop + pattern-break interaction** — when E6x and Dxy land on
-  the same row (rare), PT processes E6x first. Current code may not
-  honour the exact order; needs a synthetic test.
-- **Fxx==0x20 boundary** — current split is `<0x20 = speed`, `>=0x20 = BPM`.
-  Some sources say `<=0x1F = speed`, `>=0x20 = BPM` (same), but a few
-  legacy implementations off-by-one at exactly 0x1F. Needs verification.
+- **Amiga LED filter (E00 / E01)** — a 1-pole exponential lowpass at
+  ~11.5 kHz is applied to the mixed output (and to each plane in the
+  per-channel mode) when the LED is on. The Amiga power-on default is
+  LED on, so the filter is engaged at song start. `E00` reconnects /
+  `E01` disconnects, with last-channel-wins resolution per row (the
+  same idiom as `Fxx`). Cutoff sourced from
+  `multimedia-cx-protracker.html` E0x ("For a simple 1-pole low-pass
+  filter, 11500Hz gives a fairly decent estimation").
+- **Period range** — the *porta* effects (`1xx` / `2xx` / `E1x` / `E2x`)
+  clamp to `[113, 856]` per `Protracker-v1.1B-mod.txt` Cmd 1/2 ("you
+  cannot slide higher than B-3 / lower than C-1"). The mixer's
+  `effective_period` and tone-porta storage clamp to the *extended*
+  range `[108, 907]` so that finetune ±8 extremes (`PERIOD_TABLE[7][35]
+  = 108`, `PERIOD_TABLE[8][0] = 907`) play at the right pitch instead
+  of being snapped back to the standard limits.
+- **Vibrato sign convention** — we follow `FireLight §5.5` pseudocode:
+  the sine-table value is *added* to the period (== "AMIGA frequency"
+  in the doc) for `vibrato_pos >= 0` and subtracted for `< 0`. Adding
+  to the period lowers the audible pitch, so the first half-cycle of a
+  fresh vibrato dips below the base note. This is the canonical PT
+  interpretation.
+- **`Fxx` speed/BPM split** — `< 0x20` sets ticks/division (speed),
+  `>= 0x20` sets BPM, matching `Protracker-v1.1B-mod.txt` Cmd F and
+  the convention noted in `Pro-Noise-Soundtracker-rev4.txt:362-365`.
+  `0x1F` is the largest speed value, `0x20` (= 32) is the smallest
+  BPM value.
+- **`E6x` / `Dxy` same-row resolution** — both effects write to the
+  same `pending_jump`; per the `Pro-Noise-Soundtracker-rev4.txt:375-377`
+  channel-priority rule, the higher-numbered channel wins. The
+  regression test pins this down so a future refactor doesn't quietly
+  flip the ordering.
 
 ## License
 
