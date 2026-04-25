@@ -13,9 +13,9 @@
 
 use std::io::Cursor;
 
-use oxideav_codec::{CodecRegistry, Decoder};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
+use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
     container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, stm, CODEC_ID_STM_STR,
 };
@@ -97,7 +97,7 @@ fn open_stm_populates_metadata_and_emits_one_packet() {
     let bytes = build_minimal_stm();
     let cursor = Cursor::new(bytes.clone());
 
-    let codec_reg = oxideav_codec::CodecRegistry::new();
+    let codec_reg = oxideav_core::CodecRegistry::new();
     let mut demux = reg
         .open_demuxer("stm", Box::new(cursor), &codec_reg)
         .expect("stm demuxer must be registered");
@@ -174,7 +174,7 @@ fn parse_patterns_and_samples_off_demuxed_packet() {
     let bytes = build_minimal_stm();
     let cursor = Cursor::new(bytes);
 
-    let codec_reg = oxideav_codec::CodecRegistry::new();
+    let codec_reg = oxideav_core::CodecRegistry::new();
     let mut demux = reg
         .open_demuxer("stm", Box::new(cursor), &codec_reg)
         .expect("stm demuxer");

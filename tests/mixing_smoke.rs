@@ -4,8 +4,8 @@
 //! `OUTPUT_SAMPLE_RATE` when a note is triggered, and produces pure
 //! silence when the pattern contains no note events.
 
-use oxideav_codec::{CodecRegistry, Decoder};
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
 
 const HEADER_FIXED_SIZE: usize = 1084;

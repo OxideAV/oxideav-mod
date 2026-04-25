@@ -15,11 +15,11 @@
 //!   to mix / pan / analyse channels independently (DAWs, visualizers,
 //!   per-instrument tooling) drive the decoder via this codec id.
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result,
     SampleFormat, TimeBase,
 };
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 use crate::container::OUTPUT_SAMPLE_RATE;
 use crate::header::parse_header;

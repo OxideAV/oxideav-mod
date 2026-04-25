@@ -74,8 +74,8 @@ pub mod stm_player;
 pub mod xm;
 pub mod xm_player;
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::CodecRegistry;
+use oxideav_core::ContainerRegistry;
 
 /// Codec id for the mixed-stereo MOD decoder.
 pub const CODEC_ID_STR: &str = "mod";

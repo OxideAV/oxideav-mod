@@ -8,11 +8,11 @@
 
 use std::io::Read;
 
-use oxideav_container::{ContainerRegistry, Demuxer, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, ReadSeek};
 
 use crate::header::parse_header;
 use crate::stm;
@@ -47,7 +47,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 /// ProTracker / Soundtracker family signature at offset 1080 — a 4-byte
 /// magic identifying the channel layout. If the file is too short to
 /// reach offset 1084, fall back to extension confirmation.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() < 1084 {
         if p.ext == Some("mod") {
             return 25;
@@ -185,7 +185,7 @@ impl Demuxer for ModDemuxer {
 /// it to be printable ASCII in the probe to avoid false positives, but
 /// do NOT hard-code any specific string so we don't miss Scream Tracker
 /// clones or rewrites.
-fn probe_stm(p: &oxideav_container::ProbeData) -> u8 {
+fn probe_stm(p: &oxideav_core::ProbeData) -> u8 {
     if stm::is_stm(p.buf) {
         // Bonus points when the tracker-name field matches common values;
         // otherwise still return a solid-but-not-perfect score so the MOD
@@ -320,7 +320,7 @@ impl Demuxer for StmDemuxer {
 /// `"Extended Module: "` ASCII banner at offset 0 (capital M, trailing
 /// colon+space — per `FastTracker-2-xm-alt.txt`, lowercase is rejected
 /// by FT2 itself). Extension-only match is a weak fallback.
-fn probe_xm(p: &oxideav_container::ProbeData) -> u8 {
+fn probe_xm(p: &oxideav_core::ProbeData) -> u8 {
     if xm::is_xm(p.buf) {
         return 100;
     }

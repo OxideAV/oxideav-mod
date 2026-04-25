@@ -5,8 +5,8 @@
 //! triggering notes only on channel 0 leaves channels 1..=3 silent in
 //! their dedicated planes — which a mixed-stereo output cannot verify.
 
-use oxideav_codec::{CodecRegistry, Decoder};
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_PLANAR_STR};
 
 const HEADER_FIXED_SIZE: usize = 1084;

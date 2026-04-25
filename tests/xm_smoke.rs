@@ -13,9 +13,9 @@
 
 use std::io::Cursor;
 
-use oxideav_codec::{CodecRegistry, Decoder};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
+use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
     container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, xm, CODEC_ID_XM_STR,
 };
@@ -153,7 +153,7 @@ fn open_xm_populates_metadata_and_emits_one_packet() {
     let bytes = build_minimal_xm();
     let cursor = Cursor::new(bytes.clone());
 
-    let codec_reg = oxideav_codec::CodecRegistry::new();
+    let codec_reg = oxideav_core::CodecRegistry::new();
     let mut demux = reg
         .open_demuxer("xm", Box::new(cursor), &codec_reg)
         .expect("xm demuxer must be registered");
@@ -224,7 +224,7 @@ fn parse_patterns_and_instruments_off_demuxed_packet() {
     let bytes = build_minimal_xm();
     let cursor = Cursor::new(bytes);
 
-    let codec_reg = oxideav_codec::CodecRegistry::new();
+    let codec_reg = oxideav_core::CodecRegistry::new();
     let mut demux = reg
         .open_demuxer("xm", Box::new(cursor), &codec_reg)
         .expect("xm demuxer");
