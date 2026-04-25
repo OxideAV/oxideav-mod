@@ -14,7 +14,13 @@
 //!   decode — so the container just delivers the bytes to the codec.
 //! - A **mixed-stereo decoder** under codec id [`CODEC_ID_STR`] = `"mod"`.
 //!   Emits one interleaved S16 stereo `AudioFrame` every ~1024 samples;
-//!   the drop-in option for plug-and-play playback.
+//!   the drop-in option for plug-and-play playback. Stereo pan defaults
+//!   to a 70 % L/R separation (matching xmp/openmpt/libxmp's default)
+//!   rather than the strict Amiga hard pan — see
+//!   [`player::PlayerState::set_pan_separation`] for the override and
+//!   the rationale (`Protracker-effects-MODFIL12.txt` §11 itself
+//!   recommends *against* full hard pan "Especially when using
+//!   headphones").
 //! - A **per-channel decoder** under codec id [`CODEC_ID_PLANAR_STR`] =
 //!   `"mod_planar"`. Emits planar S16P `AudioFrame`s with one plane per
 //!   MOD tracker channel (4 / 6 / 8 / … / 32), post-volume but

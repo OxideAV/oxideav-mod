@@ -551,3 +551,84 @@ fn malformed_song_length_terminates() {
         pcm.len()
     );
 }
+
+/// Reproduce the "halluc.mod intro sounds broken from 4.5 s in"
+/// regression: a 4-channel song whose intro uses ONLY the
+/// right-panned slot (channels 1 and 2 per the Amiga convention,
+/// `Protracker-effects-MODFIL12.txt` §11). With strict hard pan the
+/// LEFT speaker is dead silent for the entire intro, which on
+/// headphones is indistinguishable from "the player has broken
+/// somewhere around the 4-5 s mark"; that is exactly what the user
+/// reported about `halluc.mod`. The default `pan_separation = 0.7`
+/// (matching xmp / openmpt / libxmp) bleeds the right side into the
+/// left so the listener hears a coherent stereo intro on both ears.
+///
+/// We assert: when only ch1 + ch2 carry notes, BOTH the rendered L
+/// and R buses must carry audible signal at the default pan
+/// separation, *and* setting `pan_separation = 1.0` on the player
+/// state must reinstate the strict hard-pan behaviour (left silent).
+#[test]
+fn pan_separation_default_keeps_both_ears_alive_on_right_only_intro() {
+    use oxideav_core::CodecParameters;
+    use oxideav_mod::container::OUTPUT_SAMPLE_RATE;
+    use oxideav_mod::header::parse_header;
+    use oxideav_mod::player::{parse_patterns, PlayerState};
+    use oxideav_mod::samples::extract_samples;
+
+    // Intro that only sounds on channels 1 (right) and 2 (right) —
+    // exactly the topology of halluc.mod's pattern 5 first 31 rows.
+    let bytes = build_mod_n_channels(4, 1, |_, pat| {
+        write_note(pat, 4, 0, 1, 428, 1, 0, 0); // ch1: right
+        write_note(pat, 4, 2, 2, 570, 1, 0, 0); // ch2: right
+        write_note(pat, 4, 4, 1, 381, 1, 0, 0);
+        write_note(pat, 4, 6, 2, 570, 1, 0, 0);
+    });
+
+    // ---- Default-pan render via the registered codec ----
+    let _ = CodecParameters::audio; // silence "unused" if any
+    let pcm_default = decode_mixed(bytes.clone(), 88_200); // 2 s
+    let (left, right): (Vec<i16>, Vec<i16>) =
+        pcm_default.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
+    let l_rms =
+        (left.iter().map(|&s| (s as i64).pow(2)).sum::<i64>() as f64 / left.len() as f64).sqrt();
+    let r_rms =
+        (right.iter().map(|&s| (s as i64).pow(2)).sum::<i64>() as f64 / right.len() as f64).sqrt();
+    assert!(
+        l_rms > 200.0 && r_rms > 200.0,
+        "default pan separation should keep both ears alive on a \
+         right-only intro: L_rms={l_rms:.0} R_rms={r_rms:.0} \
+         (the regression: hard pan made L=0 for the entire intro, \
+         which sounds 'broken at ~5 s' on headphones)"
+    );
+    // Right is the loud side — pan_separation < 1 still preserves
+    // the bias.
+    assert!(
+        r_rms > l_rms,
+        "right side must dominate (channels 1+2 are still right-leaning): \
+         L_rms={l_rms:.0} R_rms={r_rms:.0}"
+    );
+
+    // ---- Strict hard-pan render via the public override ----
+    let header = parse_header(&bytes).expect("header");
+    let samples = extract_samples(&header, &bytes);
+    let patterns = parse_patterns(&header, &bytes);
+    let mut player = PlayerState::new(&header, samples, patterns, OUTPUT_SAMPLE_RATE);
+    player.set_pan_separation(1.0);
+    let mut hard = vec![0i16; 88_200 * 2];
+    let n = player.render(&mut hard);
+    hard.truncate(n * 2);
+    let (hl, hr): (Vec<i16>, Vec<i16>) = hard.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
+    let hl_rms =
+        (hl.iter().map(|&s| (s as i64).pow(2)).sum::<i64>() as f64 / hl.len() as f64).sqrt();
+    let hr_rms =
+        (hr.iter().map(|&s| (s as i64).pow(2)).sum::<i64>() as f64 / hr.len() as f64).sqrt();
+    assert!(
+        hl_rms < 1.0,
+        "with set_pan_separation(1.0) the LEFT side must be exactly \
+         silent on a right-only intro (Amiga hard pan): hl_rms={hl_rms:.2}"
+    );
+    assert!(
+        hr_rms > 200.0,
+        "right side should still carry signal: hr_rms={hr_rms:.0}"
+    );
+}

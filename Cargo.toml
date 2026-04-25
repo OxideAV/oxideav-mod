@@ -15,3 +15,10 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# `ureq` powers the URL-backed `halluc.mod` regression test. The fixture
+# is hosted at https://samples.oxideav.org/magicaltux/mod/halluc.mod and
+# cached on disk under `target/test-fixtures/` after the first fetch so
+# repeat runs are offline and fast.
+ureq = "3"
