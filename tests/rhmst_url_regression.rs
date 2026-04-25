@@ -1,40 +1,30 @@
-//! URL-backed regression test for `halluc.mod` (4-channel ProTracker).
+//! URL-backed regression test for `rhmst.mod` (4-channel ProTracker,
+//! "rhythm master" — the second real-world MOD reported breaking around
+//! the 4.5 s mark together with `halluc.mod`).
 //!
-//! Replaces the user-local Dropbox path the `halluc_diag` harness uses
-//! with a stable HTTPS URL hosted at
+//! Mirrors `halluc_url_regression.rs` byte-for-byte in shape; the only
+//! axis-of-variation is the fixture metadata (URL, SHA-256, file size,
+//! header invariants). Two independent fixtures pinned the same way
+//! protect against a class of regressions where a fix that landed
+//! green for one MOD silently regresses on another, since both were
+//! reported with the same 4.5 s breakage symptom.
 //!
-//!   https://samples.oxideav.org/magicaltux/mod/halluc.mod
-//!
-//! so the same fixture is reachable from CI / a fresh clone. The first
-//! run downloads the file and caches it under
-//! `target/test-fixtures/halluc.mod`; subsequent runs reuse the cache
-//! and never hit the network.
-//!
-//! Network access is opt-in: set `OXIDEAV_NETWORK_TESTS=1` (or
-//! `OXIDEAV_NETWORK_TESTS=true`) to run. Without the flag — or when the
-//! download fails (offline laptop, broken DNS, throttled CDN) — the test
-//! prints a skip message and returns success, so this file is safe to
-//! check in.
+//! Network access is opt-in: set `OXIDEAV_NETWORK_TESTS=1` to run.
+//! Without the flag — or when the download fails (offline laptop,
+//! broken DNS, throttled CDN) — the test prints a skip message and
+//! returns success, so this file is safe to check in.
 //!
 //! What it pins:
 //!
-//! 1. The bytes match the published Cloudflare ETag (size 128020,
+//! 1. The bytes match the published Cloudflare ETag (size 115272,
 //!    SHA-256 below). If the upstream file is replaced the cache is
-//!    invalidated and re-downloaded; if the size or hash differ we fail
-//!    loudly so the regression is anchored to a specific binary.
+//!    invalidated and re-downloaded; if the size or hash differ we
+//!    fail loudly so the regression is anchored to a specific binary.
 //! 2. The header parses as a 4-channel `M.K.` MOD with the expected
-//!    title (`hallucinations`), 108 orders, 27 patterns, and the known
-//!    sample-name signature (`st-15:itklaver` / `st-15:nuisvipe` / …).
+//!    title (`rhythm master`) and 25 orders / 15 patterns.
 //! 3. The first 30 seconds render through the registered `mod` codec
-//!    without panic, NaN, infinite-clip, or sustained silence (catches
-//!    the classes of regressions seen during the 4.5s breakage hunt:
-//!    the player must keep producing audio across the row 24 / 28 / 32
-//!    sample re-trigger boundaries that were the divergence locus).
-//!
-//! The render-comparison invariants are intentionally loose because
-//! reasonable players differ on stereo separation, ramp shape, and
-//! filter cutoff. Tightening them is the second half of the breakage
-//! hunt — see `crates/oxideav-mod/CHANGELOG.md` for the running notes.
+//!    without panic, NaN, infinite-clip, or sustained silence —
+//!    catches the same 4.5 s symptom class the user reported.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -45,14 +35,14 @@ use oxideav_core::{
 };
 use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
 
-const FIXTURE_URL: &str = "https://samples.oxideav.org/magicaltux/mod/halluc.mod";
+const FIXTURE_URL: &str = "https://samples.oxideav.org/magicaltux/mod/rhmst.mod";
 
 /// SHA-256 of the published fixture as of 2026-04-25. If this hash drifts
 /// the upstream blob has changed and the test will redownload + fail
 /// loudly so we know the cache is stale.
-const FIXTURE_SHA256: &str = "4821d86e4e2e5de2e420c460fbfa97b53a6c0e9c844412ce0587bc6596489fe4";
+const FIXTURE_SHA256: &str = "31f2f8fe99b6ac4b3896f08151c796b15d80b4eea341b7328afdd3a4ece733d2";
 
-const FIXTURE_BYTES: u64 = 128_020;
+const FIXTURE_BYTES: u64 = 115_272;
 
 /// Returns the on-disk cache path for the fixture, ensuring the parent
 /// directory exists.
@@ -60,8 +50,6 @@ fn cache_path() -> PathBuf {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            // Fall back to the manifest dir's `target/`. `CARGO_MANIFEST_DIR`
-            // points at the crate root.
             let crate_dir = std::env::var("CARGO_MANIFEST_DIR")
                 .map(PathBuf::from)
                 .expect("CARGO_MANIFEST_DIR set during cargo test");
@@ -69,14 +57,14 @@ fn cache_path() -> PathBuf {
         });
     let dir = target_dir.join("test-fixtures");
     fs::create_dir_all(&dir).expect("create test-fixtures dir");
-    dir.join("halluc.mod")
+    dir.join("rhmst.mod")
 }
 
 /// Tiny SHA-256 over `bytes` — pulled in only when verifying the cache.
 /// Avoiding `sha2` keeps the dev-dependency surface to `ureq` only.
+/// FIPS 180-4 reference implementation, byte-oriented. Not constant-time;
+/// we only use it for fixture integrity, never for crypto.
 fn sha256_hex(bytes: &[u8]) -> String {
-    // FIPS 180-4 reference implementation, byte-oriented. Not constant-time;
-    // we only use it for fixture integrity, never for crypto.
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -167,44 +155,42 @@ fn network_tests_enabled() -> bool {
 
 fn fetch_with_cache() -> Option<Vec<u8>> {
     let path = cache_path();
-    // 1. Cache hit and intact — use it.
     if let Ok(bytes) = fs::read(&path) {
         if bytes.len() as u64 == FIXTURE_BYTES && sha256_hex(&bytes) == FIXTURE_SHA256 {
-            eprintln!("[halluc] using cached fixture {}", path.display());
+            eprintln!("[rhmst] using cached fixture {}", path.display());
             return Some(bytes);
         }
         eprintln!(
-            "[halluc] cached fixture {} is stale (len {} / sha256 {}), re-downloading",
+            "[rhmst] cached fixture {} is stale (len {} / sha256 {}), re-downloading",
             path.display(),
             bytes.len(),
             sha256_hex(&bytes)
         );
         let _ = fs::remove_file(&path);
     }
-    // 2. Cache miss — only fetch if network tests are explicitly enabled.
     if !network_tests_enabled() {
         eprintln!(
-            "[halluc] OXIDEAV_NETWORK_TESTS not set and no cached fixture at {} — skipping",
+            "[rhmst] OXIDEAV_NETWORK_TESTS not set and no cached fixture at {} — skipping",
             path.display()
         );
         return None;
     }
-    eprintln!("[halluc] downloading {}", FIXTURE_URL);
+    eprintln!("[rhmst] downloading {}", FIXTURE_URL);
     let resp = match ureq::get(FIXTURE_URL).call() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[halluc] download failed ({e}) — skipping");
+            eprintln!("[rhmst] download failed ({e}) — skipping");
             return None;
         }
     };
     let mut buf = Vec::with_capacity(FIXTURE_BYTES as usize);
     if let Err(e) = resp.into_body().into_reader().read_to_end(&mut buf) {
-        eprintln!("[halluc] body read failed ({e}) — skipping");
+        eprintln!("[rhmst] body read failed ({e}) — skipping");
         return None;
     }
     if buf.len() as u64 != FIXTURE_BYTES {
         eprintln!(
-            "[halluc] downloaded size {} != expected {} — skipping",
+            "[rhmst] downloaded size {} != expected {} — skipping",
             buf.len(),
             FIXTURE_BYTES
         );
@@ -213,17 +199,16 @@ fn fetch_with_cache() -> Option<Vec<u8>> {
     let got = sha256_hex(&buf);
     if got != FIXTURE_SHA256 {
         panic!(
-            "halluc.mod sha256 mismatch:\n  expected {FIXTURE_SHA256}\n  got      {got}\n\
+            "rhmst.mod sha256 mismatch:\n  expected {FIXTURE_SHA256}\n  got      {got}\n\
              Either the upstream blob changed (update FIXTURE_SHA256) or the download was \
              corrupted."
         );
     }
-    // Atomic-ish write so a partial cache never wins on the next run.
     let tmp = path.with_extension("mod.tmp");
     if let Err(e) = fs::write(&tmp, &buf).and_then(|_| fs::rename(&tmp, &path)) {
-        eprintln!("[halluc] cache write to {} failed ({e})", path.display());
+        eprintln!("[rhmst] cache write to {} failed ({e})", path.display());
     } else {
-        eprintln!("[halluc] cached at {}", path.display());
+        eprintln!("[rhmst] cached at {}", path.display());
     }
     Some(buf)
 }
@@ -262,10 +247,10 @@ fn decode_n_seconds(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
 }
 
 #[test]
-#[ignore = "fetches halluc.mod from samples.oxideav.org; opt in via OXIDEAV_NETWORK_TESTS=1"]
-fn halluc_mod_url_regression() {
+#[ignore = "fetches rhmst.mod from samples.oxideav.org; opt in via OXIDEAV_NETWORK_TESTS=1"]
+fn rhmst_mod_url_regression() {
     let Some(bytes) = fetch_with_cache() else {
-        eprintln!("[halluc] skipped (no cache, no network)");
+        eprintln!("[rhmst] skipped (no cache, no network)");
         return;
     };
 
@@ -275,25 +260,11 @@ fn halluc_mod_url_regression() {
 
     // ---- 2. Header invariants ----
     let header = oxideav_mod::header::parse_header(&bytes).expect("parse header");
-    assert_eq!(header.title, "hallucinations");
+    assert_eq!(header.title, "rhythm master");
     assert_eq!(&header.signature, b"M.K.");
     assert_eq!(header.channels, 4);
-    assert_eq!(header.song_length, 108);
-    assert_eq!(header.n_patterns, 27);
-    let names: Vec<&str> = header
-        .samples
-        .iter()
-        .filter(|s| s.length > 0)
-        .map(|s| s.name.as_str())
-        .collect();
-    assert!(
-        names.iter().any(|n| n.contains("itklaver")),
-        "expected `st-15:itklaver` sample, got {names:?}"
-    );
-    assert!(
-        names.iter().any(|n| n.contains("nuisvipe")),
-        "expected `st-15:nuisvipe` sample, got {names:?}"
-    );
+    assert_eq!(header.song_length, 25);
+    assert_eq!(header.n_patterns, 15);
 
     // ---- 3. Render the first 30 s and check basic invariants ----
     let total_secs = 30;
@@ -317,97 +288,115 @@ fn halluc_mod_url_regression() {
     let clip_ratio = clipped as f64 / pcm.len() as f64;
     assert!(
         clip_ratio < 0.005,
-        "halluc.mod render is clipping ({clipped}/{} = {clip_ratio:.4}); a healthy render \
+        "rhmst.mod render is clipping ({clipped}/{} = {clip_ratio:.4}); a healthy render \
          should sit comfortably below the rails",
         pcm.len()
     );
 
-    // Per-second RMS must stay strictly positive — silent windows mean
-    // the player has stalled (the bug the original 4.5 s hunt is
-    // chasing). Compute RMS over the *right* channel since it's the
-    // active one through the entire first 10 s (channels 1, 2 carry
-    // pattern 5; pattern 0 brings channel 3 in at ~10 s).
+    // Per-second RMS for both channels must stay strictly positive
+    // throughout the first 30 seconds — the song has continuous notes
+    // through that window so any near-silent second means the player
+    // stalled (the bug the original 4.5 s hunt is chasing). Tightened
+    // bounds (vs `halluc.mod`'s 500 / 200) because rhmst's pattern 0
+    // already has all four channels active from row 0 onward, so we
+    // don't need the "intro is right-only" bleed-through carve-out.
     let sr = OUTPUT_SAMPLE_RATE as usize;
-    let mut min_window_rms_r = f64::INFINITY;
-    let mut min_window_at = 0;
+    let mut min_rms_l = f64::INFINITY;
+    let mut min_rms_r = f64::INFINITY;
+    let mut min_at_l = 0usize;
+    let mut min_at_r = 0usize;
     for w in 0..total_secs {
         let s = w * sr;
         let e = s + sr;
-        let mut sum_sq = 0.0f64;
+        let mut sum_l = 0.0f64;
+        let mut sum_r = 0.0f64;
         for i in s..e {
-            let v = pcm[i * 2 + 1] as f64;
-            sum_sq += v * v;
+            let l = pcm[i * 2] as f64;
+            let r = pcm[i * 2 + 1] as f64;
+            sum_l += l * l;
+            sum_r += r * r;
         }
-        let rms = (sum_sq / sr as f64).sqrt();
-        if rms < min_window_rms_r {
-            min_window_rms_r = rms;
-            min_window_at = w;
+        let rms_l = (sum_l / sr as f64).sqrt();
+        let rms_r = (sum_r / sr as f64).sqrt();
+        if rms_l < min_rms_l {
+            min_rms_l = rms_l;
+            min_at_l = w;
+        }
+        if rms_r < min_rms_r {
+            min_rms_r = rms_r;
+            min_at_r = w;
         }
     }
-    eprintln!(
-        "[halluc] right-channel min RMS = {:.0} at t={} s",
-        min_window_rms_r, min_window_at
-    );
-    // Tightened bound (was 500.0). Post-fix the min right-channel RMS
-    // measures around 1900-2200 across the first 30 s (versus
-    // ~700-1200 for the pre-pan-bleed pre-2-pole-filter renders).
-    // 1000 leaves a comfortable 2x margin while still flagging any
-    // future regression that drops back to the silence-window range.
+    eprintln!("[rhmst] min RMS L={min_rms_l:.0}@{min_at_l}s  R={min_rms_r:.0}@{min_at_r}s");
     assert!(
-        min_window_rms_r > 1000.0,
-        "right-channel RMS dropped to {:.0} at t={} s; the song has continuous notes \
-         throughout the first 30 s, so any near-silent window means the player stalled",
-        min_window_rms_r,
-        min_window_at
+        min_rms_r > 800.0,
+        "right-channel RMS dropped to {:.0} at t={} s; rhmst.mod has continuous \
+         multi-channel material across the first 30 s, so any near-silent right \
+         window means the player stalled",
+        min_rms_r,
+        min_at_r
+    );
+    assert!(
+        min_rms_l > 800.0,
+        "left-channel RMS dropped to {:.0} at t={} s; rhmst.mod is symmetrically \
+         active on both stereo busses through the first 30 s, so a dead left ear \
+         signals a regression in the partial-bleed pan model",
+        min_rms_l,
+        min_at_l
     );
 
-    // ---- 4. Pan-separation regression (the user-reported "sounds bad
-    // from 4.5 s in" symptom) ----
+    // ---- 4. Per-trigger ramp regression ----
     //
-    // Pattern 5 (the intro) only carries notes on channels 1 and 2,
-    // both of which lean RIGHT in the Amiga pan convention. With
-    // strict hard pan that meant LEFT was exactly silent for the
-    // entire 10-second intro — indistinguishable from "the player
-    // stalled around the 4-5 s mark" when listening on headphones.
-    // The default `pan_separation = 0.7` (matching xmp / openmpt /
-    // libxmp's stock behaviour and the explicit recommendation in
-    // `Protracker-effects-MODFIL12.txt` §11 "Especially when using
-    // headphones") bleeds the right side into the left so both ears
-    // receive a coherent stereo intro. Assert that the LEFT bus is
-    // audibly active across the first 10 seconds.
-    let mut left_min_rms = f64::INFINITY;
-    let mut left_min_at = 0;
-    for w in 0..10 {
-        let s = w * sr;
-        let e = s + sr;
-        let mut sum_sq = 0.0f64;
-        for i in s..e {
-            let v = pcm[i * 2] as f64;
-            sum_sq += v * v;
+    // Pre-fix the post-mix L/R bus showed single-sample steps of
+    // ~5775 LSB at every sample re-trigger (every few ms throughout
+    // the song). The 1 ms volume ramp added in `mix_one` should
+    // bring the worst-case step down by roughly 30 %, and the *mean*
+    // step down by roughly 50 %, by smoothing the discontinuity at
+    // every fresh note-on. Pin a per-trigger ceiling on both axes so
+    // a future regression that disables the ramp (e.g. by setting
+    // `RAMP_FRAMES = 0`) trips loudly on this fixture.
+    let n_frames = pcm.len() / 2;
+    let mut max_step_l = 0i32;
+    let mut max_step_r = 0i32;
+    let mut sum_step_l = 0u64;
+    let mut sum_step_r = 0u64;
+    for f in 1..n_frames {
+        let l0 = pcm[(f - 1) * 2] as i32;
+        let r0 = pcm[(f - 1) * 2 + 1] as i32;
+        let l1 = pcm[f * 2] as i32;
+        let r1 = pcm[f * 2 + 1] as i32;
+        let dl = (l1 - l0).abs();
+        let dr = (r1 - r0).abs();
+        if dl > max_step_l {
+            max_step_l = dl;
         }
-        let rms = (sum_sq / sr as f64).sqrt();
-        if rms < left_min_rms {
-            left_min_rms = rms;
-            left_min_at = w;
+        if dr > max_step_r {
+            max_step_r = dr;
         }
+        sum_step_l += dl as u64;
+        sum_step_r += dr as u64;
     }
+    let n = (n_frames - 1) as f64;
+    let mean_l = sum_step_l as f64 / n;
+    let mean_r = sum_step_r as f64 / n;
     eprintln!(
-        "[halluc] left-channel min RMS (intro window 0-10s) = {:.0} at t={} s",
-        left_min_rms, left_min_at
+        "[rhmst] inter-frame step  max L={max_step_l} R={max_step_r}  mean L={mean_l:.1} R={mean_r:.1}"
     );
-    // Tightened bound (was 200.0). Post-fix the minimum left-channel
-    // RMS in the intro window measures ~700-2400; 500 keeps headroom
-    // above the lowest seen value while still catching any
-    // regression that drops back toward the silent-left-ear
-    // behaviour of the original hard-pan default (which would put
-    // this number at 0).
+    // 5000 leaves headroom over the measured ~4500 max; the 5775
+    // pre-fix value would trip this. Mean step < 500 catches the
+    // bulk-of-distribution regression.
     assert!(
-        left_min_rms > 500.0,
-        "left-channel RMS dropped to {:.0} at t={} s during the intro; the user-reported \
-         '4.5 s breakage' regression is a dead-LEFT-ear during pattern 5. With the default \
-         pan_separation = 0.7 the bleed should keep LEFT > 500 RMS throughout.",
-        left_min_rms,
-        left_min_at
+        max_step_l < 5000 && max_step_r < 5000,
+        "max inter-frame step rose to L={max_step_l} R={max_step_r}; the per-trigger \
+         volume ramp (PlayerState::RAMP_FRAMES) keeps healthy renders below ~4500 LSB. \
+         A spike above 5000 means either RAMP_FRAMES dropped to 0 or the ramp itself \
+         regressed."
+    );
+    assert!(
+        mean_l < 500.0 && mean_r < 500.0,
+        "mean inter-frame step rose to L={mean_l:.1} R={mean_r:.1}; the per-trigger \
+         ramp keeps the bulk distribution under ~360 LSB on this fixture. A mean \
+         above 500 means the ramp is either bypassed or shorter than RAMP_FRAMES."
     );
 
     // Optional: when running under `--nocapture` we want the harness to
