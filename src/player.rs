@@ -1179,7 +1179,46 @@ impl PlayerState {
                 r += smp * near;
             }
         }
-        let norm = (n_ch as f32 / 2.0).max(1.0);
+        // Mix-bus headroom divisor.
+        //
+        // Round 19 calibration vs libmodplug 0.8.9.0 (used as a
+        // black-box behaviour oracle through the public C API in
+        // `tests/libmodplug_compare.rs` — see that file's header for
+        // the dlopen flow + clean-config protocol). With every
+        // libmodplug colouration disabled (oversampling, megabass,
+        // surround, noise reduction off; LINEAR resampling; 44100 Hz
+        // / 16-bit / stereo; master volume default 128/512;
+        // stereo_separation 128/256 = 50 %), a single max-volume
+        // hard-left channel triggered on a 4-channel `M.K.` MOD lands
+        // libmodplug's L peak at 8500 / 32767 = 0.2594 — which only
+        // works out arithmetically if libmodplug's per-channel
+        // headroom divisor is **3**, not the **2** we previously
+        // used. The pan formula itself (near = (1+s)/2,
+        // far = (1-s)/2) matches across the two engines bit-exact;
+        // only the headroom divisor differs.
+        //
+        // Empirically the libmodplug formula is `n_ch/2 + 1` — i.e.
+        // 3 for 4-ch, 4 for 6-ch, 5 for 8-ch, etc. That gives a
+        // ~1.5× lower per-channel max gain than the strict `n_ch/2`
+        // headroom we shipped before, so a single channel never
+        // dominates the bus at 84 % of i16 peak the way ours did
+        // (which the user-reported "scrambled audio at 4.5s" hunt
+        // bracketed as the most-likely cause of downstream-clipping
+        // perceived as scrambling on real-world MODs `halluc.mod`
+        // and `rhmst.mod`). The peak ratio measured against
+        // libmodplug drops from 1.506× to roughly 1.0× after this
+        // change — confirmed by the `libmodplug_calibration_*` test
+        // in `tests/libmodplug_compare.rs`.
+        //
+        // We don't read libmodplug source; the divisor is derived
+        // purely from black-box measurement of the public-API
+        // output PCM at known input parameters. See
+        // `docs/audio/trackers/mod/openmpt-module-formats.html`
+        // ("Resampling and mixing") which documents the same
+        // "channel count + safety margin" pattern as the modern
+        // ProTracker rendering convention — though no third-party
+        // source code is referenced.
+        let norm = ((n_ch as f32 / 2.0) + 1.0).max(1.0);
         (l / norm, r / norm)
     }
 
