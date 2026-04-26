@@ -33,7 +33,7 @@
 //! a synthetic fixture (we don't ship binary `.mod` fixtures — they
 //! would balloon the repo and infringe on third-party content).
 
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
     container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_PLANAR_STR, CODEC_ID_STR,
@@ -133,9 +133,6 @@ fn decode_mixed(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.channels, 2);
-                assert_eq!(a.format, SampleFormat::S16);
-                assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
                 for chunk in a.data[0].chunks_exact(2) {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
@@ -165,10 +162,8 @@ fn decode_planar(bytes: Vec<u8>, max_frames: usize) -> Vec<Vec<i16>> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.format, SampleFormat::S16P);
-                assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
                 if planes.is_empty() {
-                    planes.resize(a.channels as usize, Vec::new());
+                    planes.resize(a.data.len(), Vec::new());
                 }
                 for (i, plane) in a.data.iter().enumerate() {
                     for chunk in plane.chunks_exact(2) {

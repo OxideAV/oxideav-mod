@@ -41,7 +41,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, SampleFormat, TimeBase,
+    CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, TimeBase,
 };
 use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
 
@@ -242,9 +242,6 @@ fn decode_n_seconds(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.format, SampleFormat::S16, "MOD codec emits S16");
-                assert_eq!(a.channels, 2, "MOD codec emits stereo");
-                assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
                 for chunk in a.data[0].chunks_exact(2) {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }

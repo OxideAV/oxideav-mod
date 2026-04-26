@@ -17,7 +17,6 @@
 
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result,
-    SampleFormat, TimeBase,
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
@@ -271,12 +270,8 @@ impl Decoder for ModDecoder {
                 let pts = *emit_pts;
                 *emit_pts += produced as i64;
                 Ok(Frame::Audio(AudioFrame {
-                    format: SampleFormat::S16,
-                    channels: 2,
-                    sample_rate: OUTPUT_SAMPLE_RATE,
                     samples: produced as u32,
                     pts: Some(pts),
-                    time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
                     data: vec![bytes],
                 }))
             }
@@ -367,12 +362,8 @@ impl Decoder for ModPlanarDecoder {
                 let pts = *emit_pts;
                 *emit_pts += produced as i64;
                 Ok(Frame::Audio(AudioFrame {
-                    format: SampleFormat::S16P,
-                    channels: n_ch as u16,
-                    sample_rate: OUTPUT_SAMPLE_RATE,
                     samples: produced as u32,
                     pts: Some(pts),
-                    time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
                     data: planes,
                 }))
             }
@@ -408,9 +399,6 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    assert_eq!(a.channels, 2);
-                    assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
-                    assert_eq!(a.format, SampleFormat::S16);
                     total_samples += a.samples as u64;
                     // Count non-zero bytes in the PCM plane.
                     let plane = &a.data[0];
@@ -452,9 +440,6 @@ mod tests {
                 Ok(Frame::Audio(a)) => {
                     got_frame = true;
                     // synth_square_mod uses the 4-channel "M.K." layout.
-                    assert_eq!(a.channels, 4);
-                    assert_eq!(a.format, SampleFormat::S16P);
-                    assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
                     assert_eq!(a.data.len(), 4, "one plane per MOD channel");
                     let expected_plane_len = a.samples as usize * 2;
                     for plane in &a.data {

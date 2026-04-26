@@ -5,7 +5,7 @@
 //! triggering notes only on channel 0 leaves channels 1..=3 silent in
 //! their dedicated planes — which a mixed-stereo output cannot verify.
 
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_PLANAR_STR};
 
@@ -72,14 +72,11 @@ fn planar_decoder_via_registry_emits_one_plane_per_channel() {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.format, SampleFormat::S16P, "expected planar S16P");
-                assert_eq!(a.sample_rate, OUTPUT_SAMPLE_RATE);
-                assert_eq!(a.channels as usize, a.data.len());
-                assert_eq!(a.channels, 4, "M.K. MOD has 4 tracker channels");
+                assert_eq!(a.data.len(), 4, "M.K. MOD has 4 tracker channels");
 
                 let plane_bytes_expected = a.samples as usize * 2;
                 if plane_energy.is_empty() {
-                    plane_energy.resize(a.channels as usize, 0);
+                    plane_energy.resize(a.data.len(), 0);
                 }
                 for (idx, plane) in a.data.iter().enumerate() {
                     assert_eq!(plane.len(), plane_bytes_expected);
