@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-mod/compare/v0.0.4...v0.0.5) - 2026-04-26
+
+### Other
+
+- fix mix-bus headroom calibration vs libmodplug oracle
+- re-tune Amiga LED filter + pan separation to match openmpt reference
+- pin 2-pole filter + per-trigger ramp on rhmst.mod fixture
+- configurable pan separation + 2-pole Amiga output filter
+- fix EE pattern-delay note-retrigger + add real-world harness
+- implement Amiga LED filter, extended period range, plus PT-fidelity tests
+- fix loop-boundary + sample-swap PT quirks for real-world fidelity
+- pin release-plz to patch-only bumps
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-mod/compare/v0.0.3...v0.0.4) - 2026-04-25
 
 ### Other
