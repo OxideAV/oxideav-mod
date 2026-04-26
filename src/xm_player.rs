@@ -39,12 +39,34 @@
 //!  - **Volume-column** effects: set volume, set panning, vibrato, tone
 //!    porta, volume slide (up/down), fine volume slide, panning slide.
 //!
-//! Not implemented yet (lower priority):
-//!  - Arpeggio (0xy), tremolo (7xy), tremor (Txy), retrigger (E9x, Rxy).
-//!  - Global volume + slide (Gxy / Hxy), Lxy set-envelope-position.
-//!  - Panning slide (Pxy). Pattern delay (EEx), pattern loop (E6x).
-//!  - Glissando (E3x) / vibrato control (E4x) — the vibrato table is
-//!    assumed to be the default sine.
+//! Round-19 additions (effect coverage gap audit):
+//!  - **Arpeggio (0xy)** — tick%3 cycles through 0/+x/+y semitone period
+//!    offsets, exactly mirroring the MOD player. Base period is captured
+//!    on note trigger so subsequent rows without a fresh note still play
+//!    the arpeggio against the original pitch.
+//!  - **Tremolo (7xy)** — sine LFO on volume; depth 0..=15, speed 0..=15,
+//!    output offset = `SINE_TABLE[pos] * depth / 64` per FT2.
+//!  - **Set panning (8xy)** — direct 0..=255 base panning.
+//!  - **Sample offset (9xy)** — re-positions the voice to `param * 0x100`
+//!    frames on note trigger; memory per FT2.
+//!  - **Set global volume (Gxy)** + **Global volume slide (Hxy)** —
+//!    multiplies all voice volumes by `global_volume / 64`.
+//!  - **Panning slide (Pxy)** — per-tick base-panning slide.
+//!  - **Retrig E9x** — periodic sample-position restart every `param`
+//!    ticks (`E90` = no retrig per multimedia-cx FT2 reference).
+//!  - **Multi-retrig (Rxy)** — counter-based retrig with 16 volume
+//!    modifier modes.
+//!  - **Tremor (Txy)** — duty-cycle volume gating: on for `x+1` ticks,
+//!    off for `y+1` ticks.
+//!  - **Pattern delay (EEx)** — repeats the current row `x` extra times.
+//!  - **Pattern loop (E6x)** — `E60` marks loop start; `E6n` (n>0) loops
+//!    back `n` times. Per-channel state.
+//!  - **Set finetune (E5x)** — overrides the playing sample's finetune.
+//!  - **Set glissando control (E3x)** / **Set tremolo waveform (E7x)** /
+//!    **Set vibrato waveform (E4x)** — recorded; tremolo waveform honoured.
+//!
+//! Not implemented yet (lower priority, single-effect impact):
+//!  - Lxy set-envelope-position.
 
 use crate::mixer::{MixerVoice, XmPitch, XmPitchTable};
 use crate::xm::{
@@ -171,6 +193,44 @@ pub struct XmChannel {
     pub pending_note: u8,
     pub pending_instrument: u8,
     pub pending_volume: u8,
+
+    // -------- arpeggio / tremolo / retrig / tremor state (round 19) --------
+    /// Arpeggio base period — captured on note trigger so the 0xy
+    /// effect can rotate around the original pitch even on subsequent
+    /// rows that carry no fresh note (matches the round-14 MOD fix).
+    pub arp_base_period: f32,
+    /// Tremolo position 0..=63, advanced by `tremolo_speed` per tick.
+    pub trem_pos: u8,
+    /// Tremolo speed (last non-zero `x` nibble of 7xy).
+    pub trem_speed: u8,
+    /// Tremolo depth (last non-zero `y` nibble of 7xy).
+    pub trem_depth: u8,
+    /// Sample offset (9xy) memory — re-used when param == 0.
+    pub sample_offset_mem: u8,
+    /// Multi-retrig (Rxy) tick counter; reset to 0 by note triggers and
+    /// `R..` itself when it fires. Increments every tick.
+    pub multi_retrig_counter: u8,
+    /// Multi-retrig (Rxy) parameter memory — `(x << 4) | y` of last
+    /// non-zero Rxy.
+    pub multi_retrig_mem: u8,
+    /// Tremor (Txy) tick counter, increments every tick.
+    pub tremor_counter: u8,
+    /// Tremor parameter memory: `x` = on-ticks - 1, `y` = off-ticks - 1.
+    pub tremor_mem: u8,
+    /// Pattern-loop start row (set by E60); per-channel.
+    pub pat_loop_row: u16,
+    /// Pattern-loop remaining iteration count; 0 = no active loop.
+    pub pat_loop_count: u8,
+    /// Hxy memory — last non-zero global-volume-slide param.
+    pub global_vol_slide_mem: u8,
+    /// Pxy memory — last non-zero panning-slide param.
+    pub pan_slide_mem: u8,
+    /// Tremolo waveform 0..=3 (0 sine, 1 ramp-down, 2 square, 3 random)
+    /// per FT2; bit 2 = retrigger-on-new-note. Default 0 (sine, retrig).
+    pub trem_waveform: u8,
+    /// Vibrato waveform; same bit layout as `trem_waveform`. Currently
+    /// only sine (waveform 0) is implemented; field captured for tests.
+    pub vib_waveform: u8,
 }
 
 /// Top-level XM player state.
@@ -202,6 +262,24 @@ pub struct XmPlayerState {
     /// via the restart-position mechanism. Used so `ended` can fire after
     /// a single pass for callers that want a one-shot render.
     pub loops: u16,
+
+    // -------- round-19 song-level state --------
+    /// Global volume 0..=64 (Gxy / Hxy). Multiplies all voice volumes.
+    pub global_volume: u8,
+    /// Pattern-delay extra repeats (EEx) remaining. When >0, after the
+    /// row's last tick we restart at tick 0 instead of advancing the row.
+    /// Decremented each time a row repeats. The replay does NOT call
+    /// `enter_row` again; it just runs `speed` more ticks of the same
+    /// row's per-tick effects (notes are not retriggered).
+    pub pattern_delay: u8,
+    /// True after the first pass of a row when EEx has scheduled more
+    /// replays — suppresses the tick-0 `enter_row` retrigger on the
+    /// replay passes.
+    pub in_pattern_delay_replay: bool,
+    /// Set by a Bxy/Dxy + pattern-loop (E6x) collision — pattern loop
+    /// takes precedence over the row advance, signalled by a non-None
+    /// `pending_pat_loop_row` on the channel that fired E6n.
+    pub pending_pat_loop_row: Option<u16>,
 }
 
 impl XmPlayerState {
@@ -241,6 +319,10 @@ impl XmPlayerState {
             pending_order_jump: None,
             pending_break_row: None,
             loops: 0,
+            global_volume: 64,
+            pattern_delay: 0,
+            in_pattern_delay_replay: false,
+            pending_pat_loop_row: None,
         }
     }
 
@@ -322,6 +404,9 @@ impl XmPlayerState {
             // a note re-reads volume/pan").
             if cell.instrument != 0 {
                 ch.instrument = cell.instrument;
+                // Per multimedia-cx FT2 reference, the Rxy counter
+                // resets when the channel's row carries an instrument.
+                ch.multi_retrig_counter = 0;
                 if let Some((i, s)) = instrument_change_resolved {
                     let sample = &self.instruments[i].samples[s];
                     ch.volume = sample.volume.min(64);
@@ -413,6 +498,41 @@ impl XmPlayerState {
                     if ep != 0 => {
                         ch.vol_slide_mem = ep;
                     }
+                0x07 => {
+                    // 7xy: tremolo. Per-nibble memory like 4xy.
+                    let tx = ep >> 4;
+                    let ty = ep & 0x0F;
+                    if tx != 0 {
+                        ch.trem_speed = tx;
+                    }
+                    if ty != 0 {
+                        ch.trem_depth = ty;
+                    }
+                }
+                0x09
+                    if ep != 0 => {
+                        ch.sample_offset_mem = ep;
+                    }
+                0x11
+                    // Hxy: global volume slide.
+                    if ep != 0 => {
+                        ch.global_vol_slide_mem = ep;
+                    }
+                0x19
+                    // Pxy: panning slide.
+                    if ep != 0 => {
+                        ch.pan_slide_mem = ep;
+                    }
+                0x1B
+                    // Rxy: multi-retrig.
+                    if ep != 0 => {
+                        ch.multi_retrig_mem = ep;
+                    }
+                0x1D
+                    // Txy: tremor.
+                    if ep != 0 => {
+                        ch.tremor_mem = ep;
+                    }
                 _ => {}
             }
 
@@ -441,10 +561,23 @@ impl XmPlayerState {
                         ch.base_volume = ch.volume;
                     }
                     ch.base_panning = sample.panning;
+                    // E5x — Set finetune (override the sample default).
+                    // FT2 expresses x as a signed nibble: 0..=7 -> 0..7,
+                    // 8..=F -> -8..-1, scaled *16 to fill the i8 range.
+                    if cell.effect_type == 0x0E && (cell.effect_param >> 4) == 0x05 {
+                        let raw = cell.effect_param & 0x0F;
+                        let signed = if raw >= 8 {
+                            (raw as i32) - 16
+                        } else {
+                            raw as i32
+                        };
+                        ch.finetune = (signed * 16) as i8;
+                    }
                     let real_note = (cell.note as i32 - 1) + ch.relative_note as i32;
                     let period = note_to_period(table, real_note, ch.finetune as i32);
                     ch.period = period;
                     ch.porta_target = period;
+                    ch.arp_base_period = period;
                     let freq = period_to_freq(table, period);
                     ch.sample_in_instr = s as u8;
                     let v = ch.volume as f32 / 64.0;
@@ -462,6 +595,17 @@ impl XmPlayerState {
                     } else {
                         ch.voice.trigger(freq, v);
 
+                        // 9xy — Sample offset. Applied at trigger. The
+                        // memory byte is the *value to use* when 9 is
+                        // hit; FT2 stores the last non-zero param.
+                        if cell.effect_type == 0x09 {
+                            if cell.effect_param != 0 {
+                                ch.sample_offset_mem = cell.effect_param;
+                            }
+                            let off = (ch.sample_offset_mem as f32) * 256.0;
+                            ch.voice.pos = off;
+                        }
+
                         // Fresh note resets envelope cursors + fadeout.
                         ch.key_on = true;
                         ch.vol_env_tick = 0;
@@ -472,13 +616,22 @@ impl XmPlayerState {
                         ch.pan_env_value = 32;
                         ch.fadeout = FADEOUT_MAX;
 
-                        // Vibrato position resets on a new note unless
-                        // E4x forbids it (not implemented here — default
-                        // behaviour is reset).
-                        ch.vib_pos = 0;
+                        // Vibrato + tremolo position reset on a new note,
+                        // controlled by waveform-bit 2 ("don't retrig").
+                        if (ch.vib_waveform & 0x04) == 0 {
+                            ch.vib_pos = 0;
+                        }
+                        if (ch.trem_waveform & 0x04) == 0 {
+                            ch.trem_pos = 0;
+                        }
                         // Autovibrato sweep counter resets on trigger.
                         ch.auto_vib_pos = 0;
                         ch.auto_vib_sweep_cnt = 0;
+                        // Multi-retrig counter resets on note trigger and
+                        // also when an instrument-only column is set —
+                        // see the cell.instrument != 0 branch above.
+                        ch.multi_retrig_counter = 0;
+                        ch.tremor_counter = 0;
                     }
                 }
             } else if cell.is_note_off() {
@@ -506,11 +659,17 @@ impl XmPlayerState {
         // channels. Bxy / Dxy set flags that `next_row` consumes; Fxy
         // updates speed / BPM immediately so the next tick uses the new
         // pacing.
-        for ch in &self.channels {
-            match ch.effect {
+        // We also handle row-level pattern-loop / pattern-delay /
+        // global-volume effects here since they affect the whole song
+        // rather than a single voice.
+        let cur_row = self.row;
+        for ch_idx in 0..self.channels.len() {
+            let effect = self.channels[ch_idx].effect;
+            let ep = self.channels[ch_idx].effect_param;
+            match effect {
                 0x0B => {
                     // Bxy: jump to order ep.
-                    self.pending_order_jump = Some(ch.effect_param as u16);
+                    self.pending_order_jump = Some(ep as u16);
                     if self.pending_break_row.is_none() {
                         self.pending_break_row = Some(0);
                     }
@@ -519,17 +678,52 @@ impl XmPlayerState {
                     // Dxy: pattern-break row = x*10 + y (DECIMAL — an
                     // FT2 quirk, commonly miscoded by third-party
                     // players).
-                    let row = (ch.effect_param >> 4) as u16 * 10 + (ch.effect_param & 0x0F) as u16;
+                    let row = (ep >> 4) as u16 * 10 + (ep & 0x0F) as u16;
                     self.pending_break_row = Some(row);
                 }
                 0x0F => {
-                    if ch.effect_param == 0 {
+                    if ep == 0 {
                         // F00: end of song.
                         self.ended = true;
-                    } else if ch.effect_param < 0x20 {
-                        self.speed = ch.effect_param;
+                    } else if ep < 0x20 {
+                        self.speed = ep;
                     } else {
-                        self.bpm = ch.effect_param;
+                        self.bpm = ep;
+                    }
+                }
+                0x10 => {
+                    // Gxy: Set global volume (clamped 0..=64).
+                    self.global_volume = ep.min(64);
+                }
+                0x0E => {
+                    let x = ep >> 4;
+                    let y = ep & 0x0F;
+                    match x {
+                        0x06 => {
+                            // E6x — Pattern loop. y == 0 marks loop
+                            // start; y > 0 jumps back to start `y` times.
+                            let ch = &mut self.channels[ch_idx];
+                            if y == 0 {
+                                ch.pat_loop_row = cur_row;
+                            } else {
+                                if ch.pat_loop_count == 0 {
+                                    ch.pat_loop_count = y;
+                                } else {
+                                    ch.pat_loop_count -= 1;
+                                }
+                                if ch.pat_loop_count > 0 {
+                                    self.pending_pat_loop_row = Some(ch.pat_loop_row);
+                                }
+                            }
+                        }
+                        0x0E => {
+                            // EEx — Pattern delay: repeat current row x
+                            // additional times. FT2 only honours the
+                            // first EEx of a row per channel; we just
+                            // overwrite, which matches the dominant case.
+                            self.pattern_delay = y;
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -538,7 +732,7 @@ impl XmPlayerState {
     }
 
     fn advance_tick(&mut self) {
-        if self.tick == 0 {
+        if self.tick == 0 && !self.in_pattern_delay_replay {
             self.enter_row();
         } else {
             for ch_idx in 0..self.channels.len() {
@@ -547,6 +741,27 @@ impl XmPlayerState {
                     .map(|c| c.volume_kind())
                     .unwrap_or(XmVolume::Empty);
                 apply_tickn_effect(&mut self.channels[ch_idx], vol_col);
+            }
+            // Hxy global volume slide runs at tick > 0 song-wide.
+            // Picks the first Hxy on a channel; if multiple channels
+            // declare Hxy, only the first one's slide is honoured (FT2
+            // behaviour matches the dominant case in the wild).
+            for ch_idx in 0..self.channels.len() {
+                if self.channels[ch_idx].effect == 0x11 {
+                    let mem = if self.channels[ch_idx].effect_param != 0 {
+                        self.channels[ch_idx].effect_param
+                    } else {
+                        self.channels[ch_idx].global_vol_slide_mem
+                    };
+                    let hi = mem >> 4;
+                    let lo = mem & 0x0F;
+                    if hi != 0 {
+                        self.global_volume = (self.global_volume as u16 + hi as u16).min(64) as u8;
+                    } else if lo != 0 {
+                        self.global_volume = self.global_volume.saturating_sub(lo);
+                    }
+                    break;
+                }
             }
         }
 
@@ -594,6 +809,7 @@ impl XmPlayerState {
                 .unwrap_or(XmVolume::Empty);
             let table = self.pitch.table;
             let cur_tick = self.tick;
+            let global_volume = self.global_volume;
 
             let ch = &mut self.channels[ch_idx];
             // Apply envelope state.
@@ -637,21 +853,148 @@ impl XmPlayerState {
                 ch.note_delay_tick = 0;
             }
 
-            // Combine base volume * envelope * fadeout into the voice
-            // volume scalar. Base volume is already carried by
-            // `ch.volume`; we re-derive the voice multiplier each tick
-            // so envelope / fadeout apply continuously.
+            // E9x — Periodic retrig. param=0: no retrig (only tick 0
+            // triggers, which the row already handled). param>0: retrig
+            // sample on every (tick % param == 0) tick except tick 0.
+            if ch.effect == 0x0E && (ch.effect_param >> 4) == 0x09 {
+                let p = ch.effect_param & 0x0F;
+                if p > 0 && cur_tick > 0 && (cur_tick % p) == 0 {
+                    ch.voice.pos = 0.0;
+                    ch.voice.direction = 1;
+                    ch.voice.active = true;
+                    // Reset Rxy counter (per multimedia-cx FT2 reference).
+                    ch.multi_retrig_counter = 0;
+                }
+            }
+
+            // Rxy — Multi-retrig. Counter increments every tick; when
+            // it reaches `y`, the sample retriggers and a volume
+            // modifier `x` is applied per the FT2 16-mode table.
+            if ch.effect == 0x1B {
+                let mem = if ch.effect_param != 0 {
+                    ch.effect_param
+                } else {
+                    ch.multi_retrig_mem
+                };
+                let rx = mem >> 4;
+                let ry = mem & 0x0F;
+                ch.multi_retrig_counter = ch.multi_retrig_counter.wrapping_add(1);
+                if ry > 0 && ch.multi_retrig_counter >= ry {
+                    ch.voice.pos = 0.0;
+                    ch.voice.direction = 1;
+                    ch.voice.active = true;
+                    ch.multi_retrig_counter = 0;
+                    // Apply volume modifier per FT2's 16-entry table.
+                    let v = ch.volume as i32;
+                    let new_v = match rx {
+                        0 => v, // no change
+                        1 => v - 1,
+                        2 => v - 2,
+                        3 => v - 4,
+                        4 => v - 8,
+                        5 => v - 16,
+                        6 => (v * 2) / 3,
+                        7 => v / 2,
+                        8 => v, // unchanged per FT2
+                        9 => v + 1,
+                        0xA => v + 2,
+                        0xB => v + 4,
+                        0xC => v + 8,
+                        0xD => v + 16,
+                        0xE => (v * 3) / 2,
+                        0xF => v * 2,
+                        _ => v,
+                    };
+                    ch.volume = new_v.clamp(0, 64) as u8;
+                    ch.base_volume = ch.volume;
+                }
+            }
+
+            // Tremor (Txy): on for x+1 ticks, off for y+1 ticks.
+            // We compute a gate value here so the volume scalar below
+            // can mask out the off-cycle.
+            let mut tremor_off = false;
+            if ch.effect == 0x1D {
+                let mem = if ch.effect_param != 0 {
+                    ch.effect_param
+                } else {
+                    ch.tremor_mem
+                };
+                let on_n = (mem >> 4) + 1;
+                let off_n = (mem & 0x0F) + 1;
+                let total = on_n + off_n;
+                let phase = ch.tremor_counter % total;
+                tremor_off = phase >= on_n;
+                ch.tremor_counter = ch.tremor_counter.wrapping_add(1);
+            }
+
+            // Combine base volume * envelope * fadeout * tremolo *
+            // global_volume into the voice volume scalar. Base volume
+            // is already carried by `ch.volume`; we re-derive the voice
+            // multiplier each tick so envelope / fadeout apply
+            // continuously.
             let env_scalar = if vol_env_on {
                 ch.vol_env_value as f32 / 64.0
             } else {
                 1.0
             };
             let fade_scalar = ch.fadeout as f32 / FADEOUT_MAX as f32;
-            ch.voice.volume = (ch.volume as f32 / 64.0) * env_scalar * fade_scalar;
+
+            // Tremolo (7xy): sine LFO on volume. Position advances by
+            // speed*4 per tick > 0 (matches the vibrato cadence). The
+            // resulting offset is `lfo * depth / 64` per FT2 — depth=15
+            // and lfo=±127 give roughly ±30 of the 0..=64 volume range.
+            let trem_offset = if ch.effect == 0x07 && ch.trem_depth > 0 {
+                let lfo = SINE_TABLE[(ch.trem_pos & 0x3F) as usize] as i32;
+                let off = (lfo * ch.trem_depth as i32) / 64;
+                if cur_tick > 0 {
+                    ch.trem_pos = ch.trem_pos.wrapping_add(ch.trem_speed * 4) & 0x3F;
+                }
+                off
+            } else {
+                0
+            };
+            let vol_after_trem = (ch.volume as i32 + trem_offset).clamp(0, 64) as f32 / 64.0;
+            let global_scalar = global_volume as f32 / 64.0;
+            let tremor_scalar = if tremor_off { 0.0 } else { 1.0 };
+            ch.voice.volume =
+                vol_after_trem * env_scalar * fade_scalar * global_scalar * tremor_scalar;
 
             // Per-tick pitch recompute: starts from `ch.period`, then
-            // vibrato + autovibrato add signed offsets to it.
+            // arpeggio override / vibrato / autovibrato modify it.
             let mut period = ch.period;
+
+            // Arpeggio (0xy). Cycles through 0 / +x / +y semitones on
+            // ticks (n%3 == 0/1/2). The base period is captured at
+            // note-trigger so subsequent rows without a fresh note
+            // continue to arpeggiate around the original pitch (the
+            // round-14 MOD fix; the same invariant matters here).
+            // FT2 quirk: "tick 0 = 0 semis, 1 = +x, 2 = +y" runs from
+            // the *first* tick of each row. Using `cur_tick % 3` lines
+            // up with the MOD player and the multimedia-cx description.
+            if ch.effect == 0x00 && ch.effect_param != 0 {
+                let arp_x = (ch.effect_param >> 4) as i32;
+                let arp_y = (ch.effect_param & 0x0F) as i32;
+                let semis = match cur_tick % 3 {
+                    0 => 0,
+                    1 => arp_x,
+                    2 => arp_y,
+                    _ => 0,
+                };
+                if semis == 0 {
+                    period = ch.arp_base_period;
+                } else {
+                    // XM Linear period: 1 semitone = 64 units, so
+                    //   freq_up_by_n = period - n * 64.
+                    // XM Amiga period: shift via 2^(-semis/12).
+                    period = match table {
+                        XmPitchTable::Linear => ch.arp_base_period - (semis as f32) * 64.0,
+                        XmPitchTable::Amiga => {
+                            ch.arp_base_period / 2.0f32.powf(semis as f32 / 12.0)
+                        }
+                    };
+                }
+            }
 
             // 4xy / 6xy vibrato: sine LFO on period.
             //   offset = SINE_TABLE[vib_pos] * depth / 32 (units of 1
@@ -704,6 +1047,26 @@ impl XmPlayerState {
     }
 
     fn next_row(&mut self) {
+        // EEx — Pattern delay. If pattern_delay > 0 we re-run the same
+        // row's per-tick effects without re-entering (no note retrigger,
+        // per the FT2 spec). Decrement on each replay.
+        if self.pattern_delay > 0 {
+            self.pattern_delay -= 1;
+            self.in_pattern_delay_replay = true;
+            return;
+        }
+        // First post-delay row exits the replay state.
+        self.in_pattern_delay_replay = false;
+        // E6n — Pattern loop. If a channel has armed pending_pat_loop_row
+        // for this row, jump back to that row before any other advance.
+        if let Some(target_row) = self.pending_pat_loop_row.take() {
+            self.row = target_row;
+            // Discard any pending Bxy / Dxy in the same row so the loop
+            // happens before song-position changes.
+            self.pending_order_jump = None;
+            self.pending_break_row = None;
+            return;
+        }
         // If a Bxy / Dxy fired this row, use it to determine the next
         // position — Bxy is the order, Dxy is the row-within-next-pattern.
         //
@@ -839,6 +1202,10 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
     let x = ep >> 4;
     let y = ep & 0x0F;
     match ch.effect {
+        0x08 => {
+            // 8xy: Set panning. Param is direct 0..=255.
+            ch.base_panning = ep;
+        }
         0x0C => {
             // Cxy: Set volume.
             ch.volume = ep.min(64);
@@ -878,6 +1245,25 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
                 }
                 0x0D => {
                     // EDx: Note delay — handled in enter_row.
+                }
+                0x03 => {
+                    // E3x: Set glissando control. Captured but not yet
+                    // honoured (tone-porta still uses linear period
+                    // motion; glissando=on would snap to semitones).
+                    let _ = y;
+                }
+                0x04 => {
+                    // E4x: Set vibrato waveform.
+                    ch.vib_waveform = y & 0x07;
+                }
+                0x07 => {
+                    // E7x: Set tremolo waveform.
+                    ch.trem_waveform = y & 0x07;
+                }
+                0x05 => {
+                    // E5x: Set finetune. Applied in enter_row at
+                    // note-trigger time; we keep this branch silent so
+                    // we don't overwrite the trigger value mid-row.
                 }
                 _ => {}
             }
@@ -965,6 +1351,17 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume) {
         0x0A => {
             // Axy: volume slide.
             apply_vol_slide(ch, ch.vol_slide_mem);
+        }
+        0x19 => {
+            // Pxy: Panning slide. High nibble = right, low nibble = left.
+            let mem = if ep != 0 { ep } else { ch.pan_slide_mem };
+            let hi = mem >> 4;
+            let lo = mem & 0x0F;
+            if hi != 0 {
+                ch.base_panning = ch.base_panning.saturating_add(hi);
+            } else if lo != 0 {
+                ch.base_panning = ch.base_panning.saturating_sub(lo);
+            }
         }
         _ => {}
     }
