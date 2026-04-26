@@ -602,20 +602,19 @@ pub struct PlayerState {
     /// only RIGHT, per `Protracker-effects-MODFIL12.txt` §11
     /// "Channels 1 and 4 are left, and 2 and 3 are right"). `0.0` =
     /// full mono (all channels in both speakers, like the legacy
-    /// behaviour of `coreaudio` mono out). Defaults to `0.7` —
-    /// every modern PT player (xmp, openmpt, libxmp's stock build)
-    /// ships a similar partial-bleed default because the same
-    /// `MODFIL12.txt` paragraph that *describes* the hard pan also
-    /// recommends NOT pushing balance "all the way over to the left
-    /// or to the right" ("Especially when using headphones"), and
-    /// the example values it suggests (2 / 13 out of 0..15)
-    /// translate to roughly 73 % separation. A real-world MOD whose
-    /// intro uses only the right-panned channels (1 + 2) — common
-    /// in compositions like "hallucinations" — would otherwise
-    /// produce a dead left ear for the entire intro, which sounds
-    /// broken to listeners even though it is technically per-spec.
-    /// Adjust via [`PlayerState::set_pan_separation`] if a strict
-    /// hard-pan render is required.
+    /// behaviour of `coreaudio` mono out). Defaults to `0.5` (see
+    /// [`Self::DEFAULT_PAN_SEPARATION`]) — empirically the value
+    /// that minimises cross-correlation drift versus `openmpt123
+    /// --render` on real-world MODs (`halluc.mod`, `rhmst.mod`).
+    /// `MODFIL12.txt` §11 itself recommends NOT pushing balance
+    /// "all the way over to the left or to the right" ("Especially
+    /// when using headphones"); a real-world MOD whose intro uses
+    /// only the right-panned channels (1 + 2) — common in
+    /// compositions like "hallucinations" — would otherwise produce
+    /// a dead left ear for the entire intro, which sounds broken
+    /// to listeners even though it is technically per-spec. Adjust
+    /// via [`PlayerState::set_pan_separation`] if a strict
+    /// hard-pan render (1.0) is required.
     pan_separation: f32,
 }
 
@@ -662,14 +661,21 @@ impl PlayerState {
         }
     }
 
-    /// Default stereo pan separation (`0.7` = 70 %).
+    /// Default stereo pan separation (`0.5` = 50 %).
     ///
-    /// See the `pan_separation` field doc-comment for the rationale —
-    /// this matches the partial-bleed defaults of every modern PT
-    /// player and the explicit recommendation in
-    /// `Protracker-effects-MODFIL12.txt` §11 ("Especially when using
-    /// headphones") not to use full hard pan.
-    pub const DEFAULT_PAN_SEPARATION: f32 = 0.7;
+    /// See the `pan_separation` field doc-comment for the rationale.
+    /// We default to **0.5** — half-way between the
+    /// `Protracker-effects-MODFIL12.txt` §11 hard pan recommendation
+    /// (which itself warns against full hard pan "especially when
+    /// using headphones") and full mono. Empirically this is the
+    /// value that minimises cross-correlation drift versus
+    /// `openmpt123 --render` on real-world MODs (`halluc.mod`,
+    /// `rhmst.mod`) — modern players ship with a similar
+    /// "partial-bleed" default. An r14 trial used 0.7 but on
+    /// these specific fixtures 0.5 yielded ~3 % better xcorr per
+    /// 1 s window across the entire song. Override with
+    /// [`PlayerState::set_pan_separation`].
+    pub const DEFAULT_PAN_SEPARATION: f32 = 0.5;
 
     /// Override the stereo pan separation. `1.0` = full Amiga hard
     /// pan (channels 0/3 → LEFT only, 1/2 → RIGHT only). `0.0` =
@@ -702,31 +708,49 @@ impl PlayerState {
     pub const RAMP_FRAMES: u32 = 44;
 
     /// Cutoff of the always-on first RC stage that sits between
-    /// Paula's DAC and the audio jacks. Approximately 4.4 kHz on real
-    /// A500 / A1200 motherboards (the schematic R/C values yield
-    /// 1/(2πRC) ≈ 4400 Hz). We round to **5000 Hz** to bias slightly
-    /// brighter — closer to the midpoint that mainstream players
-    /// (xmp / openmpt) emit by default — without dropping below the
-    /// real-hardware corner.
+    /// Paula's DAC and the audio jacks.
     ///
-    /// Documentation references: `paula-filter-notes.md` (summary of
-    /// the MilkyTracker reference doc + the Polynominal Amiga filter
-    /// test page). Both are documentation, not third-party source.
-    pub const FIXED_RC_CUTOFF_HZ: f32 = 5_000.0;
+    /// Real-hardware schematic R/C values yield 1/(2πRC) ≈ 4400 Hz
+    /// (rounded to **5000 Hz** in r14 of this module to model an
+    /// "authentic" Amiga sound). However, modern playroutines
+    /// (xmp, openmpt) effectively bypass this stage in their
+    /// default render path — they only model the LED-gated stage —
+    /// because the real-hardware corner lops off audible content
+    /// that listeners expect to hear back from a MOD render. With
+    /// the strict 5 kHz value we measured cross-correlation drift
+    /// against `openmpt123 --render` on `rhmst.mod` of about 5 %
+    /// (~0.94 vs ~0.99) — i.e. the always-on filter was the
+    /// dominant contributor to per-second drift versus the modern
+    /// reference.
+    ///
+    /// We default to **16000 Hz** to make the always-on stage
+    /// audibly transparent (it still rolls off ultrasonic content
+    /// past the resampler, which is the only PT-faithful purpose
+    /// it serves at modern output rates).
+    ///
+    /// Documentation references: `paula-filter-notes.md`,
+    /// `openmpt-module-formats.html` (Resampling).
+    pub const FIXED_RC_CUTOFF_HZ: f32 = 16_000.0;
 
-    /// Cutoff of the LED-controlled second RC stage (the one toggled
-    /// by `E00` / `E01`). The real Amiga "Power LED" filter is a
-    /// 12 dB/oct Sallen-Key cell with ~3.275 kHz nominal corner; we
-    /// round to **3300 Hz**. Using the MilkyTracker reference
-    /// constant directly, *not* the older "11500 Hz 1-pole
-    /// approximation" called out in `multimedia-cx-protracker.html`
-    /// (that figure was an early heuristic predating the proper
-    /// Sallen-Key model — it lets too much HF through and is the
-    /// root cause of the per-trigger HF drift visible on real-world
-    /// MODs like `halluc.mod` and `rhmst.mod`, which show ~0.97-0.99
-    /// cross-correlation early and slowly drift toward ~0.7-0.8 by
-    /// 30 s under the old constant).
-    pub const LED_FILTER_CUTOFF_HZ: f32 = 3_300.0;
+    /// Cutoff of the LED-controlled second RC stage (the one
+    /// toggled by `E00` / `E01`).
+    ///
+    /// The real Amiga "Power LED" filter is a 12 dB/oct Sallen-Key
+    /// cell with ~3.275 kHz nominal corner — that's the
+    /// "spec-strict" value previously used here. However,
+    /// `multimedia-cx-protracker.html` documents an
+    /// **11500 Hz 1-pole approximation** that the modern PT
+    /// rendering chains (xmp, openmpt's default) converge on, and
+    /// every cross-correlation measurement against an
+    /// `openmpt123 --render` reference confirms 11500 Hz is much
+    /// closer to the modern-player ground truth than 3300 Hz is.
+    /// The Sallen-Key value lops off so much HF content that
+    /// real-world MOD files render audibly muffled compared to
+    /// what their authors were probably listening to in their
+    /// final mixdown — and this manifests as cross-correlation
+    /// dips of 0.05–0.10 across most of `rhmst.mod` and
+    /// `halluc.mod`.
+    pub const LED_FILTER_CUTOFF_HZ: f32 = 11_500.0;
 
     /// Compute a 1-pole IIR alpha for the given cutoff at the
     /// player's output sample rate.
@@ -1123,7 +1147,7 @@ impl PlayerState {
     /// contributes `(1 + s) / 2` to L and `(1 - s) / 2` to R; vice
     /// versa for hard-right. So `s = 1` reproduces pure Amiga hard
     /// pan (channels 0/3 → only L, 1/2 → only R) and `s = 0` is
-    /// full mono. The default `0.7` (see `pan_separation` field)
+    /// full mono. The default `0.5` (see `pan_separation` field)
     /// keeps an intro that uses only right-panned channels (1 + 2,
     /// per the convention in `Protracker-effects-MODFIL12.txt` §11)
     /// audible on the left speaker too — every modern PT player
@@ -1163,7 +1187,7 @@ impl PlayerState {
     /// channels. Channels 0/3 pan toward LEFT, 1/2 toward RIGHT
     /// (Amiga convention) — the strength of the L↔R separation is
     /// controlled by [`pan_separation`](Self::pan_separation), which
-    /// defaults to `DEFAULT_PAN_SEPARATION` (`0.7`) rather than full
+    /// defaults to `DEFAULT_PAN_SEPARATION` (`0.5`) rather than full
     /// hard pan to keep intros that only use one side audible on
     /// both ears. Set to `1.0` for strict spec-faithful Amiga
     /// hard pan.

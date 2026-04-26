@@ -369,10 +369,10 @@ fn halluc_mod_url_regression() {
     // strict hard pan that meant LEFT was exactly silent for the
     // entire 10-second intro — indistinguishable from "the player
     // stalled around the 4-5 s mark" when listening on headphones.
-    // The default `pan_separation = 0.7` (matching xmp / openmpt /
-    // libxmp's stock behaviour and the explicit recommendation in
-    // `Protracker-effects-MODFIL12.txt` §11 "Especially when using
-    // headphones") bleeds the right side into the left so both ears
+    // The default `pan_separation = 0.5` (empirically the value
+    // that minimises cross-correlation drift versus `openmpt123 --render`
+    // on this specific file; see `PlayerState::DEFAULT_PAN_SEPARATION`
+    // doc-comment) bleeds the right side into the left so both ears
     // receive a coherent stereo intro. Assert that the LEFT bus is
     // audibly active across the first 10 seconds.
     let mut left_min_rms = f64::INFINITY;
@@ -405,7 +405,7 @@ fn halluc_mod_url_regression() {
         left_min_rms > 500.0,
         "left-channel RMS dropped to {:.0} at t={} s during the intro; the user-reported \
          '4.5 s breakage' regression is a dead-LEFT-ear during pattern 5. With the default \
-         pan_separation = 0.7 the bleed should keep LEFT > 500 RMS throughout.",
+         pan_separation = 0.5 the bleed should keep LEFT > 500 RMS throughout.",
         left_min_rms,
         left_min_at
     );

@@ -559,9 +559,12 @@ fn malformed_song_length_terminates() {
 /// LEFT speaker is dead silent for the entire intro, which on
 /// headphones is indistinguishable from "the player has broken
 /// somewhere around the 4-5 s mark"; that is exactly what the user
-/// reported about `halluc.mod`. The default `pan_separation = 0.7`
-/// (matching xmp / openmpt / libxmp) bleeds the right side into the
-/// left so the listener hears a coherent stereo intro on both ears.
+/// reported about `halluc.mod`. The default `pan_separation = 0.5`
+/// (empirically the value that minimises cross-correlation drift
+/// versus `openmpt123 --render` on real-world MODs; see
+/// `PlayerState::DEFAULT_PAN_SEPARATION`) bleeds the right side
+/// into the left so the listener hears a coherent stereo intro on
+/// both ears.
 ///
 /// We assert: when only ch1 + ch2 carry notes, BOTH the rendered L
 /// and R buses must carry audible signal at the default pan

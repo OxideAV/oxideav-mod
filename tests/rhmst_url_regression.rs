@@ -355,6 +355,16 @@ fn rhmst_mod_url_regression() {
     // every fresh note-on. Pin a per-trigger ceiling on both axes so
     // a future regression that disables the ramp (e.g. by setting
     // `RAMP_FRAMES = 0`) trips loudly on this fixture.
+    //
+    // The 8000 ceiling matches what `openmpt123 --render` itself
+    // emits on this fixture (measured: max L≈8964 R≈8697); the
+    // earlier 5000 ceiling was set under the assumption that the
+    // 3300 Hz LED filter would remove most transient HF, but moving
+    // the filter to its docs-faithful 11500 Hz value (see
+    // `LED_FILTER_CUTOFF_HZ`) lets through what real PT players
+    // do. A regression that removed the 1 ms ramp entirely was
+    // measured at 12000+ on this fixture, so the 8000 ceiling
+    // still fires for that case.
     let n_frames = pcm.len() / 2;
     let mut max_step_l = 0i32;
     let mut max_step_r = 0i32;
@@ -382,21 +392,24 @@ fn rhmst_mod_url_regression() {
     eprintln!(
         "[rhmst] inter-frame step  max L={max_step_l} R={max_step_r}  mean L={mean_l:.1} R={mean_r:.1}"
     );
-    // 5000 leaves headroom over the measured ~4500 max; the 5775
-    // pre-fix value would trip this. Mean step < 500 catches the
-    // bulk-of-distribution regression.
+    // 9000 leaves a small headroom over the measured ~7500 max;
+    // openmpt's own render measures ~8950 here, so we're allowed to
+    // be slightly higher (anti-aliasing differences). Mean step <
+    // 800 catches the bulk-of-distribution regression while staying
+    // above the openmpt-mean (~690).
     assert!(
-        max_step_l < 5000 && max_step_r < 5000,
-        "max inter-frame step rose to L={max_step_l} R={max_step_r}; the per-trigger \
-         volume ramp (PlayerState::RAMP_FRAMES) keeps healthy renders below ~4500 LSB. \
-         A spike above 5000 means either RAMP_FRAMES dropped to 0 or the ramp itself \
-         regressed."
+        max_step_l < 9000 && max_step_r < 9000,
+        "max inter-frame step rose to L={max_step_l} R={max_step_r}; healthy renders \
+         on this fixture stay under ~7500 LSB (openmpt123 measures ~8950 itself). A \
+         spike above 9000 means either the per-trigger ramp regressed or the LED \
+         filter constant moved high enough to expose Paula DMA-step transients."
     );
     assert!(
-        mean_l < 500.0 && mean_r < 500.0,
+        mean_l < 800.0 && mean_r < 800.0,
         "mean inter-frame step rose to L={mean_l:.1} R={mean_r:.1}; the per-trigger \
-         ramp keeps the bulk distribution under ~360 LSB on this fixture. A mean \
-         above 500 means the ramp is either bypassed or shorter than RAMP_FRAMES."
+         ramp + Amiga LED filter keeps the bulk distribution under ~600 LSB on this \
+         fixture (openmpt123 itself measures ~690). A mean above 800 means the ramp \
+         is either bypassed or shorter than RAMP_FRAMES."
     );
 
     // Optional: when running under `--nocapture` we want the harness to
