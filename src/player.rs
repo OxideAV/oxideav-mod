@@ -834,6 +834,37 @@ impl PlayerState {
             let y = param & 0x0F;
 
             let ch = &mut self.channels[ch_idx];
+
+            // Arpeggio cleanup: if the previous row was running arpeggio
+            // (effect 0 with non-zero param), `ch.period` was left at a
+            // semitone-shifted value by the last tick (per FireLight
+            // tutorial §5.1: tick%3==1 → +x, tick%3==2 → +y). At a row
+            // boundary the spec calls for "Tick 0 set frequency to
+            // normal value" (FireLight §5.1) — i.e. the un-modulated
+            // base. Restore `ch.period` to `ch.arp_base_period` before
+            // any new-row decisions so:
+            //   1. The mixer plays tick 0 of the new row at the correct
+            //      base pitch instead of whatever leftover modulated
+            //      value the prior row's last arp tick left behind.
+            //   2. The "no new note" branch below does not capture the
+            //      stale modulated period as a NEW `arp_base_period` —
+            //      that would compound the modulation across every row
+            //      with continuing arpeggio (audible on `cyber.mod`'s
+            //      pat-1 ch-2 lead, rows 32-58, where the effect-0 cell
+            //      pattern is "trigger / continue / trigger / trigger
+            //      / trigger / continue / ..." — every "continue" row
+            //      played at the prior tick's modulated period and
+            //      then re-modulated from that, raising the pitch by
+            //      ~3 semitones per non-trigger row).
+            //   3. Other effects starting on this row (porta up/down,
+            //      tone porta, fine slides) operate on the true base
+            //      period rather than a modulated one.
+            // See `Protracker-effects-MODFIL12.txt` 0:Arpeggio and
+            // FireLight-MOD-Player-Tutorial.txt §5.1.
+            if ch.effect == 0x0 && ch.effect_param != 0 && ch.arp_base_period != 0 {
+                ch.period = ch.arp_base_period;
+            }
+
             ch.effect = effect;
             ch.effect_param = param;
             ch.cut_tick = 0;
@@ -3328,6 +3359,103 @@ pub mod tests {
             end as usize <= s.pcm.len(),
             "loop_end ({end}) must be clamped to pcm.len() ({})",
             s.pcm.len()
+        );
+    }
+
+    /// Regression for the round-105 cyber.mod arpeggio bug:
+    ///
+    /// When effect 0xy (arpeggio) carries across rows — i.e. row N
+    /// triggers a note + arpeggio, and row N+1 has no new note but
+    /// continues the same effect 0xy — the channel's
+    /// `arp_base_period` MUST stay anchored to the original triggered
+    /// note. Without the fix, the previous row's last tick left
+    /// `ch.period` at a semitone-shifted value (FireLight §5.1
+    /// pseudo: tick%3==2 → +y); the "no note" branch in `enter_row`
+    /// then captured that modulated period as the NEW arp base, so
+    /// every continuation row shifted the chord up another (x, y)
+    /// step. On `cyber.mod` pat-1 ch-2 (rows 32-58, sample 5
+    /// `st-07:buzzshot`) this produced an audibly out-of-tune lead
+    /// in the 12-14 s region, which the user reported as "effects a
+    /// bit off". See `Protracker-effects-MODFIL12.txt` 0:Arpeggio
+    /// ("This effect means to play the note specified, then the
+    /// note+xxxx half-steps, then the note+yyyy half-steps, and then
+    /// return to the original note"; the "original note" is the
+    /// triggered note, not the previous tick's modulated value) and
+    /// FireLight-MOD-Player-Tutorial.txt §5.1 ("Tick 0 set frequency
+    /// to normal value").
+    #[test]
+    fn arpeggio_base_persists_across_rows_without_new_note() {
+        // Row 0: trigger C-2 (period 428) on channel 0 with arpeggio
+        //        x=3, y=4 (effect 034).
+        // Row 1: NO new note, same arpeggio 034 still active.
+        // Expected at row 1, tick 1 (after enter_row + 1 tickN): the
+        // period must equal `PERIOD_TABLE[0][12 + 3]` (C-2 + 3 semis
+        // = D#-2 = 339), NOT the bug-shifted value
+        // `PERIOD_TABLE[0][15 + 3]` (which would be a fifth higher).
+        // Row 1 tick 0: must equal the un-modulated base (period 428),
+        // not the leftover modulated period from row 0 tick 5
+        // (which would be 339 = base + x semis).
+        let bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0x34,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0,
+                    effect_param: 0x34,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+
+        // Step 8 ticks: ticks 0..5 of row 0 (6 ticks) + ticks 0..1 of
+        // row 1 (2 ticks). step_one_tick advances state at the end of
+        // each call; the 7th call's `advance_tick` calls
+        // `enter_row(row=1)` (where the round-105 fix restores period
+        // to the un-modulated base), and the 8th call's
+        // `advance_tick` runs `apply_tickn` for tick 1 of row 1
+        // (which applies the +x arpeggio offset).
+        for _ in 0..8 {
+            step_one_tick(&mut player);
+        }
+        // After the round-105 fix, `arp_base_period` must still be
+        // anchored to the original triggered period (428). Pre-fix
+        // this would equal the previous row's last-tick modulated
+        // period (e.g. 320 = C-2 + y=4 semis = E-2), causing the
+        // chord to shift up by (x, y) on every continuation row.
+        assert_eq!(
+            player.channels[0].arp_base_period, 428,
+            "arpeggio base must persist across rows that have no new \
+             note — got {}, expected 428 (the original note period). \
+             Pre-fix this would equal the previous row's last-tick \
+             modulated period.",
+            player.channels[0].arp_base_period
+        );
+
+        // After 7 ticks total: tick 1 of row 1 has just been rendered
+        // (tick=2 in the player's internal counter). Arpeggio sets
+        // period = base + x semitones = `PERIOD_TABLE[0][12 + 3]`
+        // = 360 (D#-2 in finetune-0 row). With the bug this would be
+        // `PERIOD_TABLE[0][15 + 3]` ≈ 285 — a fifth higher than the
+        // intended +3 semis.
+        assert_eq!(
+            player.channels[0].period,
+            PERIOD_TABLE[0][12 + 3],
+            "row 1 tick 1 of a continuation arpeggio must land on \
+             base + x semitones (PERIOD_TABLE[0][15] = {}), not on \
+             a doubly-shifted value",
+            PERIOD_TABLE[0][12 + 3]
         );
     }
 }
