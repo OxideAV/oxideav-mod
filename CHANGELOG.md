@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mod/compare/v0.0.5...v0.0.6) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- round 19 — close standard-effect coverage gaps
+- pin Sadness.mod (infinite-stream MOD) URL regression
+- adopt slim VideoFrame/AudioFrame shape
+- fix arpeggio base period persistence across no-note rows
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-mod/compare/v0.0.4...v0.0.5) - 2026-04-26
 
 ### Other
