@@ -219,7 +219,7 @@ fn decode_n_seconds(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
-    let mut dec: Box<dyn Decoder> = reg.make_decoder(&params).expect("decoder");
+    let mut dec: Box<dyn Decoder> = reg.first_decoder(&params).expect("decoder");
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
     dec.send_packet(&pkt).expect("send_packet");
 

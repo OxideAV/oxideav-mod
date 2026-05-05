@@ -64,7 +64,7 @@ fn decode_interleaved(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     register_codecs(&mut reg);
     let codec_id = CodecId::new(CODEC_ID_STR);
     let params = CodecParameters::audio(codec_id);
-    let mut dec: Box<dyn Decoder> = reg.make_decoder(&params).expect("decoder available");
+    let mut dec: Box<dyn Decoder> = reg.first_decoder(&params).expect("decoder available");
 
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
     dec.send_packet(&pkt).expect("send_packet");
