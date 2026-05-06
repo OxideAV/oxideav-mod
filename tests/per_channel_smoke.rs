@@ -53,7 +53,9 @@ fn planar_decoder_via_registry_emits_one_plane_per_channel() {
     register_codecs(&mut reg);
     let codec_id = CodecId::new(CODEC_ID_PLANAR_STR);
     let params = CodecParameters::audio(codec_id);
-    let mut dec: Box<dyn Decoder> = reg.first_decoder(&params).expect("planar decoder available");
+    let mut dec: Box<dyn Decoder> = reg
+        .first_decoder(&params)
+        .expect("planar decoder available");
 
     let pkt = Packet::new(
         0,

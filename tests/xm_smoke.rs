@@ -187,7 +187,9 @@ fn xm_decoder_rejects_with_unsupported_but_is_constructible() {
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_XM_STR));
-    let mut dec: Box<dyn Decoder> = reg.first_decoder(&params).expect("xm decoder constructible");
+    let mut dec: Box<dyn Decoder> = reg
+        .first_decoder(&params)
+        .expect("xm decoder constructible");
 
     let bytes = build_minimal_xm();
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
@@ -207,7 +209,9 @@ fn xm_decoder_rejects_non_xm_blob_as_invalid() {
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_XM_STR));
-    let mut dec: Box<dyn Decoder> = reg.first_decoder(&params).expect("xm decoder constructible");
+    let mut dec: Box<dyn Decoder> = reg
+        .first_decoder(&params)
+        .expect("xm decoder constructible");
 
     let bytes = vec![0u8; xm::XM_MIN_HEADER_LEN];
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
