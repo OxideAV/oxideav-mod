@@ -107,10 +107,8 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Unified entry point: install every codec and container provided by
 /// `oxideav-mod` into a [`RuntimeContext`].
 ///
-/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
-/// [`oxideav_core::register!`] macro below so consumers calling
-/// [`oxideav_core::RuntimeContext::with_all_features`] pick the MOD
-/// codec/container up without any explicit umbrella plumbing. The
+/// Also wired into [`oxideav_meta::register_all`] via the
+/// [`oxideav_core::register!`] macro below. The
 /// short-name `amiga_mod` matches the umbrella's existing trace name
 /// from the #502 sweep.
 pub fn register(ctx: &mut RuntimeContext) {
