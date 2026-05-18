@@ -92,7 +92,8 @@ Spec-level effect coverage per
 | EDx | Note delay | implemented |
 | EEx | Pattern delay | implemented |
 | EFx | Invert loop | deliberately not implemented per spec ("don't bother") |
-| 8xx | Set pan | not implemented (ProTracker ignores; Amiga uses hard-pan LRRL) |
+| 8xx | Set FINE Panning (FT extension) | implemented (raw 0..=255: $00 LEFT, $FF RIGHT; per-channel) |
+| E8x | Set ROUGH Panning (FT extension) | implemented (nibble replicated: $0 LEFT, $F RIGHT; per-channel) |
 
 Loop handling is forward-only per MOD spec — ping-pong / bidi loops are an
 XM/IT/S3M-era extension and are deliberately not used here.
@@ -149,6 +150,22 @@ a unit test in `src/player.rs`):
   channel-priority rule, the higher-numbered channel wins. The
   regression test pins this down so a future refactor doesn't quietly
   flip the ordering.
+- **`8xx` / `E8x` per-channel pan vs. Amiga LRRL default** — the
+  FastTracker pan extensions live alongside the player's global
+  `pan_separation` knob: each channel carries a `pan: u8` (0 = LEFT,
+  128 = centre, 255 = RIGHT) initialised to the classic Amiga LRRL
+  layout (channels 0 & 3 → 0, 1 & 2 → 255, repeating every 4) so a
+  MOD with no pan commands renders identically to the pre-r75 build.
+  `8xx` overwrites the full byte; `E8x` replicates the nibble across
+  both halves (`E80` → 0x00, `E8F` → 0xFF) — matching the endpoint
+  semantics in `Protracker-effects-MODFIL12.txt` lines 1201-1207
+  (8xx) and 1503-1505 (E8x), and the monotonic 16-step ramp echoed in
+  `multimedia-cx-protracker.html` E8x. The per-channel gain helper
+  `pan_gains(p, s)` collapses to the prior hard-LRRL formula at the
+  endpoints (so the libmodplug-calibrated headroom divisor still
+  holds bit-for-bit), and splits a centred channel evenly regardless
+  of `s` — so a MOD that pans a lead voice to centre stays centred
+  even at `pan_separation = 1.0`.
 
 ## License
 

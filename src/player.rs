@@ -332,6 +332,24 @@ pub struct Channel {
     /// processed: like Fxx, a later channel's E0 wins on the same row.
     pub pending_led: Option<bool>,
 
+    /// Per-channel pan position, 0..=255. `0` = hard LEFT, `255` =
+    /// hard RIGHT, `128` = centre. This is the FT-extension panning
+    /// state set by `8xx` (full 8-bit pan, `Protracker-effects-
+    /// MODFIL12.txt` lines 1201-1207: "Command 8: Set FINE Panning ...
+    /// xxxxyyyy = panning position. (0=Most left, 255=most right.)")
+    /// and by `E8x` (rough nibble pan, `Protracker-effects-
+    /// MODFIL12.txt` lines 1503-1505: "Command $E8: Set (Rough)
+    /// Panning ... yyyy = panning value. $0 = most left, $F = most
+    /// right.") — the E8 nibble is replicated across both halves of
+    /// the byte so `E80` → 0x00, `E8F` → 0xFF, `E87` → 0x77, matching
+    /// the "rough" 16-step interpretation also documented in
+    /// `multimedia-cx-protracker.html` ("$0 is hard left, $F is hard
+    /// right"). Initial values follow the Amiga LRRL hard-pan
+    /// convention (channels 0 & 3 → 0, 1 & 2 → 255, pattern repeats
+    /// every 4) so a MOD with no panning commands renders identically
+    /// to the pre-r75 build.
+    pub pan: u8,
+
     /// Last post-volume sample emitted by this channel's mixer. Used
     /// as the starting point for the crossfade ramp on the next
     /// re-trigger (see `ramp_prev_sample`). Updated by `mix_one`
@@ -626,7 +644,25 @@ impl PlayerState {
         sample_rate: u32,
     ) -> Self {
         let channels = (0..header.channels)
-            .map(|_| Channel::default())
+            .map(|i| {
+                // Initialise per-channel pan to the Amiga LRRL
+                // hard-pan layout (channels 0 & 3 → 0/LEFT, 1 & 2 →
+                // 255/RIGHT, repeating every 4). This matches
+                // `channel_is_left` and keeps a MOD that never issues
+                // 8xx / E8x rendering identically to the pre-r75
+                // build (the per-channel `pan` simply re-derives the
+                // hard-LRRL mix that `sample_all_channels` used to
+                // compute from `channel_is_left(i)`).
+                let pan = if Self::channel_is_left(i as usize) {
+                    0
+                } else {
+                    255
+                };
+                Channel {
+                    pan,
+                    ..Channel::default()
+                }
+            })
             .collect::<Vec<_>>();
         let n_ch = channels.len();
         PlayerState {
@@ -1195,20 +1231,25 @@ impl PlayerState {
         let mut r = 0.0f32;
         let n_ch = self.channels.len();
         let s = self.pan_separation;
-        let near = (1.0 + s) * 0.5;
-        let far = (1.0 - s) * 0.5;
+        // Per-channel pan derives the L/R gain pair from `ch.pan`
+        // (0 = hard LEFT, 128 = centre, 255 = hard RIGHT) per the
+        // 8xx / E8x spec. The `pan_separation` global narrows the L↔R
+        // gap symmetrically around the centre: a fully panned channel
+        // contributes `(1 + s) / 2` to its near speaker and
+        // `(1 - s) / 2` to the far one. A centred channel (pan = 128)
+        // splits evenly regardless of separation. This collapses to
+        // the pre-r75 hard-LRRL formula whenever `ch.pan` is 0 or
+        // 255 (which is the LRRL default initialised by `new`), so
+        // the libmodplug calibration in the divisor below still
+        // holds bit-for-bit.
         for (i, ch) in self.channels.iter_mut().enumerate() {
             let vib = Self::vibrato_offset(ch);
             let trem = Self::tremolo_offset(ch);
             let smp = ch.mix_one(&self.samples, out_rate, vib, trem);
             per_channel[i] = smp;
-            if Self::channel_is_left(i) {
-                l += smp * near;
-                r += smp * far;
-            } else {
-                l += smp * far;
-                r += smp * near;
-            }
+            let (gl, gr) = pan_gains(ch.pan, s);
+            l += smp * gl;
+            r += smp * gr;
         }
         // Mix-bus headroom divisor.
         //
@@ -1453,6 +1494,22 @@ fn apply_tick0_effect(
             }
             ch.mem_tremolo = (rate << 4) | depth;
         }
+        0x8 => {
+            // 8xx: Set FINE Panning (FT2 extension).
+            // `Protracker-effects-MODFIL12.txt` lines 1201-1207:
+            //   "Command 8: Set FINE Panning.
+            //    Even if the AMIGA PROTracker does not support it,
+            //    this effect is used by modern MOD's and supported
+            //    by nearly all modern PC MOD player routines.
+            //    xxxxyyyy = panning position. (0=Most left,
+            //    255=most right.)"
+            // The classic Amiga ProTracker hard-pan layout (LRRL,
+            // see `channel_is_left`) is overridden per channel by
+            // this command until a new 8xx / E8x sets a different
+            // value. No memory semantics in the spec (8xx is
+            // explicitly not memorised between rows).
+            ch.pan = param;
+        }
         0x9 => {
             // 9xx: handled at note-trigger time (enter_row). Nothing to do here
             // since we already latched the memory and the position.
@@ -1582,7 +1639,24 @@ fn apply_extended_tick0(
             // E7x: set tremolo waveform.
             ch.trem_wave.set(y);
         }
-        0x8 => { /* E8x — unused in classic PT. */ }
+        0x8 => {
+            // E8x: Set (Rough) Panning.
+            // `Protracker-effects-MODFIL12.txt` lines 1503-1505:
+            //   "Command $E8: Set (Rough) Panning. (also called
+            //    MTM panning)
+            //    yyyy = panning value. $0 = most left, $F = most
+            //    right."
+            // The spec doesn't pin a specific 4 → 8 bit upscale, but
+            // the convention echoed in `multimedia-cx-protracker.html`
+            // E8x ("Another stereo extension. $0 is hard left, $F is
+            // hard right.") is for the nibble to span the same range
+            // as 8xx. Replicating the nibble into both halves of the
+            // byte (`y << 4 | y`) gives the correct endpoints (0x00,
+            // 0xFF) and a monotonic centre (0x77/0x88 either side of
+            // the midpoint), which is the standard "nibble panning"
+            // mapping used by every modern PT-compatible player.
+            ch.pan = (y << 4) | y;
+        }
         0x9 => {
             // E9x: retrig note — parameter captured here, per-tick handler
             // actually replays the sample.
@@ -1798,6 +1872,36 @@ fn volume_slide_step(ch: &mut Channel, slide: u8) {
     } else if y != 0 {
         ch.volume = ch.volume.saturating_sub(y);
     }
+}
+
+/// Compute the (left, right) gain pair for a channel with FT-extension
+/// 8-bit pan `p` (0 = hard LEFT, 128 = centre, 255 = hard RIGHT) under
+/// the player's global `pan_separation` `s ∈ [0, 1]` (1 = full Amiga
+/// hard pan, 0 = collapse to mono).
+///
+/// Construction:
+/// - Map `p` to a unit position `u = p / 255` in `[0, 1]`.
+/// - Centre and scale to `[-1, 1]`: `c = 2*u - 1`.
+/// - Scale by separation `s`: `c' = c * s`.
+/// - Equal-power-by-cancellation linear pan:
+///   `left  = (1 - c') / 2`
+///   `right = (1 + c') / 2`
+///
+/// At endpoints (`p = 0`, `s = 1` → c' = -1) this collapses to
+/// `(1, 0)`, identical to the pre-r75 `channel_is_left` hard-pan
+/// formula via `near = (1 + s) / 2 = 1, far = (1 - s) / 2 = 0`. At
+/// the centre (`p = 128`, c' ≈ 0) the channel contributes `(0.5,
+/// 0.5)` regardless of `s`, which is the desired behaviour for a
+/// centred channel under a global separation narrow. With `p = 0`
+/// and `s = 0.5` we get `(0.75, 0.25)`, matching the prior
+/// `near/far = ((1+s)/2, (1-s)/2)` split.
+pub fn pan_gains(p: u8, s: f32) -> (f32, f32) {
+    let u = p as f32 / 255.0;
+    let c = 2.0 * u - 1.0;
+    let c_eff = c * s.clamp(0.0, 1.0);
+    let left = (1.0 - c_eff) * 0.5;
+    let right = (1.0 + c_eff) * 0.5;
+    (left, right)
 }
 
 /// Advance a vibrato / tremolo LFO position register per the Protracker
@@ -3456,6 +3560,202 @@ pub mod tests {
              base + x semitones (PERIOD_TABLE[0][15] = {}), not on \
              a doubly-shifted value",
             PERIOD_TABLE[0][12 + 3]
+        );
+    }
+
+    /// Default per-channel pan in a freshly-built `PlayerState` follows
+    /// the Amiga LRRL hard-pan convention (channels 0 & 3 → 0/LEFT,
+    /// 1 & 2 → 255/RIGHT, repeating every 4) so that a MOD with no
+    /// 8xx / E8x commands renders identically to the pre-r75 build.
+    /// Cited in `Protracker-effects-MODFIL12.txt` §11 (the same hard-pan
+    /// layout that motivates `pan_separation < 1.0` for headphone
+    /// listeners).
+    #[test]
+    fn channel_pan_defaults_to_amiga_lrrl() {
+        let bytes = synth_square_mod();
+        let player = make_player(&bytes);
+        // 4-channel synth: ch 0 & 3 → 0 (LEFT), ch 1 & 2 → 255 (RIGHT).
+        assert_eq!(player.channels[0].pan, 0, "ch 0 default = LEFT (0)");
+        assert_eq!(player.channels[1].pan, 255, "ch 1 default = RIGHT (255)");
+        assert_eq!(player.channels[2].pan, 255, "ch 2 default = RIGHT (255)");
+        assert_eq!(player.channels[3].pan, 0, "ch 3 default = LEFT (0)");
+    }
+
+    /// `8xx` is the FT-extension Set Fine Panning command:
+    /// `Protracker-effects-MODFIL12.txt` lines 1201-1207
+    ///   "Command 8: Set FINE Panning. xxxxyyyy = panning position.
+    ///    (0=Most left, 255=most right.)"
+    /// Verify tick-0 dispatch latches the byte verbatim into `ch.pan`.
+    #[test]
+    fn effect_8xx_sets_per_channel_pan() {
+        let bytes = synth_mod_with_pattern(&[
+            // Row 0: trigger note on ch 1, then 8xx with param 0x40 on ch 1.
+            (
+                0,
+                1,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0x8,
+                    effect_param: 0x40,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        // Sanity — Amiga default for ch 1 = RIGHT (255).
+        assert_eq!(player.channels[1].pan, 255);
+        // Tick 0 dispatches the row's tick-0 effects.
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[1].pan, 0x40,
+            "8xx must overwrite ch.pan with the raw param byte"
+        );
+        // Endpoints both directions.
+        let bytes_left = synth_mod_with_pattern(&[(
+            0,
+            2,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0x8,
+                effect_param: 0x00,
+            },
+        )]);
+        let mut p2 = make_player(&bytes_left);
+        step_one_tick(&mut p2);
+        assert_eq!(p2.channels[2].pan, 0x00, "800 = hard LEFT");
+
+        let bytes_right = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0x8,
+                effect_param: 0xFF,
+            },
+        )]);
+        let mut p3 = make_player(&bytes_right);
+        step_one_tick(&mut p3);
+        assert_eq!(p3.channels[0].pan, 0xFF, "8FF = hard RIGHT");
+    }
+
+    /// `E8x` is the rough nibble-pan extension:
+    /// `Protracker-effects-MODFIL12.txt` lines 1503-1505
+    ///   "Command $E8: Set (Rough) Panning. yyyy = panning value.
+    ///    $0 = most left, $F = most right."
+    /// The nibble is replicated into both halves of the byte
+    /// (`y << 4 | y`) so E80 → 0x00, E8F → 0xFF, E87 → 0x77, E88 →
+    /// 0x88 — matching the same endpoint mapping as 8xx and the
+    /// monotonic "rough" 16-step ramp documented in
+    /// `multimedia-cx-protracker.html` E8x.
+    #[test]
+    fn effect_e8x_sets_rough_pan_from_nibble() {
+        let table = [
+            (0x0u8, 0x00u8),
+            (0x1, 0x11),
+            (0x7, 0x77),
+            (0x8, 0x88),
+            (0xF, 0xFF),
+        ];
+        for (nibble, expected) in table {
+            let bytes = synth_mod_with_pattern(&[(
+                0,
+                1,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xE,
+                    effect_param: 0x80 | nibble,
+                },
+            )]);
+            let mut player = make_player(&bytes);
+            step_one_tick(&mut player);
+            assert_eq!(
+                player.channels[1].pan, expected,
+                "E8{:X} must set ch.pan to 0x{:02X} (nibble replicated)",
+                nibble, expected,
+            );
+        }
+    }
+
+    /// `pan_gains` must collapse to the pre-r75 hard-pan formula at the
+    /// LRRL endpoints (pan = 0 or 255) for any `s` — that's the
+    /// invariant that keeps the libmodplug calibration in
+    /// `sample_all_channels` valid bit-for-bit on MODs that don't use
+    /// 8xx / E8x. The centre (pan = 128) must split evenly regardless
+    /// of `s`; that's the property that lets per-channel pan coexist
+    /// with the global `pan_separation` narrow.
+    #[test]
+    fn pan_gains_matches_legacy_hard_pan_at_endpoints() {
+        for s_int in 0..=10 {
+            let s = s_int as f32 / 10.0;
+            // p = 0: hard LEFT. Legacy formula for a hard-LEFT channel:
+            //   l_gain = (1 + s) / 2, r_gain = (1 - s) / 2.
+            let (l, r) = pan_gains(0, s);
+            let expected_l = (1.0 + s) * 0.5;
+            let expected_r = (1.0 - s) * 0.5;
+            assert!(
+                (l - expected_l).abs() < 1e-6 && (r - expected_r).abs() < 1e-6,
+                "pan=0 s={s}: got ({l},{r}), expected ({expected_l},{expected_r})",
+            );
+            // p = 255: hard RIGHT. Symmetric: l = (1 - s) / 2,
+            // r = (1 + s) / 2.
+            let (l, r) = pan_gains(255, s);
+            assert!(
+                (l - (1.0 - s) * 0.5).abs() < 1e-6 && (r - (1.0 + s) * 0.5).abs() < 1e-6,
+                "pan=255 s={s}: got ({l},{r}), expected hard-RIGHT mirror"
+            );
+        }
+        // Centre (p = 128 ≈ 0.5 + ε) splits roughly evenly for any s.
+        for s_int in 0..=10 {
+            let s = s_int as f32 / 10.0;
+            let (l, r) = pan_gains(128, s);
+            // Drift from exact 0.5 is tiny (128/255 ≠ 0.5 exactly).
+            let drift = (l - r).abs();
+            assert!(
+                drift < 0.01,
+                "centred pan must yield near-equal L/R for s={s}; got ({l},{r}) drift={drift}",
+            );
+        }
+    }
+
+    /// End-to-end smoke: a synth MOD with no 8xx / E8x commands must
+    /// render exactly the same bytes after the per-channel-pan rework
+    /// as before (the LRRL initialisation + endpoint collapse of
+    /// `pan_gains` guarantees this). We verify by checking that
+    /// `render` produces non-trivial signal on BOTH stereo lanes for
+    /// a 4-ch MOD whose only triggered channel is ch 0 (LEFT-panned)
+    /// — the `pan_separation = 0.5` default bleeds it to the right
+    /// at 25 % gain, which is exactly the prior behaviour.
+    #[test]
+    fn render_with_no_pan_commands_preserves_legacy_bleed() {
+        let bytes = synth_square_mod();
+        let mut player = make_player(&bytes);
+        let mut buf = vec![0i16; 1024 * 2];
+        let produced = player.render(&mut buf);
+        assert!(produced > 0, "must render some samples");
+        let peak_l = buf
+            .chunks_exact(2)
+            .map(|c| c[0].unsigned_abs() as u32)
+            .max()
+            .unwrap_or(0);
+        let peak_r = buf
+            .chunks_exact(2)
+            .map(|c| c[1].unsigned_abs() as u32)
+            .max()
+            .unwrap_or(0);
+        assert!(peak_l > 0, "LEFT lane must carry signal");
+        assert!(
+            peak_r > 0,
+            "RIGHT lane must carry bleed signal (default pan_separation = 0.5)"
+        );
+        // Bleed ratio: hard-LEFT ch under separation 0.5 → 25 % on R,
+        // 75 % on L. Tolerate ramp + filter / interpolation slack.
+        let ratio = peak_r as f32 / peak_l as f32;
+        assert!(
+            (0.25..=0.4).contains(&ratio),
+            "RIGHT-to-LEFT bleed ratio for hard-LEFT ch at s=0.5 must be ~0.33; got {ratio}"
         );
     }
 }

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `8xx` Set FINE Panning (FT extension): per-channel `pan: u8`
+  (0 = hard LEFT, 255 = hard RIGHT) overwrites the Amiga LRRL
+  hard-pan default. Cited in `Protracker-effects-MODFIL12.txt`
+  lines 1201-1207.
+- `E8x` Set ROUGH Panning (FT extension): per-channel pan from
+  the nibble replicated into both halves of the byte (`E80` →
+  0x00, `E8F` → 0xFF). Cited in `Protracker-effects-MODFIL12.txt`
+  lines 1503-1505 and `multimedia-cx-protracker.html` E8x.
+- New `pan_gains(p, s)` helper that derives per-channel L/R gains
+  from the 8-bit pan and the global `pan_separation`. Collapses to
+  the prior hard-LRRL formula at the endpoints (pan = 0 or 255)
+  so the libmodplug-calibrated headroom divisor is preserved
+  bit-for-bit on MODs that don't use 8xx / E8x. Centred channels
+  (pan = 128) split evenly regardless of separation.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-mod/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other
