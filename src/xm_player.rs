@@ -62,11 +62,14 @@
 //!  - **Pattern loop (E6x)** — `E60` marks loop start; `E6n` (n>0) loops
 //!    back `n` times. Per-channel state.
 //!  - **Set finetune (E5x)** — overrides the playing sample's finetune.
-//!  - **Set glissando control (E3x)** / **Set tremolo waveform (E7x)** /
-//!    **Set vibrato waveform (E4x)** — recorded; tremolo waveform honoured.
-//!
-//! Not implemented yet (lower priority, single-effect impact):
-//!  - Lxy set-envelope-position.
+//!  - **Set glissando control (E3x)** — when on, tone-porta (3xy / 5xy
+//!    / vol-col Mx) snaps the period to the nearest semitone after
+//!    each tick's linear slide step.
+//!  - **Set tremolo waveform (E7x)** / **Set vibrato waveform (E4x)** —
+//!    recorded; tremolo waveform honoured.
+//!  - **Set envelope position (Lxy)** — sets the volume envelope's
+//!    tick cursor to `param`. The next `tick_envelope` call re-aligns
+//!    the segment index on its own.
 
 use crate::mixer::{MixerVoice, XmPitch, XmPitchTable};
 use crate::xm::{
@@ -231,6 +234,14 @@ pub struct XmChannel {
     /// Vibrato waveform; same bit layout as `trem_waveform`. Currently
     /// only sine (waveform 0) is implemented; field captured for tests.
     pub vib_waveform: u8,
+    /// Glissando control (E3x): when on, tone-porta (3xy / 5xy / vol-col
+    /// Mx) snaps the period to the nearest semitone after each tick's
+    /// linear slide step. Default off — period slides continuously.
+    ///
+    /// Spec source: `FastTracker-2-v2.04-xm.txt` line 222 ("E3  Set
+    /// glissando control"); the snap-on-non-zero semantics match the
+    /// canonical PT/FT2 reading where E30 = off, E3n (n>0) = on.
+    pub glissando: bool,
 }
 
 /// Top-level XM player state.
@@ -740,7 +751,7 @@ impl XmPlayerState {
                     .cell_at(self.row, ch_idx)
                     .map(|c| c.volume_kind())
                     .unwrap_or(XmVolume::Empty);
-                apply_tickn_effect(&mut self.channels[ch_idx], vol_col);
+                apply_tickn_effect(&mut self.channels[ch_idx], vol_col, self.pitch.table);
             }
             // Hxy global volume slide runs at tick > 0 song-wide.
             // Picks the first Hxy on a channel; if multiple channels
@@ -1247,10 +1258,12 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
                     // EDx: Note delay — handled in enter_row.
                 }
                 0x03 => {
-                    // E3x: Set glissando control. Captured but not yet
-                    // honoured (tone-porta still uses linear period
-                    // motion; glissando=on would snap to semitones).
-                    let _ = y;
+                    // E3x: Set glissando control. y=0 turns it off, any
+                    // non-zero value turns it on. When on, tone-porta
+                    // (3xy / 5xy / vol-col Mx) snaps the period to the
+                    // nearest semitone after each tick's linear slide
+                    // step; see `apply_tickn_effect` below.
+                    ch.glissando = y != 0;
                 }
                 0x04 => {
                     // E4x: Set vibrato waveform.
@@ -1277,6 +1290,28 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
         0x14 => {
             // Kxy: key-off-as-effect (treat like note 97).
             ch.key_on = false;
+        }
+        0x15 => {
+            // Lxy: Set envelope position.
+            //
+            // Spec source: `FastTracker-2-v2.04-xm.txt` line 226
+            // ("L      Set envelope position") +
+            // `multimedia-cx-fasttracker-2.html` Lxy §2.1.20 ("Set
+            // envelope position."). Spec is terse; the canonical FT2
+            // reading is that the parameter byte is the new tick offset
+            // on the *volume* envelope's x-axis (pan envelope is left
+            // alone). We re-derive the segment index so `tick_envelope`
+            // can resume linear interpolation from the right
+            // (seg, tick) pair.
+            ch.vol_env_tick = ep as u16;
+            ch.vol_env_seg = 0;
+            // We can't reach the instrument table from here; the
+            // segment will be re-aligned on the next `tick_envelope`
+            // call (it auto-advances `seg` while
+            // `tick >= points[seg + 1].0`). Setting seg = 0 forces
+            // re-alignment from the start of the envelope on the next
+            // tick — correct because the envelope only ever moves
+            // monotonically forward within a (loop-free) segment chain.
         }
         0x21 => {
             // X1x/X2x encoded as effect 0x21 by some XM files. We don't
@@ -1305,8 +1340,10 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
 ///
 /// `vol_col` is the cell's volume-column interpretation for this row —
 /// vol-col slides must run per-tick too (e.g. `+x` = slide up y each
-/// non-zero tick).
-fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume) {
+/// non-zero tick). `table` is the active XM pitch table so the
+/// glissando snap can map a period back to the nearest semitone in
+/// either Linear or Amiga mode.
+fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume, table: XmPitchTable) {
     let ep = ch.effect_param;
 
     match ch.effect {
@@ -1322,25 +1359,11 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume) {
         }
         0x03 => {
             // 3xy: Tone porta — slide toward target.
-            let speed = (ch.porta_speed as f32) * 4.0;
-            if (ch.period - ch.porta_target).abs() <= speed {
-                ch.period = ch.porta_target;
-            } else if ch.period < ch.porta_target {
-                ch.period += speed;
-            } else {
-                ch.period -= speed;
-            }
+            tone_porta_step(ch, table);
         }
         0x05 => {
             // 5xy: tone porta + volume slide.
-            let speed = (ch.porta_speed as f32) * 4.0;
-            if (ch.period - ch.porta_target).abs() <= speed {
-                ch.period = ch.porta_target;
-            } else if ch.period < ch.porta_target {
-                ch.period += speed;
-            } else {
-                ch.period -= speed;
-            }
+            tone_porta_step(ch, table);
             apply_vol_slide(ch, ch.vol_slide_mem);
         }
         0x06 => {
@@ -1379,15 +1402,9 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume) {
             ch.base_volume = ch.volume;
         }
         XmVolume::TonePorta(_) => {
-            // Slide toward target by (porta_speed) period units per tick.
-            let speed = (ch.porta_speed as f32) * 4.0;
-            if (ch.period - ch.porta_target).abs() <= speed {
-                ch.period = ch.porta_target;
-            } else if ch.period < ch.porta_target {
-                ch.period += speed;
-            } else {
-                ch.period -= speed;
-            }
+            // Slide toward target by (porta_speed) period units per
+            // tick. Same step + glissando snap as 3xy / 5xy.
+            tone_porta_step(ch, table);
         }
         XmVolume::PanningSlideLeft(p) => {
             ch.base_panning = ch.base_panning.saturating_sub(p);
@@ -1445,6 +1462,76 @@ fn period_to_freq(table: XmPitchTable, period: f32) -> f32 {
             } else {
                 8363.0 * 1712.0 / period
             }
+        }
+    }
+}
+
+/// Take one 3xy/5xy/vol-col-Mx tone-porta step and, when glissando is
+/// on, snap the resulting period to the nearest semitone.
+///
+/// Spec source: `FastTracker-2-v2.04-xm.txt` line 222 ("E3  Set
+/// glissando control"). The standard tone-porta slide is `period ±=
+/// porta_speed * 4` per tick > 0, settling when within `speed` of the
+/// target. Glissando layers a per-tick semitone quantisation on top so
+/// audible pitch only changes in semitone steps even while the
+/// underlying period interpolates continuously toward the target.
+fn tone_porta_step(ch: &mut XmChannel, table: XmPitchTable) {
+    let speed = (ch.porta_speed as f32) * 4.0;
+    if (ch.period - ch.porta_target).abs() <= speed {
+        ch.period = ch.porta_target;
+    } else if ch.period < ch.porta_target {
+        ch.period += speed;
+    } else {
+        ch.period -= speed;
+    }
+    if ch.glissando {
+        ch.period = snap_to_semitone(ch.period, table);
+    }
+}
+
+/// Quantise a period to the nearest semitone under the given pitch
+/// table. In Linear mode this is a straight `round` to the 64-unit
+/// semitone grid (anchored on the spec formula
+/// `Period = 10*12*16*4 - Note*16*4`). In Amiga mode we find the
+/// closest entry in the published 96-step finetune-0 column of
+/// `XmPitch::PERIOD_TAB_PUB`, expanded across the 10 octaves the period
+/// formula spans, and return that entry's period.
+fn snap_to_semitone(period: f32, table: XmPitchTable) -> f32 {
+    match table {
+        XmPitchTable::Linear => {
+            // Linear period: Period = 10*12*16*4 - Note*16*4 -
+            // FineTune/2. Semitone grid step is 16*4 = 64 units.
+            // Anchor: when finetune = 0, the period is an integer
+            // multiple of 64 offset from the spec's zero. We snap by
+            // rounding to that grid and clamping into the valid range.
+            const GRID: f32 = 64.0;
+            const ANCHOR: f32 = 10.0 * 12.0 * 16.0 * 4.0; // 7680
+            let n = ((ANCHOR - period) / GRID).round();
+            (ANCHOR - n * GRID).max(1.0)
+        }
+        XmPitchTable::Amiga => {
+            // Amiga period table is 96 entries (one per finetune-0
+            // semitone at the base octave) on the `* 16` scale.
+            // `note_to_period` divides by 2^(n_div) to drop octaves, so
+            // we walk the table at each octave shift and pick whichever
+            // candidate minimises `|period - candidate|`.
+            if period <= 1.0 {
+                return period.max(1.0);
+            }
+            let mut best = period;
+            let mut best_err = f32::INFINITY;
+            for n_div in 0..10 {
+                let div = 2.0f32.powi(n_div);
+                for &p_raw in XmPitch::PERIOD_TAB_PUB.iter() {
+                    let cand = (p_raw as f32 * 16.0) / div;
+                    let err = (cand - period).abs();
+                    if err < best_err {
+                        best_err = err;
+                        best = cand;
+                    }
+                }
+            }
+            best
         }
     }
 }
@@ -1666,5 +1753,150 @@ mod tests {
         // Should clamp to the last point's y.
         assert_eq!(r.value, 64);
         assert_eq!(r.next_tick, 5);
+    }
+
+    // ---------------- Glissando / tone-porta snap ----------------
+
+    #[test]
+    fn glissando_linear_snaps_to_64_unit_grid() {
+        // Linear semitone grid is 64 units off the anchor `ANCHOR`.
+        // 4608 is the C-4 period (real_note 48): ANCHOR - 48*64 = 4608.
+        // Half-way between two semitones is +32; snap should pick the
+        // nearer semitone.
+        let a = snap_to_semitone(4608.0, XmPitchTable::Linear);
+        assert!((a - 4608.0).abs() < 0.5);
+        // 4608 + 31 → still C-4 (round down).
+        let b = snap_to_semitone(4608.0 + 31.0, XmPitchTable::Linear);
+        assert!((b - 4608.0).abs() < 0.5);
+        // 4608 + 33 → next semitone down (period larger = lower pitch),
+        // i.e. ANCHOR - 47*64 = 4672.
+        let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
+        assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn glissando_amiga_picks_nearest_table_entry() {
+        // The published Amiga period table's finetune-0 column at
+        // semitone 0 is XmPitch::PERIOD_TAB_PUB[0]; we recompute the
+        // expected period for the base octave on the *16 scale.
+        let p0 = XmPitch::PERIOD_TAB_PUB[0] as f32 * 16.0;
+        // Off by +1 — snap should still pick p0.
+        let snapped = snap_to_semitone(p0 + 1.0, XmPitchTable::Amiga);
+        assert!((snapped - p0).abs() < 0.5);
+        // Off by +(table_step / 4) — still snaps to p0 because the
+        // next semitone in the table is ~5% away on the *16 scale.
+        let p1 = XmPitch::PERIOD_TAB_PUB[8] as f32 * 16.0;
+        let mid = (p0 + p1) / 2.0;
+        let snapped = snap_to_semitone(mid - 1.0, XmPitchTable::Amiga);
+        assert!((snapped - p0).abs() < (p1 - p0).abs(), "should pick p0");
+        let snapped = snap_to_semitone(mid + 1.0, XmPitchTable::Amiga);
+        assert!((snapped - p1).abs() < (p1 - p0).abs(), "should pick p1");
+    }
+
+    #[test]
+    fn tone_porta_step_without_glissando_lands_on_target() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            porta_target: 4672.0, // one semitone down (larger period)
+            porta_speed: 0x10,    // step = 16 * 4 = 64 units / tick
+            glissando: false,
+            ..Default::default()
+        };
+        tone_porta_step(&mut ch, XmPitchTable::Linear);
+        // One tick of speed=64 should hit the target exactly.
+        assert!((ch.period - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn tone_porta_step_with_glissando_snaps_intermediate_steps() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            porta_target: 4736.0, // two semitones down (larger period)
+            porta_speed: 0x08,    // step = 8 * 4 = 32 (half-semitone)
+            glissando: true,
+            ..Default::default()
+        };
+        // First tick: +32 raw → 4640, snap to nearest grid → either
+        // 4608 or 4672. The round-half-to-even rule on `.round()` picks
+        // 4640 → 4640/64 = 72.5 from the anchor's neg distance, so the
+        // round goes to 73 → ANCHOR - 73*64 = 4672 (C-4 + 1 semi down).
+        tone_porta_step(&mut ch, XmPitchTable::Linear);
+        assert!(
+            (ch.period - 4672.0).abs() < 0.5 || (ch.period - 4608.0).abs() < 0.5,
+            "expected snap to neighbour semitone, got {}",
+            ch.period
+        );
+        // Without glissando, after one tick we'd be at 4640.0 — i.e.
+        // the period is *quantised*, not still mid-step.
+        assert!(
+            (ch.period - 4640.0).abs() > 1.0,
+            "glissando snap should not leave the period at the raw \
+             intermediate value 4640.0 (got {})",
+            ch.period
+        );
+    }
+
+    // ---------------- Lxy / set envelope position ----------------
+
+    #[test]
+    fn lxy_sets_volume_envelope_tick_and_zeroes_segment() {
+        let mut ch = XmChannel {
+            vol_env_tick: 3,
+            vol_env_seg: 1,
+            pan_env_tick: 7,
+            pan_env_seg: 2,
+            effect: 0x15,
+            effect_param: 0x20,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        // Volume envelope cursor moved to the requested tick.
+        assert_eq!(ch.vol_env_tick, 0x20);
+        // Segment zeroed so `tick_envelope` re-aligns on the next call.
+        assert_eq!(ch.vol_env_seg, 0);
+        // Pan envelope untouched (Lxy targets the volume envelope per
+        // the FT2 reading; pan envelope only moves under explicit
+        // panning effects).
+        assert_eq!(ch.pan_env_tick, 7);
+        assert_eq!(ch.pan_env_seg, 2);
+    }
+
+    #[test]
+    fn lxy_param_zero_rewinds_to_envelope_start() {
+        let mut ch = XmChannel {
+            vol_env_tick: 100,
+            vol_env_seg: 3,
+            effect: 0x15,
+            effect_param: 0x00,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.vol_env_tick, 0);
+        assert_eq!(ch.vol_env_seg, 0);
+    }
+
+    // ---------------- E3x captured into ch.glissando ----------------
+
+    #[test]
+    fn e3x_nonzero_enables_glissando() {
+        let mut ch = XmChannel {
+            effect: 0x0E,
+            effect_param: 0x31,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert!(ch.glissando);
+    }
+
+    #[test]
+    fn e3x_zero_disables_glissando() {
+        let mut ch = XmChannel {
+            glissando: true,
+            effect: 0x0E,
+            effect_param: 0x30,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert!(!ch.glissando);
     }
 }

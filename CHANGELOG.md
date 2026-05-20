@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- XM **E3x glissando control** — when on, tone-porta (3xy / 5xy /
+  vol-col Mx) snaps the period to the nearest semitone after each
+  tick's linear slide step. Works in both Linear and Amiga pitch
+  tables (Linear snaps to the 64-unit semitone grid; Amiga walks
+  `XmPitch::PERIOD_TAB_PUB` across the 10-octave span and picks the
+  nearest table entry by absolute period error). Cited in
+  `FastTracker-2-v2.04-xm.txt` line 222.
+- XM **Lxy set envelope position** (effect 0x15) — moves the volume
+  envelope tick cursor to `param`; segment index is reset to 0 so the
+  next `tick_envelope` call re-aligns from the segment chain. Pan
+  envelope is left untouched, matching the FT2 reading. Cited in
+  `FastTracker-2-v2.04-xm.txt` line 226 and
+  `multimedia-cx-fasttracker-2.html` §2.1.20.
+- `tone_porta_step` / `snap_to_semitone` helpers, factored out of
+  `apply_tickn_effect` so the 3xy, 5xy, and volume-column Mx
+  branches share the same single-step + glissando-snap path.
+- `glissando: bool` field on `XmChannel` (default off).
 - `8xx` Set FINE Panning (FT extension): per-channel `pan: u8`
   (0 = hard LEFT, 255 = hard RIGHT) overwrites the Amiga LRRL
   hard-pan default. Cited in `Protracker-effects-MODFIL12.txt`

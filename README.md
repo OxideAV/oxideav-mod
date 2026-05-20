@@ -167,6 +167,31 @@ a unit test in `src/player.rs`):
   of `s` — so a MOD that pans a lead voice to centre stays centred
   even at `pan_separation = 1.0`.
 
+## FastTracker 2 (.xm) playback coverage
+
+`oxideav-mod` also ships an XM (FastTracker 2 Extended Module) playback
+engine (`xm_player::XmPlayerState`). The XM codec id is parsing-only at
+the registry level pending a few corner-case quirks, but the engine
+itself drives audio for every FT2 standard effect listed in
+[`docs/audio/trackers/xm/FT2-effects-list.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/xm)
+plus the eleven volume-column kinds.
+
+Round 81 closed the two surviving "captured but not honoured" items:
+
+- **E3x glissando control** — when on, tone-porta (3xy / 5xy / vol-col
+  Mx) snaps the period to the nearest semitone after each tick's linear
+  slide step. Works in both Linear and Amiga pitch tables; the Amiga
+  snap walks `XmPitch::PERIOD_TAB_PUB` across the 10-octave span and
+  picks the nearest table entry by absolute period error. Cited in
+  `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 222.
+- **Lxy set envelope position** — moves the volume-envelope tick cursor
+  to `param`. The segment index is reset to 0 so the next
+  `tick_envelope` call re-aligns from the start of the segment chain
+  (which is monotonic without the loop bit, so re-alignment is exact).
+  Pan envelope is left untouched, matching the FT2 reading. Cited in
+  `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 226 and
+  `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.20.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
