@@ -26,6 +26,11 @@
 //!    speed + depth memory.
 //!  - 5xy: tone porta + volume slide (combined).
 //!  - 6xy: vibrato + volume slide.
+//!  - 7xy: tremolo — sine LFO on output volume (clamped 0..=64); shares
+//!    no memory with vibrato (separate `trem_speed` / `trem_depth`
+//!    nibble registers per the canonical "if either xxxx or yyyy are 0,
+//!    then values from the most recent prior tremolo will be used"
+//!    rule in `Protracker-effects-MODFIL12.txt` 7:Tremolo).
 //!  - Exy subcommands: E1x / E2x fine porta, EA x / EB x fine volume
 //!    slide, EC x note cut, ED x note delay.
 //!
@@ -125,6 +130,18 @@ pub struct StmChannel {
     pub vib_depth: u8,
     /// Axy volume-slide parameter memory (shared with 5xy / 6xy).
     pub vol_slide_mem: u8,
+
+    // -------- tremolo (7xy) state --------
+    /// Tremolo sine-table position 0..=63. Walks like `vib_pos` but on
+    /// a separate register so 4xy vibrato and 7xy tremolo on the same
+    /// channel don't share phase.
+    pub trem_pos: u8,
+    /// Tremolo speed memory (last non-zero 7xy `x` nibble). PT semantics
+    /// per `Protracker-effects-MODFIL12.txt` 7:Tremolo say the per-nibble
+    /// memory operates independently from vibrato's.
+    pub trem_speed: u8,
+    /// Tremolo depth memory (last non-zero 7xy `y` nibble).
+    pub trem_depth: u8,
 
     // -------- scheduling --------
     /// Pending note-cut tick (ECx): if >0, volume forced to 0 on that
@@ -270,6 +287,21 @@ impl StmPlayerState {
                         ch.vib_depth = vy;
                     }
                 }
+                0x7 => {
+                    // 7xy: tremolo — per-nibble memory (`x` speed,
+                    // `y` depth) independent of vibrato's. PT spec
+                    // §7:Tremolo: "If either xxxx or yyyy are 0, then
+                    // values from the most recent prior tremolo will
+                    // be used."
+                    let tx = ep >> 4;
+                    let ty = ep & 0x0F;
+                    if tx != 0 {
+                        ch.trem_speed = tx;
+                    }
+                    if ty != 0 {
+                        ch.trem_depth = ty;
+                    }
+                }
                 0x5 | 0x6 | 0xA if ep != 0 => {
                     ch.vol_slide_mem = ep;
                 }
@@ -312,8 +344,16 @@ impl StmPlayerState {
                                 ch.voice.trigger(freq, vol);
                                 ch.cur_semis = target;
                                 ch.porta_target_semis = target;
-                                // Fresh note resets vibrato phase.
+                                // Fresh note resets vibrato + tremolo
+                                // phases (PT canonical retrigger:
+                                // `Protracker-effects-MODFIL12.txt`
+                                // E7:Set-Tremolo-Waveform implies the
+                                // default waveform retriggers on a new
+                                // note unless E7x sets the no-retrig
+                                // bit, which STM's pre-FT2 effect set
+                                // doesn't expose).
                                 ch.vib_pos = 0;
+                                ch.trem_pos = 0;
                             }
                         }
                     }
@@ -400,6 +440,7 @@ impl StmPlayerState {
                     ch.cur_semis = note_to_semis(po, ps);
                     ch.porta_target_semis = ch.cur_semis;
                     ch.vib_pos = 0;
+                    ch.trem_pos = 0;
                 }
                 ch.has_pending_delay = false;
                 ch.note_delay_tick = 0;
@@ -457,9 +498,45 @@ impl StmPlayerState {
                 }
             }
 
+            // Tremolo (7xy): oscillate the *output* volume with a sine
+            // LFO. Per `Protracker-effects-MODFIL12.txt` 7:Tremolo, the
+            // peak amplitude is `depth * (speed - 1)` volume units, and
+            // the effect is "Like vibrato, except we modify the output
+            // volume" per `multimedia-cx-protracker.html` 7xy with the
+            // result clamped to `0 <= vol <= 64`. We mirror the STM
+            // vibrato divisor (`/ 32`) so depth 15 yields a peak swing
+            // of ~60 volume units (full-range at the strongest setting)
+            // — the same ratio MOD's `tremolo_offset` produces via its
+            // `>> 6` shift on the 32-entry table. The offset is computed
+            // first (before the volume scalar update) and added to the
+            // base `ch.volume` so Axy / Cxx etc. set the baseline that
+            // tremolo modulates around (per the "stored volume isn't
+            // modified by this effect" reading shared by the S3M Ixy
+            // doc, which is the same family of effects).
+            let trem_active = ch.effect == 0x7 && ch.trem_depth > 0;
+            let trem_off_units: f32 = if trem_active {
+                let lfo = SINE_TABLE[(ch.trem_pos & 0x3F) as usize] as f32;
+                // Same shape as STM vibrato: (lfo * depth) / 32 → peak
+                // ≈ depth * 4 volume units. At depth 15 → ~±60 units.
+                let units = (lfo * ch.trem_depth as f32) / 32.0;
+                if cur_tick > 0 {
+                    // Walk the sine table at `speed * 4` (matches the
+                    // STM vibrato stepping and gives the same per-line
+                    // oscillation rate the 4xy / 7xy parameters share
+                    // by spec construction).
+                    ch.trem_pos = ch.trem_pos.wrapping_add(ch.trem_speed.wrapping_mul(4)) & 0x3F;
+                }
+                units
+            } else {
+                0.0
+            };
+
             // Update the voice volume scalar (in case Axy / Exx modified
-            // `ch.volume` this tick).
-            ch.voice.volume = (ch.volume as f32 / 64.0) * (global_vol as f32 / 64.0);
+            // `ch.volume` this tick). Tremolo adds an offset, then the
+            // result is clamped to [0, 64] per the PT spec before the
+            // global-volume scale is folded in.
+            let modulated = (ch.volume as f32 + trem_off_units).clamp(0.0, 64.0);
+            ch.voice.volume = (modulated / 64.0) * (global_vol as f32 / 64.0);
         }
     }
 
@@ -806,6 +883,135 @@ mod tests {
             assert!(
                 (got - base).abs() < 1.0,
                 "tick {tick}: zero-param effect-0 must hold base {base}, got {got}"
+            );
+        }
+    }
+
+    /// Build an STM with a C-4 note on row 0 plus tremolo `7xy`
+    /// (effect 7, x=speed nibble, y=depth nibble) on channel 0.
+    /// `vol` (1..=64) sets the cell's starting volume so we have
+    /// headroom for tremolo to swing both above and below.
+    fn build_tremolo_stm(speed: u8, depth: u8, vol: u8) -> Vec<u8> {
+        let mut out = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        // Cell volume override (STM encodes vol bits as bit 0..2 of
+        // byte 1 (low bit) + bits 4..6 of byte 2 (upper bits); vol-1 is
+        // stored — see `StmCell::volume` decoding). For simplicity,
+        // patch the existing ping STM's volume to the requested value:
+        // bit 0..2 of byte 1 (instrument is in bits 3..7, value 1).
+        let v = vol & 0x3F;
+        out[PATTERN_OFF + 1] = (1 << 3) | (v & 0x07);
+        out[PATTERN_OFF + 2] = ((v >> 3) << 4) | 0x07; // upper-vol nibble + effect 7
+        out[PATTERN_OFF + 3] = (speed << 4) | (depth & 0x0F);
+        out
+    }
+
+    #[test]
+    fn tremolo_modulates_volume_symmetrically() {
+        // Tremolo with mid-range volume (32/64) has +32 headroom up and
+        // -32 down so we can see swings both directions. Use a moderate
+        // speed (4) and large depth (15) → peak swing ≈ ±60 vol units,
+        // clamped to [0, 64].
+        let bytes = build_tremolo_stm(4, 15, 32);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Walk many ticks to cover at least one full sine cycle.
+        let mut min_vol = f32::INFINITY;
+        let mut max_vol = f32::NEG_INFINITY;
+        for tick in 0u8..32 {
+            p.tick = tick;
+            p.advance_tick();
+            let v = p.channels[0].voice.volume;
+            if v < min_vol {
+                min_vol = v;
+            }
+            if v > max_vol {
+                max_vol = v;
+            }
+        }
+
+        // Baseline (no tremolo) would be (32 / 64) * (global / 64).
+        // Global is 64 from build_ping_stm. So baseline = 0.5.
+        // Depth 15 + STM scaler 4 gives peak ≈ ±60 vol units, clamped
+        // into [0, 64]. The sine LFO with `speed * 4 = 16` steps per
+        // tick covers a full cycle in 4 ticks, so within 32 ticks we
+        // should see both the lower clamp (0.0) and a high value near
+        // (64 / 64) = 1.0 scaled by global = 1.0.
+        assert!(
+            min_vol < 0.4,
+            "tremolo should swing volume below baseline 0.5: min = {min_vol}"
+        );
+        assert!(
+            max_vol > 0.6,
+            "tremolo should swing volume above baseline 0.5: max = {max_vol}"
+        );
+    }
+
+    #[test]
+    fn tremolo_zero_param_uses_memory() {
+        // First a 7xy with non-zero nibbles to seed memory, then a 700
+        // continuation must keep modulating using the stored values.
+        let mut bytes = build_tremolo_stm(4, 8, 32);
+        // Patch row 1 channel 0 to be effect 7 with param 0 (memory).
+        const PATTERN_OFF: usize = 0x410;
+        const BYTES_PER_ROW: usize = 4 * 4;
+        let row1 = PATTERN_OFF + BYTES_PER_ROW;
+        // Note: 253 (Dots) so no retrigger / no fresh phase reset.
+        bytes[row1] = 253;
+        bytes[row1 + 1] = 0;
+        bytes[row1 + 2] = 0x07;
+        bytes[row1 + 3] = 0x00; // 700 → reuse memory
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Walk row 0 to seed memory (speed=4, depth=8).
+        for tick in 0u8..6 {
+            p.tick = tick;
+            p.advance_tick();
+        }
+        // Now move to row 1 (which uses 700 — memory) and confirm
+        // the tremolo offset is non-zero on at least one tick.
+        p.next_row();
+        let mut saw_swing = false;
+        for tick in 0u8..6 {
+            p.tick = tick;
+            p.advance_tick();
+            let v = p.channels[0].voice.volume;
+            // Baseline would be 32/64 = 0.5. Tremolo with depth 8 must
+            // move it off that value on at least one tick.
+            if (v - 0.5).abs() > 0.05 {
+                saw_swing = true;
+            }
+        }
+        assert!(
+            saw_swing,
+            "700 must reuse last non-zero 7xy params (depth/speed memory)"
+        );
+    }
+
+    #[test]
+    fn tremolo_inert_at_zero_depth() {
+        // 700 on a row with no prior 7xy seed → memory still zero →
+        // volume must hold the baseline across all ticks.
+        let bytes = build_tremolo_stm(0, 0, 32);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        for tick in 0u8..6 {
+            p.tick = tick;
+            p.advance_tick();
+            let v = p.channels[0].voice.volume;
+            // Baseline = 32/64 * 64/64 = 0.5 exactly.
+            assert!(
+                (v - 0.5).abs() < 1e-4,
+                "tick {tick}: 700 with empty memory must leave volume unmodulated, got {v}"
             );
         }
     }

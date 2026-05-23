@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- STM **7xy tremolo** — the Scream Tracker v1 (`.stm`) player now
+  honours effect 7 with a sine LFO on the output volume, parallel
+  to the existing 4xy vibrato pipeline. New `trem_pos` / `trem_speed`
+  / `trem_depth` state on `StmChannel` (independent of vibrato's
+  so 4xy + 7xy on the same channel don't share phase), per-nibble
+  parameter memory (zero nibble = reuse last non-zero value, per
+  `Protracker-effects-MODFIL12.txt` 7:Tremolo "If either xxxx or
+  yyyy are 0, then values from the most recent prior tremolo will
+  be used"), phase reset on note-trigger and note-delay trigger
+  (matching the vibrato retrigger contract), and `[0, 64]` volume
+  clamping per `multimedia-cx-protracker.html` 7xy ("Like vibrato,
+  except we modify the output volume … clamped to 0 <= vol <= 64").
+  The offset is added on top of the live `ch.volume` baseline so
+  Cxx / Axy / EAx / EBx continue to control the centre value the
+  tremolo modulates around. Three unit tests pin the contract:
+  symmetric swing below and above baseline at depth 15, memory
+  reuse on a `700` continuation row, and inert behaviour when both
+  nibbles are zero with empty memory.
 - STM **0xy arpeggio** — the Scream Tracker v1 (`.stm`) player now
   honours effect 0: with at least one non-zero nibble it cycles the
   pitch through note / note+x / note+y half-steps across the row's

@@ -224,6 +224,7 @@ so the implemented columns track the ProTracker semantics documented under
 | 1xy / 2xy | Portamento up / down | implemented (semitone-space, shared last-param memory) |
 | 3xy / 5xy | Tone portamento, with volume slide | implemented |
 | 4xy / 6xy | Vibrato, with volume slide | implemented (XM-shared sine LFO) |
+| 7xy | Tremolo | implemented (independent `trem_pos` register; volume offset clamped to `[0, 64]`; per-nibble memory) |
 | Axy | Volume slide | implemented |
 | Bxy | Position jump | implemented |
 | Cxx | Set volume | implemented |
@@ -240,6 +241,20 @@ arpeggio offset is a direct semitone addition on top of the live pitch.
 The 0xy walk follows the canonical algorithm in
 `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` 0:Arpeggio
 ("if (counter mod 3) = 0/1/2 then play note / note+x / note+y").
+
+Tremolo (7xy) follows the same MOD/PT contract: a sine LFO modulates the
+output volume around the current `ch.volume` baseline (Cxx / Axy /
+EAx / EBx set the baseline; tremolo does not write back to it), the
+result is clamped to the spec's `[0, 64]` range before the global-volume
+scale, and the per-nibble memory (`trem_speed` from a non-zero `x`,
+`trem_depth` from a non-zero `y`) is independent of vibrato's so an
+LFO on volume can stack with an LFO on pitch on the same channel
+without phase-bleed. Cited in
+`docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` 7:Tremolo
+("If either xxxx or yyyy are 0, then values from the most recent prior
+tremolo will be used") and `multimedia-cx-protracker.html` 7xy ("Like
+vibrato, except we modify the output volume … clamped to 0 <= vol <=
+64").
 
 ## License
 
