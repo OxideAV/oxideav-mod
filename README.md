@@ -209,6 +209,38 @@ down / 3 ramp up ordering, distinct from E4x's) is not documented in the
 staged `docs/`, so it is left for a future round once the spec gap is
 filled.
 
+## Scream Tracker v1 (.stm) playback coverage
+
+`oxideav-mod` also drives a Scream Tracker v1 (`.stm`) playback engine
+(`stm_player::StmPlayerState`). STM declares its effects as "in ProTracker
+format" per
+[`docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/stm),
+so the implemented columns track the ProTracker semantics documented under
+`docs/audio/trackers/mod/`:
+
+| Slot | Effect | Status |
+| ---- | ------ | ------ |
+| 0xy  | Arpeggio | implemented (note / note+x / note+y half-steps cycling on `counter mod 3`; pure additive offset, inert at param 0) |
+| 1xy / 2xy | Portamento up / down | implemented (semitone-space, shared last-param memory) |
+| 3xy / 5xy | Tone portamento, with volume slide | implemented |
+| 4xy / 6xy | Vibrato, with volume slide | implemented (XM-shared sine LFO) |
+| Axy | Volume slide | implemented |
+| Bxy | Position jump | implemented |
+| Cxx | Set volume | implemented |
+| Dxy | Pattern break (FT2-style decimal landing row) | implemented |
+| Fxx | Speed / tempo split (≤$1F = speed, ≥$20 = tempo) | implemented |
+| E1x / E2x | Fine portamento up / down | implemented |
+| EAx / EBx | Fine volume slide up / down | implemented |
+| ECx | Note cut | implemented |
+| EDx | Note delay | implemented |
+
+Pitch effects operate in a fractional **semitone** domain (STM has no
+Amiga periods — pitch is derived from each instrument's C3 Hz), so the
+arpeggio offset is a direct semitone addition on top of the live pitch.
+The 0xy walk follows the canonical algorithm in
+`docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` 0:Arpeggio
+("if (counter mod 3) = 0/1/2 then play note / note+x / note+y").
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

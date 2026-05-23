@@ -5,8 +5,12 @@
 //! rather than Amiga periods (see [`crate::mixer::StmC3Pitch`]) and
 //! ProTracker-like effect columns.
 //!
-//! Effects implemented (round 9):
+//! Effects implemented (round 9 onward):
 //!
+//!  - 0xy: arpeggio — cycle the pitch through note / note+x / note+y
+//!    half-steps across the row's ticks (`counter mod 3` per
+//!    `Protracker-effects-MODFIL12.txt` 0:Arpeggio), then back to the
+//!    note. Pure additive offset so porta / vibrato continue underneath.
 //!  - Cxx: set volume.
 //!  - Axy: volume slide (+x per tick, else -y).
 //!  - Fxx: set speed / tempo (<0x20 = speed, >=0x20 = tempo).
@@ -422,6 +426,25 @@ impl StmPlayerState {
                 }
             }
 
+            // Arpeggio (0xy): with at least one non-zero nibble, cycle the
+            // pitch through note / note+x / note+y half-steps across the
+            // ticks of the row, evenly spaced, then back to the note.
+            // STM uses ProTracker-format effects, so we follow the
+            // `Protracker-effects-MODFIL12.txt` 0:Arpeggio algorithm
+            // ("if (counter mod 3) = 0/1/2 then play note / note+x /
+            // note+y"). The offset is a pure addition to the live
+            // semitone position so porta / vibrato continue underneath
+            // and `cur_semis` is left unmodified (no permanent drift).
+            if ch.effect == 0x0 && ch.effect_param != 0 {
+                let arp_x = (ch.effect_param >> 4) as f32;
+                let arp_y = (ch.effect_param & 0x0F) as f32;
+                semis += match cur_tick % 3 {
+                    0 => 0.0,
+                    1 => arp_x,
+                    _ => arp_y,
+                };
+            }
+
             // If the channel is actively playing, recompute the voice
             // frequency from the (possibly-modulated) semitone position.
             let inst_idx = ch.instrument.saturating_sub(1) as usize;
@@ -716,6 +739,75 @@ mod tests {
         assert_eq!(produced, 4410);
         let nonzero = buf.iter().filter(|&&x| x != 0).count();
         assert!(nonzero > 100, "expected audible PCM, got {nonzero} nonzero");
+    }
+
+    /// Build an STM with a C-4 note on row 0 plus arpeggio `037`
+    /// (effect 0, x=3, y=7) on channel 0.
+    fn build_arpeggio_stm() -> Vec<u8> {
+        let mut out = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        // Cell byte 2 = (vol_hi << 4) | command; command 0 = arpeggio.
+        out[PATTERN_OFF + 2] = 0x00;
+        // Cell byte 3 = command param 0x37 (x=3 half-steps, y=7).
+        out[PATTERN_OFF + 3] = 0x37;
+        out
+    }
+
+    #[test]
+    fn arpeggio_cycles_note_x_y_half_steps() {
+        let bytes = build_arpeggio_stm();
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Base note C-4 (48 semis from C0) at c3_hz=8363 →
+        //   8363 * 2^((48-36)/12) = 8363 * 2 = 16726 Hz.
+        let base = semis_to_freq(8363.0, 48.0);
+        assert!((base - 16726.0).abs() < 1.0, "base freq = {base}");
+
+        // Step the engine tick by tick (advance_tick recomputes
+        // ch.voice.freq each tick). On the row's ticks the arpeggio
+        // walks 0 / +3 / +7 / 0 / +3 / +7 half-steps via `tick % 3`.
+        let expected = |semis_off: f32| base * 2.0f32.powf(semis_off / 12.0);
+        let cases = [0.0f32, 3.0, 7.0, 0.0, 3.0, 7.0];
+        for (tick, &off) in cases.iter().enumerate() {
+            p.tick = tick as u8;
+            p.advance_tick();
+            let got = p.channels[0].voice.freq;
+            let want = expected(off);
+            assert!(
+                (got - want).abs() < 1.0,
+                "tick {tick}: arpeggio +{off} semis: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn arpeggio_zero_param_is_inert() {
+        // Effect 0 with a zero parameter is NOT an arpeggio (per
+        // `Protracker-effects-MODFIL12.txt`: "only an arpeggio if there
+        // is at least one non-zero argument"). The pitch must stay on
+        // the base note across all ticks.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x00; // command 0
+        bytes[PATTERN_OFF + 3] = 0x00; // zero param → no arpeggio
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        let base = semis_to_freq(8363.0, 48.0);
+        for tick in 0u8..4 {
+            p.tick = tick;
+            p.advance_tick();
+            let got = p.channels[0].voice.freq;
+            assert!(
+                (got - base).abs() < 1.0,
+                "tick {tick}: zero-param effect-0 must hold base {base}, got {got}"
+            );
+        }
     }
 
     #[test]

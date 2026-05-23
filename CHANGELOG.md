@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- STM **0xy arpeggio** — the Scream Tracker v1 (`.stm`) player now
+  honours effect 0: with at least one non-zero nibble it cycles the
+  pitch through note / note+x / note+y half-steps across the row's
+  ticks (`counter mod 3`), then back to the note, matching the
+  `Protracker-effects-MODFIL12.txt` 0:Arpeggio algorithm STM inherits
+  via its "ProTracker format" effect column. The offset is a pure
+  additive shift on the live semitone position, so porta / vibrato
+  continue underneath and `cur_semis` is left unmodified (no drift).
+  A zero parameter (`000`) is inert per the spec. Cited in
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` lines
+  1000-1045 and `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`
+  ("Effect command in ProTracker format").
 - XM **E4x / E7x vibrato + tremolo waveform shapes** — the LFO shape
   selected by E4x (vibrato) / E7x (tremolo) is now applied to the
   modulation, not just the bit-2 retrigger flag. New `waveform_lfo`
