@@ -66,7 +66,9 @@
 //!    / vol-col Mx) snaps the period to the nearest semitone after
 //!    each tick's linear slide step.
 //!  - **Set tremolo waveform (E7x)** / **Set vibrato waveform (E4x)** —
-//!    recorded; tremolo waveform honoured.
+//!    both shapes honoured by `waveform_lfo`: sine (0), downward saw (1),
+//!    square (2), random (3 → deterministic sine fallback). Bit 2 of the
+//!    parameter selects continue-vs-retrigger at note-on.
 //!  - **Set envelope position (Lxy)** — sets the volume envelope's
 //!    tick cursor to `param`. The next `tick_envelope` call re-aligns
 //!    the segment index on its own.
@@ -99,6 +101,52 @@ const SINE_TABLE: [i8; 64] = [
 /// instrument.fadeout each tick after note is released"). We use 65536 so
 /// that dividing by 65536 gives 1.0 exactly for a pre-fadeout voice.
 const FADEOUT_MAX: i32 = 65536;
+
+/// Compute the signed LFO value for a vibrato / tremolo waveform shape at
+/// a 64-step cycle position, on the same `±127` scale as [`SINE_TABLE`] so
+/// the existing `lfo * depth / N` scaling carries over unchanged.
+///
+/// Waveform shapes per the E4x / E7x effect documentation in
+/// `docs/audio/trackers/mod/multimedia-cx-protracker.html` §4xy
+/// ("Each waveform other than the last has a full cycle of 64 steps, and
+/// the amplitude is somewhere between -y and y"):
+///
+///  - **0 — sine** (default): the 64-entry [`SINE_TABLE`].
+///  - **1 — downward saw**: descends linearly from +127 at `pos == 0`
+///    toward -127 across the cycle.
+///  - **2 — square**: +127 for the first half of the cycle (`pos < 32`),
+///    -127 for the second — "a square wave, starting from +y".
+///  - **3 — random**: the cycle is "mostly irrelevant"; with no
+///    documented PRNG in `docs/`, we fall back to the deterministic sine
+///    shape (the same choice the MOD player makes in `src/player.rs`).
+///
+/// The low two bits of the E4x / E7x parameter pick the shape (bit 2 is
+/// the don't-retrigger flag, handled at note-on); callers pass
+/// `shape & 0x03`.
+///
+/// Spec source for the shape catalogue + the "0 sine / 1 ramp-down /
+/// 2 square / 3 random" numbering:
+/// `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` E4/E7,
+/// `docs/audio/trackers/mod/Protracker-2.3A-misc-info.txt` lines 387/390,
+/// and `docs/audio/trackers/mod/multimedia-cx-protracker.html` §4xy.
+fn waveform_lfo(shape: u8, pos: u8) -> i32 {
+    let p = (pos & 0x3F) as i32;
+    match shape & 0x03 {
+        // Downward saw: +127 at pos 0, stepping down by 2 each of the 64
+        // positions so the cycle spans +127 .. -127.
+        1 => 127 - p * 4,
+        // Square: +127 for the first half, -127 for the second.
+        2 => {
+            if p < 32 {
+                127
+            } else {
+                -127
+            }
+        }
+        // Sine (0) and random (3, no documented PRNG) both use the table.
+        _ => SINE_TABLE[p as usize] as i32,
+    }
+}
 
 /// Per-channel playback state for XM.
 #[derive(Clone, Debug, Default)]
@@ -230,9 +278,12 @@ pub struct XmChannel {
     pub pan_slide_mem: u8,
     /// Tremolo waveform 0..=3 (0 sine, 1 ramp-down, 2 square, 3 random)
     /// per FT2; bit 2 = retrigger-on-new-note. Default 0 (sine, retrig).
+    /// The shape is honoured by [`waveform_lfo`]; bit 2 gates the
+    /// position reset at note-on.
     pub trem_waveform: u8,
-    /// Vibrato waveform; same bit layout as `trem_waveform`. Currently
-    /// only sine (waveform 0) is implemented; field captured for tests.
+    /// Vibrato waveform; same bit layout as `trem_waveform`. The shape is
+    /// honoured by [`waveform_lfo`] (sine / downward saw / square /
+    /// random→sine); bit 2 gates the position reset at note-on.
     pub vib_waveform: u8,
     /// Glissando control (E3x): when on, tone-porta (3xy / 5xy / vol-col
     /// Mx) snaps the period to the nearest semitone after each tick's
@@ -956,7 +1007,7 @@ impl XmPlayerState {
             // resulting offset is `lfo * depth / 64` per FT2 — depth=15
             // and lfo=±127 give roughly ±30 of the 0..=64 volume range.
             let trem_offset = if ch.effect == 0x07 && ch.trem_depth > 0 {
-                let lfo = SINE_TABLE[(ch.trem_pos & 0x3F) as usize] as i32;
+                let lfo = waveform_lfo(ch.trem_waveform, ch.trem_pos);
                 let off = (lfo * ch.trem_depth as i32) / 64;
                 if cur_tick > 0 {
                     ch.trem_pos = ch.trem_pos.wrapping_add(ch.trem_speed * 4) & 0x3F;
@@ -1020,7 +1071,7 @@ impl XmPlayerState {
                 || matches!(vol_col_kind, XmVolume::Vibrato(_)))
                 && ch.vib_depth > 0
             {
-                let lfo = SINE_TABLE[(ch.vib_pos & 0x3F) as usize] as i32;
+                let lfo = waveform_lfo(ch.vib_waveform, ch.vib_pos);
                 // Period offset (FT2: * depth * 4 / 16 = depth / 4, but
                 // classically "depth * 2" of period at max sine). We use
                 // `lfo * depth / 32` which yields +/- ~4 * depth units
@@ -1898,5 +1949,90 @@ mod tests {
         };
         apply_tick0_effect(&mut ch);
         assert!(!ch.glissando);
+    }
+
+    // ---------- E4x / E7x vibrato + tremolo waveform shapes ----------
+
+    #[test]
+    fn waveform_sine_matches_table() {
+        // Shape 0 (and the no-retrigger variant 4) must reproduce the
+        // sine table exactly across the whole 64-step cycle.
+        for pos in 0u8..64 {
+            assert_eq!(waveform_lfo(0, pos), SINE_TABLE[pos as usize] as i32);
+            assert_eq!(waveform_lfo(4, pos), SINE_TABLE[pos as usize] as i32);
+        }
+    }
+
+    #[test]
+    fn waveform_random_falls_back_to_sine() {
+        // No PRNG is documented under docs/, so shape 3 is the
+        // deterministic sine fallback (same choice as the MOD player).
+        for pos in [0u8, 7, 16, 32, 48, 63] {
+            assert_eq!(waveform_lfo(3, pos), SINE_TABLE[pos as usize] as i32);
+        }
+    }
+
+    #[test]
+    fn waveform_downward_saw_descends_through_cycle() {
+        // "Waveform 1 is a downwards saw wave." Starts positive at the
+        // top of the cycle and falls monotonically to negative.
+        assert_eq!(waveform_lfo(1, 0), 127);
+        let mut prev = waveform_lfo(1, 0);
+        for pos in 1u8..64 {
+            let v = waveform_lfo(1, pos);
+            assert!(v < prev, "saw must descend at pos {pos}: {v} !< {prev}");
+            prev = v;
+        }
+        // Crosses zero around mid-cycle and reaches the negative extreme.
+        assert!(waveform_lfo(1, 31) > 0);
+        assert!(waveform_lfo(1, 32) < 0);
+        assert_eq!(waveform_lfo(1, 63), 127 - 63 * 4);
+    }
+
+    #[test]
+    fn waveform_square_is_plus_then_minus() {
+        // "Waveform 2 is a square wave, starting from +y." Positive over
+        // the first half of the cycle, negative over the second.
+        for pos in 0u8..32 {
+            assert_eq!(waveform_lfo(2, pos), 127, "first half should be +127");
+        }
+        for pos in 32u8..64 {
+            assert_eq!(waveform_lfo(2, pos), -127, "second half should be -127");
+        }
+    }
+
+    #[test]
+    fn e4x_sets_vibrato_waveform_shape_bits() {
+        // E41 selects the downward-saw vibrato shape; E44 selects sine
+        // with the don't-retrigger bit. The low three bits are stored.
+        let mut ch = XmChannel {
+            effect: 0x0E,
+            effect_param: 0x41,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.vib_waveform & 0x03, 1, "shape bits = ramp-down");
+        assert_eq!(ch.vib_waveform & 0x04, 0, "retrigger still enabled");
+
+        let mut ch = XmChannel {
+            effect: 0x0E,
+            effect_param: 0x44,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.vib_waveform & 0x03, 0, "shape bits = sine");
+        assert_eq!(ch.vib_waveform & 0x04, 0x04, "don't-retrigger set");
+    }
+
+    #[test]
+    fn e7x_sets_tremolo_waveform_shape_bits() {
+        // E72 selects the square tremolo shape.
+        let mut ch = XmChannel {
+            effect: 0x0E,
+            effect_param: 0x72,
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.trem_waveform & 0x03, 2, "shape bits = square");
     }
 }

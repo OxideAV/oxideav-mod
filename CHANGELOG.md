@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- XM **E4x / E7x vibrato + tremolo waveform shapes** — the LFO shape
+  selected by E4x (vibrato) / E7x (tremolo) is now applied to the
+  modulation, not just the bit-2 retrigger flag. New `waveform_lfo`
+  helper returns the per-cycle value on the same ±127 scale as the
+  sine table: shape 0 sine, 1 downward saw, 2 square ("starting from
+  +y"), 3 random (deterministic sine fallback — no PRNG documented).
+  Both the vibrato and tremolo motion paths now route through it
+  instead of the hardcoded sine table. Cited in
+  `multimedia-cx-protracker.html` §4xy (64-step shape catalogue),
+  `Protracker-effects-MODFIL12.txt` E4/E7, and
+  `Protracker-2.3A-misc-info.txt` lines 387/390.
 - XM **E3x glissando control** — when on, tone-porta (3xy / 5xy /
   vol-col Mx) snaps the period to the nearest semitone after each
   tick's linear slide step. Works in both Linear and Amiga pitch

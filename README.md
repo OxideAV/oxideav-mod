@@ -174,10 +174,21 @@ engine (`xm_player::XmPlayerState`). The XM codec id is parsing-only at
 the registry level pending a few corner-case quirks, but the engine
 itself drives audio for every FT2 standard effect listed in
 [`docs/audio/trackers/xm/FT2-effects-list.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/xm)
-plus the eleven volume-column kinds.
+plus the eleven volume-column kinds. Recent rounds closed the surviving
+"captured but not honoured" items:
 
-Round 81 closed the two surviving "captured but not honoured" items:
-
+- **E4x / E7x vibrato + tremolo waveform shapes** — the LFO shape set by
+  E4x (vibrato) / E7x (tremolo) is now honoured, not just the bit-2
+  retrigger flag. `waveform_lfo` returns the per-cycle value on the same
+  ±127 scale as the sine table: shape 0 sine, 1 downward saw, 2 square
+  ("starting from +y"), 3 random (deterministic sine fallback — no PRNG
+  is documented). Replaces the prior hardcoded-sine LFO for both effects.
+  Cited in `docs/audio/trackers/mod/multimedia-cx-protracker.html` §4xy
+  (the 64-step full-cycle shape catalogue) +
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` E4/E7 +
+  `docs/audio/trackers/mod/Protracker-2.3A-misc-info.txt` lines 387/390
+  (the "0 sine / 1 ramp-down / 2 square / 3 random" numbering, shared by
+  the FT2 E4x/E7x effects).
 - **E3x glissando control** — when on, tone-porta (3xy / 5xy / vol-col
   Mx) snaps the period to the nearest semitone after each tick's linear
   slide step. Works in both Linear and Amiga pitch tables; the Amiga
@@ -191,6 +202,12 @@ Round 81 closed the two surviving "captured but not honoured" items:
   Pan envelope is left untouched, matching the FT2 reading. Cited in
   `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 226 and
   `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.20.
+
+The instrument-level autovibrato (`vibrato_type` byte) still runs a fixed
+sine LFO — its waveform-value mapping (FT2's 0 sine / 1 square / 2 ramp
+down / 3 ramp up ordering, distinct from E4x's) is not documented in the
+staged `docs/`, so it is left for a future round once the spec gap is
+filled.
 
 ## License
 
