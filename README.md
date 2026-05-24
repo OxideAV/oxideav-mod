@@ -74,7 +74,7 @@ Spec-level effect coverage per
 | 3xy / 5xy | Tone portamento, with volume slide | implemented; E3x glissando snaps to nearest semitone |
 | 4xy / 6xy | Vibrato, with volume slide | implemented (32-entry Protracker sine + ramp-down + square) |
 | 7xy | Tremolo | implemented |
-| 9xx | Sample offset (`param << 8`) with memory | implemented |
+| 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk) |
 | Axy | Volume slide | implemented |
 | Bxx | Position jump | implemented |
 | Cxx | Set volume | implemented |
@@ -112,6 +112,13 @@ a unit test in `src/player.rs`):
   `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` §2.2 + §2.8.
 - **Loop metadata clamp** — out-of-range repeat start/length in real-world
   rips is clamped to `pcm.len()` so the mixer never reads past the buffer.
+- **9xx out-of-range** — a sample-offset (`9xx`) whose target lands at or
+  past the end of the sample plays *no note at all* on that channel,
+  rather than silencing on the first mix call (one-shot) or wrapping the
+  over-range cursor back into the loop region (looped). Cited in
+  `Protracker-effects-MODFIL12.txt` 9:Set-sample-offset ("if the effect is
+  out of range … NO NOTE WILL BE PLAYED!"). The `9xx` memory still latches
+  so a later `900` continuation reuses the requested offset.
 - **Sample swap without note** — when a sample number appears on a row
   without a note, PT loads the new sample's default volume + finetune
   immediately but defers the actual sample-PCM swap until the next

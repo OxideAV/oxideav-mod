@@ -1005,6 +1005,40 @@ impl PlayerState {
                     ch.mem_sample_offset = used;
                     offset_frames = (used as u32) * 0x100;
                 }
+
+                // 9xx out-of-range quirk: if the offset lands at or past
+                // the end of the sample body, ProTracker plays NO NOTE at
+                // all on this channel (Protracker-effects-MODFIL12.txt
+                // 9:Set-sample-offset, lines 1240-1242: "Note that if the
+                // effect is out of range (e.g. if it tries to jump beyond
+                // the end of the sample) NO NOTE WILL BE PLAYED!"). We
+                // detect this at trigger time and silence the channel
+                // instead of letting the mixer wrap a looped sample's
+                // over-range cursor back into the loop region (which would
+                // audibly play the loop from a fresh trigger — exactly the
+                // artefact the spec says should not happen). The check
+                // applies only when a 9xx offset was actually requested;
+                // a plain note with no 9xx keeps the original semantics.
+                if effect == 0x9 {
+                    let sample_len = (ch.sample_index as usize)
+                        .checked_sub(1)
+                        .and_then(|i| self.samples.get(i))
+                        .map(|b| b.pcm.len())
+                        .unwrap_or(0);
+                    if offset_frames as usize >= sample_len {
+                        // No note: leave the channel inactive and skip the
+                        // rest of the trigger (position / ramp / LFO
+                        // retrigger). arp_base_period still anchors to the
+                        // intended note period so a following effect-0 row
+                        // has a sane base, matching the "note info is still
+                        // updated, just not played" reading.
+                        ch.active = false;
+                        ch.sample_pos = 0.0;
+                        ch.arp_base_period = note_period;
+                        continue;
+                    }
+                }
+
                 ch.sample_pos = offset_frames as f32;
                 ch.active = true;
                 ch.arp_base_period = note_period;
@@ -2347,6 +2381,118 @@ pub mod tests {
         assert!(
             player.channels[0].sample_pos >= 256.0,
             "expected sample_pos >= 256, got {}",
+            player.channels[0].sample_pos
+        );
+    }
+
+    #[test]
+    fn sample_offset_out_of_range_plays_no_note() {
+        // ProTracker quirk (Protracker-effects-MODFIL12.txt 9:Set-sample-
+        // offset, lines 1240-1242): if a 9xx offset lands at or past the
+        // end of the sample, NO NOTE is played at all. The synth helper
+        // builds a 32-frame sample; 901 → offset 0x100 = 256 frames, far
+        // beyond the end, so the channel must stay inactive and emit
+        // silence rather than wrapping a looped sample back into its loop.
+        let bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0x9,
+                effect_param: 0x01,
+            },
+        )]);
+        let mut player = make_player(&bytes);
+        // The 9xx memory is still latched even though no note plays
+        // (the note info is updated; only playback is suppressed).
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].mem_sample_offset, 0x01,
+            "9xx memory should still latch even when the offset is OOR"
+        );
+        assert!(
+            !player.channels[0].active,
+            "out-of-range 9xx must leave the channel inactive (no note)"
+        );
+        assert_eq!(
+            player.channels[0].sample_pos, 0.0,
+            "out-of-range 9xx must not advance the sample cursor"
+        );
+
+        // Render a chunk and confirm the channel produced silence (no
+        // wrapped-loop artefact). A fresh player so we re-enter row 0.
+        let mut player = make_player(&bytes);
+        let mut buf = vec![0i16; 2048 * 2];
+        player.render(&mut buf);
+        assert!(
+            buf.iter().all(|&s| s == 0),
+            "out-of-range 9xx must render silence, found non-zero PCM"
+        );
+    }
+
+    #[test]
+    fn sample_offset_at_exact_end_plays_no_note() {
+        // Boundary: an offset landing EXACTLY at the sample length is
+        // still "at or past the end" per the spec wording, so it must
+        // also suppress the note. Build a 256-frame sample and request
+        // 901 (offset = 256 = the length).
+        let mut bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0x9,
+                effect_param: 0x01,
+            },
+        )]);
+        // Sample length 128 words = 256 frames; disable loop so the body
+        // is a plain one-shot.
+        bytes[20 + 22..20 + 24].copy_from_slice(&128u16.to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&0u16.to_be_bytes());
+        // Append the extra body bytes (synth helper writes 32; need 256).
+        bytes.extend(std::iter::repeat_n(0u8, 256 - 32));
+
+        let mut player = make_player(&bytes);
+        step_one_tick(&mut player);
+        assert!(
+            !player.channels[0].active,
+            "9xx offset == sample length must suppress the note (>= end)"
+        );
+    }
+
+    #[test]
+    fn sample_offset_just_inside_end_plays() {
+        // Contrast: an offset comfortably inside the sample DOES play.
+        // Build a 512-frame one-shot so 901 (offset 256) seeks to the
+        // middle and the note survives a full tick of playback. This
+        // pins the boundary direction of the OOR check (only >= end
+        // suppresses; in-range still triggers).
+        let mut bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0x9,
+                effect_param: 0x01,
+            },
+        )]);
+        // Sample length 256 words = 512 frames; disable loop.
+        bytes[20 + 22..20 + 24].copy_from_slice(&256u16.to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&0u16.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(7u8, 512 - 32));
+
+        let mut player = make_player(&bytes);
+        step_one_tick(&mut player);
+        assert!(
+            player.channels[0].active,
+            "9xx offset inside the sample must still play the note"
+        );
+        assert!(
+            player.channels[0].sample_pos >= 256.0,
+            "in-range 9xx should seek to >= 256, got {}",
             player.channels[0].sample_pos
         );
     }

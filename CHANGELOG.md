@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MOD **9xx out-of-range quirk** — a `9xx` sample-offset that lands at
+  or past the end of the sample now plays **no note at all** on that
+  channel, matching the ProTracker replayer behaviour documented in
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+  9:Set-sample-offset (lines 1240-1242: "Note that if the effect is out
+  of range (e.g. if it tries to jump beyond the end of the sample) NO
+  NOTE WILL BE PLAYED!"). Previously the player set `sample_pos` to the
+  over-range offset unconditionally, which silenced a one-shot sample on
+  the first mix call but let a **looped** sample's over-range cursor wrap
+  back into the loop region — audibly retriggering the loop from a fresh
+  note, exactly the artefact the spec says must not happen. The check
+  runs at note-trigger time in `enter_row`: when a `9xx` is present and
+  `offset >= sample.pcm.len()`, the channel is left inactive
+  (`active = false`, `sample_pos = 0`) and the sample cursor / per-trigger
+  ramp / LFO retrigger are skipped. The `9xx` parameter memory is still
+  latched (the note info is updated; only playback is suppressed). Three
+  unit tests pin the contract: a far-out-of-range offset renders silence
+  (no wrapped-loop artefact), an offset landing exactly at the sample
+  length is suppressed (`>= end`), and an offset comfortably inside the
+  sample still triggers.
 - STM **7xy tremolo** — the Scream Tracker v1 (`.stm`) player now
   honours effect 7 with a sine LFO on the output volume, parallel
   to the existing 4xy vibrato pipeline. New `trem_pos` / `trem_speed`
