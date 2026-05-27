@@ -581,10 +581,18 @@ pub fn parse_patterns(header: &XmHeader, bytes: &[u8]) -> Result<(Vec<XmPattern>
                 rows.push(vec![XmCell::default(); num_channels]);
             }
         } else {
+            // Clamp BOTH ends against `bytes.len()` — a hostile
+            // `header_length` can push `data_start` past EOF, and the
+            // bare `&bytes[data_start..data_end]` slice index would
+            // panic with "slice index out of bounds" before the
+            // `min(bytes.len())` on `data_end` had a chance to
+            // matter. Caught by `oxideav-mod-fuzz/xm_decode`
+            // (crash-212b2111).
+            let start = data_start.min(bytes.len());
             let data_end = data_start
                 .saturating_add(packed_size as usize)
                 .min(bytes.len());
-            let slice = &bytes[data_start..data_end];
+            let slice = &bytes[start..data_end];
             let mut inner = 0usize;
             for _ in 0..num_rows {
                 let mut row = Vec::with_capacity(num_channels);
@@ -1122,6 +1130,41 @@ mod tests {
         }
         // No packed data → end = header_end + pattern_header_size (9).
         assert_eq!(end, pattern_data_offset(&h) + 9);
+    }
+
+    #[test]
+    fn parse_patterns_hostile_header_length_does_not_panic() {
+        // Regression for fuzz find `xm_decode/crash-212b2111…`: a
+        // hostile pattern `header_length` that pushes `data_start`
+        // past EOF must clamp the packed-data slice rather than
+        // index `&bytes[oob..…]` directly and panic with "slice
+        // index out of bounds".
+        //
+        // We construct a 1-pattern XM whose pattern header declares
+        // `header_length = 0xFFFF` (well past the end of our test
+        // file) and `packed_size = 1` (non-zero so the parser takes
+        // the packed-slice branch instead of the
+        // `packed_size == 0` synth path).
+        let mut bytes = build_header(1, 1, 0, false);
+        // Pattern header: header_length=0xFFFF, packing=0, rows=1,
+        // packed_size=1.
+        let mut block = Vec::new();
+        block.extend_from_slice(&0xFFFFu32.to_le_bytes()); // header_length
+        block.push(0); // packing type
+        block.extend_from_slice(&1u16.to_le_bytes()); // num_rows
+        block.extend_from_slice(&1u16.to_le_bytes()); // packed_size
+                                                      // No packed body bytes — the slice should be empty after
+                                                      // clamping. `decode_packed_cell` against an empty slice
+                                                      // returns the default cell with consumed == 0.
+        bytes.extend(block);
+
+        let h = parse_header(&bytes).unwrap();
+        let (pats, _end) = parse_patterns(&h, &bytes)
+            .expect("hostile header_length must clamp rather than panic on the slice index");
+        assert_eq!(pats.len(), 1);
+        assert_eq!(pats[0].rows.len(), 1);
+        assert_eq!(pats[0].rows[0].len(), 1);
+        assert_eq!(pats[0].rows[0][0], XmCell::default());
     }
 
     #[test]

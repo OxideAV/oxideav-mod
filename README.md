@@ -263,6 +263,28 @@ tremolo will be used") and `multimedia-cx-protracker.html` 7xy ("Like
 vibrato, except we modify the output volume … clamped to 0 <= vol <=
 64").
 
+## Fuzz harness
+
+A `cargo-fuzz` harness under `fuzz/` drives the three parser
+pipelines (MOD / STM / XM) against arbitrary attacker-controlled
+bytes and asserts the call always returns rather than panicking /
+aborting / OOMing.
+
+| Target | Driven pipeline |
+| ------ | --------------- |
+| `mod_decode` | `header::parse_header` → `player::parse_patterns` → `samples::extract_samples` → `player::PlayerState::new` → 2048-frame `render` |
+| `stm_decode` | `stm::parse_header` → `stm::parse_patterns` → `stm::extract_samples` → `stm_player::StmPlayerState::new` → 2048-frame `render` |
+| `xm_decode`  | `xm::parse_header` → `xm::parse_patterns` → `xm::parse_instruments` → `xm::extract_sample_bodies` → `xm_player::XmPlayerState::new` → 2048-frame `render` |
+
+Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`.
+Each target has a minimal valid-header seed under
+`fuzz/corpus/<target>/minimal.{mod,stm,xm}` so libfuzzer's coverage
+hill-climb starts from a parser-accepting input. The bootstrap
+session of round 171 caught one `xm::parse_patterns` slice-index
+panic (a hostile `header_length` pushing the packed-data slice's
+start past EOF) which is now fixed and pinned by a regression test
+in `src/xm.rs`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

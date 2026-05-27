@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cargo-fuzz` harness** under `fuzz/` driving the three parser
+  pipelines (MOD / STM / XM) against arbitrary attacker-controlled
+  bytes. Three targets: `mod_decode` runs `header::parse_header` →
+  `player::parse_patterns` → `samples::extract_samples` →
+  `player::PlayerState::new` → 2048-frame `render`; `stm_decode`
+  runs the equivalent STM pipeline through `stm_player::
+  StmPlayerState::render`; `xm_decode` runs the equivalent XM
+  pipeline including `xm::parse_instruments` and
+  `xm::extract_sample_bodies` through `xm_player::
+  XmPlayerState::render`. Each target ships a minimal valid-header
+  seed (`fuzz/corpus/<target>/minimal.{mod,stm,xm}`) so libfuzzer's
+  coverage hill-climb starts from a parser-accepting input rather
+  than coin-flipping for the signature byte. Per the
+  workspace clean-room rule the harness asserts "the call returns"
+  rather than cross-decoding against an external oracle. Bootstrap
+  session caught one XM bug, fixed below.
+
+### Fixed
+
+- XM **`parse_patterns` slice-index panic on hostile `header_length`**
+  — a pattern whose declared `header_length` pushed `data_start`
+  past EOF would slice `&bytes[data_start..data_end]` and panic
+  with "slice index 0xFFFF out of bounds" rather than clamping. The
+  prior `.min(bytes.len())` on `data_end` only protected the upper
+  bound; the lower bound is now also clamped against `bytes.len()`,
+  so a hostile header_length collapses to an empty packed-data
+  slice and `decode_packed_cell` returns the default cell with
+  zero consumed bytes. Caught by `oxideav-mod-fuzz/xm_decode`
+  (crash `212b2111`) in the harness bootstrap session above; pinned
+  by a new unit test (`parse_patterns_hostile_header_length_does_
+  not_panic` in `src/xm.rs`) that constructs a 1-pattern XM whose
+  pattern header declares `header_length = 0xFFFF` and asserts the
+  parser returns `Ok` with a single default-cell row rather than
+  panicking.
+
 - MOD **9xx out-of-range quirk** — a `9xx` sample-offset that lands at
   or past the end of the sample now plays **no note at all** on that
   channel, matching the ProTracker replayer behaviour documented in

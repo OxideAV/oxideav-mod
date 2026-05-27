@@ -1,0 +1,145 @@
+[package]
+name = "oxideav-mod-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The .mod / .stm / .xm parsers all consume unbounded attacker-controlled
+# input — exactly the shape libFuzzer chews through best. The danger
+# spots are well-charted by the trackers' format specs in
+# `docs/audio/trackers/{mod,stm,xm}/`:
+#
+#  * `mod_decode` — feed arbitrary bytes to the full MOD parsing
+#                   pipeline (`header::parse_header` →
+#                   `samples::extract_samples` →
+#                   `player::parse_patterns` →
+#                   `player::PlayerState::new` → a short
+#                   `PlayerState::render` burst) and assert it always
+#                   returns rather than panicking / aborting / OOMing.
+#                   Classic MOD danger spots driven here:
+#
+#                     - Per-sample header byte 24 (low-nibble signed
+#                       finetune) and byte 25 (volume clamp to 64) —
+#                       the parser must not let an attacker-controlled
+#                       finetune produce an out-of-range
+#                       `PERIOD_TABLE` index downstream.
+#                     - Sample length words (BE u16 at off+22),
+#                       repeat-start (off+26), repeat-length (off+28):
+#                       each is doubled to bytes, so the multiplied
+#                       value is up to 131068; the sample extractor
+#                       must clamp against the file body before
+#                       allocating.
+#                     - Pattern-order table byte at offset 952 +
+#                       song-length byte at 950: `n_patterns` is
+#                       `1 + max(order[0..song_length])`, which lets a
+#                       single attacker byte ask the parser to walk
+#                       `256 * 64 * 32 * 4 = 2 MiB` of pattern data —
+#                       the pattern extractor must tolerate the body
+#                       being short and produce zero-filled notes
+#                       instead of indexing past the slice.
+#                     - 4-byte signature at offset 1080 — `xxCH` parse
+#                       must reject channel counts outside `10..=32`
+#                       cleanly, and the standard `M.K.` / `4CHN` /
+#                       `6CHN` / `8CHN` / `FLT4` / `FLT8` / `OCTA` /
+#                       `CD81` aliases must each route to a sane
+#                       channel count.
+#                     - Loop metadata clamp — a `repeat_start` past
+#                       `pcm.len()` or a `repeat_length` longer than
+#                       `pcm.len() - repeat_start` must collapse to
+#                       no-loop rather than letting the mixer read
+#                       past the buffer.
+#                     - `9xx` sample-offset out-of-range — a hostile
+#                       pattern that issues a `9FF` against an
+#                       attacker-controlled sample length must take
+#                       the "no note played" path rather than wrapping
+#                       a looped sample's cursor back into the loop
+#                       region.
+#                     - `Fxx` speed/BPM split — a hostile `F00` (==
+#                       stop song) must terminate the render rather
+#                       than spinning a zero-tick mixer.
+#                     - `Bxx` position jump — must clamp the order
+#                       index against `song_length` instead of
+#                       wandering into uninitialised slots.
+#                     - LED filter `E00` / `E01` — toggling the
+#                       1-pole IIR mid-render must not produce
+#                       non-finite samples.
+#
+#  * `stm_decode` — feed arbitrary bytes to the STM (Scream Tracker v1)
+#                   parsing pipeline (`stm::is_stm` →
+#                   `stm::parse_header` →
+#                   `stm::extract_samples` →
+#                   `stm::parse_patterns` →
+#                   `stm_player::StmPlayerState::new` → a short render
+#                   burst) and assert it always returns. STM has a
+#                   fixed 4-channel layout, 31-instrument table, and a
+#                   "P" signature byte at offset 20 — but the order
+#                   table, sample headers, and pattern data still come
+#                   from attacker input. The fuzz target must drive
+#                   the same fragile paths as MOD: instrument C3 Hz
+#                   driving pitch (zero must not divide-by-zero), the
+#                   per-channel `[0, 64]` volume clamp, and the
+#                   "0xy arpeggio" / "4xy vibrato" / "7xy tremolo"
+#                   per-tick LFO arithmetic.
+#
+#  * `xm_decode` — feed arbitrary bytes to the XM (FastTracker 2
+#                  Extended Module) parsing pipeline
+#                  (`xm::is_xm` → `xm::parse_header` →
+#                  `xm::parse_patterns` → `xm::parse_instruments` →
+#                  `xm::extract_sample_bodies` →
+#                  `xm_player::XmPlayerState::new` → a short render
+#                  burst) and assert it always returns. XM has the
+#                  most attacker-flexible header in the crate: 256-
+#                  entry order table, variable-length bit-packed
+#                  pattern rows (per-cell mask byte gates note / inst
+#                  / volume-col / effect / param), per-instrument
+#                  envelope tables (volume + panning, up to 12 nodes
+#                  each), and delta-encoded 8/16-bit sample bodies.
+#                  Each of those is a separate over-allocation /
+#                  index-past-slice trap to verify is clamped.
+#
+# No external library worth dlopen-ing as a cross-decode oracle: the
+# clean-room wall bars libmodplug / libopenmpt / xmp / milkytracker /
+# mikmod source-reading; the existing `tests/libmodplug_compare.rs`
+# uses libmodplug as a black-box dlopen oracle for *render*
+# similarity, not parse-fault correlation. The contract under fuzz
+# is "the call returns", not "the call returns the same thing as
+# library X".
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-mod]
+path = ".."
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+[[bin]]
+name = "mod_decode"
+path = "fuzz_targets/mod_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "stm_decode"
+path = "fuzz_targets/stm_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xm_decode"
+path = "fuzz_targets/xm_decode.rs"
+test = false
+doc = false
