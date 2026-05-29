@@ -519,9 +519,11 @@ impl XmPlayerState {
                     }
                 }
                 XmVolume::PanningSlideLeft(_) | XmVolume::PanningSlideRight(_) => {
-                    // Handled per-tick below in apply_tickn_effect (via
-                    // the effect-type field we don't have for vol-col).
-                    // We tolerate it as a no-op for now.
+                    // Per the FT2 v2.04 spec, all volume-column effects
+                    // work as the standard effects. Panning slides are
+                    // per-tick (rows >= 1); the tick-0 enter_row path
+                    // does no initial slide. The per-tick step happens
+                    // in `apply_tickn_effect`'s `vol_col` match arm.
                 }
                 XmVolume::TonePorta(p) => {
                     // Each value is multiplied by 16 to match 3xy scale
@@ -2034,5 +2036,63 @@ mod tests {
         };
         apply_tick0_effect(&mut ch);
         assert_eq!(ch.trem_waveform & 0x03, 2, "shape bits = square");
+    }
+
+    // ---------------- Volume-column panning slide (vol-col $d0-$ef) ----------------
+
+    #[test]
+    fn vol_col_panning_slide_left_decrements_per_tick() {
+        // Per FT2-v2.04 §"Effects in volume column", $d0-$df is Panning
+        // slide left and "should work as the standard effect" — meaning
+        // each non-tick-0 tick subtracts the nibble from base_panning.
+        let mut ch = XmChannel {
+            base_panning: 128,
+            ..Default::default()
+        };
+        // Vol-col $d5 = PanningSlideLeft(5).
+        apply_tickn_effect(&mut ch, XmVolume::PanningSlideLeft(5), XmPitchTable::Linear);
+        assert_eq!(ch.base_panning, 123);
+        // Repeated ticks keep sliding.
+        apply_tickn_effect(&mut ch, XmVolume::PanningSlideLeft(5), XmPitchTable::Linear);
+        assert_eq!(ch.base_panning, 118);
+    }
+
+    #[test]
+    fn vol_col_panning_slide_right_increments_per_tick() {
+        // $e0-$ef is Panning slide right — adds the nibble per non-tick-0 tick.
+        let mut ch = XmChannel {
+            base_panning: 128,
+            ..Default::default()
+        };
+        apply_tickn_effect(
+            &mut ch,
+            XmVolume::PanningSlideRight(4),
+            XmPitchTable::Linear,
+        );
+        assert_eq!(ch.base_panning, 132);
+        // Saturates at 255.
+        ch.base_panning = 254;
+        apply_tickn_effect(
+            &mut ch,
+            XmVolume::PanningSlideRight(4),
+            XmPitchTable::Linear,
+        );
+        assert_eq!(
+            ch.base_panning, 255,
+            "panning slide right should saturate at 255"
+        );
+    }
+
+    #[test]
+    fn vol_col_panning_slide_left_saturates_at_zero() {
+        let mut ch = XmChannel {
+            base_panning: 3,
+            ..Default::default()
+        };
+        apply_tickn_effect(&mut ch, XmVolume::PanningSlideLeft(8), XmPitchTable::Linear);
+        assert_eq!(
+            ch.base_panning, 0,
+            "panning slide left should saturate at 0"
+        );
     }
 }

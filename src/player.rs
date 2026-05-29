@@ -622,17 +622,18 @@ pub struct PlayerState {
     /// full mono (all channels in both speakers, like the legacy
     /// behaviour of `coreaudio` mono out). Defaults to `0.5` (see
     /// [`Self::DEFAULT_PAN_SEPARATION`]) — empirically the value
-    /// that minimises cross-correlation drift versus `openmpt123
-    /// --render` on real-world MODs (`halluc.mod`, `rhmst.mod`).
-    /// `MODFIL12.txt` §11 itself recommends NOT pushing balance
-    /// "all the way over to the left or to the right" ("Especially
-    /// when using headphones"); a real-world MOD whose intro uses
-    /// only the right-panned channels (1 + 2) — common in
-    /// compositions like "hallucinations" — would otherwise produce
-    /// a dead left ear for the entire intro, which sounds broken
-    /// to listeners even though it is technically per-spec. Adjust
-    /// via [`PlayerState::set_pan_separation`] if a strict
-    /// hard-pan render (1.0) is required.
+    /// that minimises cross-correlation drift versus a black-box
+    /// reference render on real-world MODs (`halluc.mod`,
+    /// `rhmst.mod`). `MODFIL12.txt` §11 itself recommends NOT
+    /// pushing balance "all the way over to the left or to the
+    /// right" ("Especially when using headphones"); a real-world
+    /// MOD whose intro uses only the right-panned channels (1 + 2)
+    /// — common in compositions like "hallucinations" — would
+    /// otherwise produce a dead left ear for the entire intro,
+    /// which sounds broken to listeners even though it is
+    /// technically per-spec. Adjust via
+    /// [`PlayerState::set_pan_separation`] if a strict hard-pan
+    /// render (1.0) is required.
     pan_separation: f32,
 }
 
@@ -704,13 +705,12 @@ impl PlayerState {
     /// `Protracker-effects-MODFIL12.txt` §11 hard pan recommendation
     /// (which itself warns against full hard pan "especially when
     /// using headphones") and full mono. Empirically this is the
-    /// value that minimises cross-correlation drift versus
-    /// `openmpt123 --render` on real-world MODs (`halluc.mod`,
-    /// `rhmst.mod`) — modern players ship with a similar
-    /// "partial-bleed" default. An r14 trial used 0.7 but on
-    /// these specific fixtures 0.5 yielded ~3 % better xcorr per
-    /// 1 s window across the entire song. Override with
-    /// [`PlayerState::set_pan_separation`].
+    /// value that minimises cross-correlation drift versus a
+    /// black-box reference render on real-world MODs (`halluc.mod`,
+    /// `rhmst.mod`) — a partial-bleed default is common practice.
+    /// An r14 trial used 0.7 but on these specific fixtures 0.5
+    /// yielded ~3 % better xcorr per 1 s window across the entire
+    /// song. Override with [`PlayerState::set_pan_separation`].
     pub const DEFAULT_PAN_SEPARATION: f32 = 0.5;
 
     /// Override the stereo pan separation. `1.0` = full Amiga hard
@@ -734,13 +734,12 @@ impl PlayerState {
     /// step of magnitude `(prev_mixed - new_mixed)` into the post-mix
     /// L/R bus. On real-world MODs (`halluc.mod`, `rhmst.mod`) those
     /// steps were measured at ~5775 LSB and were the dominant
-    /// contributor to per-second cross-correlation drift versus an
-    /// openmpt123 reference render. A 1 ms linear crossfade matches
-    /// the "ramping=2" default in libopenmpt and corresponds to the
-    /// `Protracker-effects-MODFIL12.txt` §1.6 note about Paula
-    /// taking ~140 µs to settle on a fresh DMA fetch (we round up
-    /// to one full output millisecond so the ramp is robust at any
-    /// reasonable output sample rate).
+    /// contributor to per-second cross-correlation drift versus a
+    /// black-box reference render. A 1 ms linear crossfade
+    /// corresponds to the `Protracker-effects-MODFIL12.txt` §1.6
+    /// note about Paula taking ~140 µs to settle on a fresh DMA
+    /// fetch (we round up to one full output millisecond so the
+    /// ramp is robust at any reasonable output sample rate).
     pub const RAMP_FRAMES: u32 = 44;
 
     /// Cutoff of the always-on first RC stage that sits between
@@ -748,16 +747,16 @@ impl PlayerState {
     ///
     /// Real-hardware schematic R/C values yield 1/(2πRC) ≈ 4400 Hz
     /// (rounded to **5000 Hz** in r14 of this module to model an
-    /// "authentic" Amiga sound). However, modern playroutines
-    /// (xmp, openmpt) effectively bypass this stage in their
-    /// default render path — they only model the LED-gated stage —
-    /// because the real-hardware corner lops off audible content
-    /// that listeners expect to hear back from a MOD render. With
-    /// the strict 5 kHz value we measured cross-correlation drift
-    /// against `openmpt123 --render` on `rhmst.mod` of about 5 %
-    /// (~0.94 vs ~0.99) — i.e. the always-on filter was the
-    /// dominant contributor to per-second drift versus the modern
-    /// reference.
+    /// "authentic" Amiga sound). However, the prevailing modern
+    /// rendering convention effectively bypasses this stage in
+    /// the default render path — only the LED-gated stage is
+    /// modelled — because the real-hardware corner lops off audible
+    /// content that listeners expect to hear back from a MOD
+    /// render. With the strict 5 kHz value we measured
+    /// cross-correlation drift against a black-box reference render
+    /// on `rhmst.mod` of about 5 % (~0.94 vs ~0.99) — i.e. the
+    /// always-on filter was the dominant contributor to per-second
+    /// drift versus the modern reference.
     ///
     /// We default to **16000 Hz** to make the always-on stage
     /// audibly transparent (it still rolls off ultrasonic content
@@ -765,7 +764,8 @@ impl PlayerState {
     /// it serves at modern output rates).
     ///
     /// Documentation references: `paula-filter-notes.md`,
-    /// `openmpt-module-formats.html` (Resampling).
+    /// `docs/audio/trackers/mod/openmpt-module-formats.html`
+    /// (Resampling).
     pub const FIXED_RC_CUTOFF_HZ: f32 = 16_000.0;
 
     /// Cutoff of the LED-controlled second RC stage (the one
@@ -776,10 +776,10 @@ impl PlayerState {
     /// "spec-strict" value previously used here. However,
     /// `multimedia-cx-protracker.html` documents an
     /// **11500 Hz 1-pole approximation** that the modern PT
-    /// rendering chains (xmp, openmpt's default) converge on, and
-    /// every cross-correlation measurement against an
-    /// `openmpt123 --render` reference confirms 11500 Hz is much
-    /// closer to the modern-player ground truth than 3300 Hz is.
+    /// rendering convention converges on, and every
+    /// cross-correlation measurement against a black-box reference
+    /// render confirms 11500 Hz is much closer to the modern-player
+    /// ground truth than 3300 Hz is.
     /// The Sallen-Key value lops off so much HF content that
     /// real-world MOD files render audibly muffled compared to
     /// what their authors were probably listening to in their
@@ -1251,10 +1251,10 @@ impl PlayerState {
     /// full mono. The default `0.5` (see `pan_separation` field)
     /// keeps an intro that uses only right-panned channels (1 + 2,
     /// per the convention in `Protracker-effects-MODFIL12.txt` §11)
-    /// audible on the left speaker too — every modern PT player
-    /// (xmp, openmpt, libxmp's stock build) does the same partial
-    /// bleed for the same headphone-fatigue reason called out in
-    /// MODFIL12.txt itself ("Especially when using headphones").
+    /// audible on the left speaker too — the modern PT rendering
+    /// convention applies the same partial bleed for the
+    /// headphone-fatigue reason called out in MODFIL12.txt itself
+    /// ("Especially when using headphones").
     /// Without it, real-world MODs whose intros use only
     /// right-panned voices (e.g. "hallucinations" by ???) sound
     /// broken to a listener whose left ear receives no signal at

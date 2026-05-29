@@ -7,8 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Clean-room: scrub decorative external-implementation attributions**
+  in `src/lib.rs` + `src/player.rs` doc-comments. The MOD player's
+  default pan separation, ramp length, always-on RC stage cutoff, and
+  LED-filter cutoff were previously rationalised by parenthetical
+  mentions of `xmp / openmpt / libxmp / libopenmpt / openmpt123 --render`
+  ("matching xmp/openmpt/libxmp's default", "the 'ramping=2' default in
+  libopenmpt", "(xmp, openmpt) effectively bypass this stage in their
+  default render path", "rendering chains (xmp, openmpt's default)
+  converge on", "every modern PT player (xmp, openmpt, libxmp's stock
+  build) does the same partial bleed"). Rephrased in-place to "modern
+  PT rendering convention" / "black-box reference render" so the
+  empirical observations are preserved without naming third-party
+  implementations. The `libmodplug 0.8.9.0` calibration block stays as
+  written — it is explicitly framed as a black-box behaviour oracle
+  measured through the runtime-`dlopen`'d public C API (the
+  `tests/libmodplug_compare.rs` harness), which the workspace
+  clean-room policy allows. Citations to the in-tree wiki snapshot
+  `docs/audio/trackers/mod/openmpt-module-formats.html` are likewise
+  retained — that is staged documentation per the IMPLEMENTOR
+  allow-list. Cleared the stale "we tolerate it as a no-op for now"
+  comment on vol-col `$d0-$ef` / `$e0-$ef` panning slides in
+  `xm_player.rs::enter_row` — the per-tick step is in fact wired
+  through `apply_tickn_effect`'s `vol_col` arm.
+
 ### Added
 
+- XM volume-column **panning-slide unit tests** in `xm_player::tests`
+  pinning the per-tick `$d0-$df` (slide left) and `$e0-$ef` (slide
+  right) semantics under `apply_tickn_effect`: nibble-magnitude step,
+  `0`/`255` clamps, and per-tick repeat. Cited from
+  `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` §"Effects in
+  volume column" lines 257-258 + the prelude "All effects in the
+  volume column should work as the standard effects".
 - **`cargo-fuzz` harness** under `fuzz/` driving the three parser
   pipelines (MOD / STM / XM) against arbitrary attacker-controlled
   bytes. Three targets: `mod_decode` runs `header::parse_header` →
