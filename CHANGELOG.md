@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-mod/compare/v0.0.7...v0.0.8) - 2026-05-29
+
+### Other
+
+- scrub decorative third-party-implementation attributions
+- cargo-fuzz harness for MOD / STM / XM parsers; fix xm slice-index panic
+- MOD 9xx out-of-range plays no note (PT replayer quirk)
+- STM 7xy tremolo — sine LFO on output volume (PT contract)
+- implement 0xy arpeggio in the .stm playback engine
+- honour E4x/E7x vibrato + tremolo waveform shapes
+- implement E3x glissando + Lxy set-envelope-position
+- 8xx + E8x: per-channel pan (FastTracker extensions)
+
 ### Changed
 
 - **Clean-room: scrub decorative external-implementation attributions**
