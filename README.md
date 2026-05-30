@@ -210,11 +210,19 @@ plus the eleven volume-column kinds. Recent rounds closed the surviving
   `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 226 and
   `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.20.
 
-The instrument-level autovibrato (`vibrato_type` byte) still runs a fixed
-sine LFO — its waveform-value mapping (FT2's 0 sine / 1 square / 2 ramp
-down / 3 ramp up ordering, distinct from E4x's) is not documented in the
-staged `docs/`, so it is left for a future round once the spec gap is
-filled.
+The instrument-level autovibrato (`vibrato_type` byte) now honours the
+type byte's waveform shape and the +4 "don't retrigger" flag, sharing
+the same `waveform_lfo` helper as the E4x / E7x effects: `0 = Sine`,
+`1 = Ramp down`, `2 = Square` (value 3 is undefined in FT2 and falls
+back to the deterministic sine, per `xm-instrument-autovibrato.md`'s
+"FT2 documents only three waveforms" finding). With bit 2 set, the LFO
+phase persists across note triggers; the sweep-in counter still
+restarts on every trigger because the sweep is a separate ramp-in
+envelope rather than a phase register. Numeric mapping + the +4 flag
+sourced from the in-tree clean-room note
+[`docs/audio/trackers/xm/xm-instrument-autovibrato.md`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/xm/xm-instrument-autovibrato.md)
+(which cites `FastTracker-2.08-manual.doc` §3.15.4 / §4.2.1 / §4.2.6
+and the `FastTracker-2-v2.04-xm.txt` field table at +235..+238).
 
 ## Scream Tracker v1 (.stm) playback coverage
 

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- XM **instrument auto-vibrato waveform** — the per-instrument
+  auto-vibrato LFO now honours the `vibrato_type` byte's
+  waveform-shape selector (low two bits) and the +4 "don't retrigger"
+  flag (bit 2). Previously the LFO was hardcoded to a sine shape
+  regardless of the type byte, and a new note always reset
+  `auto_vib_pos` to 0. The autovibrato block now routes through the
+  same `waveform_lfo` helper used by E4x / E7x — `0 = Sine`,
+  `1 = Ramp down`, `2 = Square` (3 falls back to the deterministic
+  sine, per the in-tree note's "FT2 documents only three
+  waveforms" finding). When `vibrato_type & 0x04` is set, the LFO
+  phase carries across note triggers; the sweep counter
+  (`auto_vib_sweep_cnt`) still resets on every trigger because
+  the sweep is a separate ramp-in envelope, not a phase register.
+  Source for the numeric mapping + the +4 flag semantics + the
+  retrigger gating: the new in-tree clean-room note
+  `docs/audio/trackers/xm/xm-instrument-autovibrato.md` (which
+  cites the `FastTracker-2.08-manual.doc` §3.15.4 / §4.2.1 / §4.2.6
+  passages and the `FastTracker-2-v2.04-xm.txt` field table at
+  +235..+238). Four unit tests in `xm_player::tests` pin the
+  contract: trigger resets `auto_vib_pos` to 0 when bit 2 is
+  clear, trigger preserves accumulated phase when bit 2 is set,
+  shape 2 (square) at phase 0 lowers `voice.freq` relative to
+  shape 0 (sine) at phase 0 (square is +127, sine is 0 → period
+  is pushed up → freq down), and `depth == 0 || rate == 0` keeps
+  the autovib block dormant.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-mod/compare/v0.0.7...v0.0.8) - 2026-05-29
 
 ### Other

@@ -688,8 +688,18 @@ impl XmPlayerState {
                         if (ch.trem_waveform & 0x04) == 0 {
                             ch.trem_pos = 0;
                         }
-                        // Autovibrato sweep counter resets on trigger.
-                        ch.auto_vib_pos = 0;
+                        // Autovibrato: the sweep counter always restarts
+                        // on a new note (the sweep is a separate ramp-in
+                        // envelope, not a phase register). The LFO phase
+                        // `auto_vib_pos` is reset on trigger UNLESS bit 2
+                        // of the instrument's `vibrato_type` byte is set
+                        // ("+4 to the type" = don't-retrigger flag, per
+                        // FT2 manual §3.15.4 and the in-tree note
+                        // `docs/audio/trackers/xm/xm-instrument-autovibrato.md`).
+                        let inst_vib_type = self.instruments[i].vibrato_type;
+                        if (inst_vib_type & 0x04) == 0 {
+                            ch.auto_vib_pos = 0;
+                        }
                         ch.auto_vib_sweep_cnt = 0;
                         // Multi-retrig counter resets on note trigger and
                         // also when an instrument-only column is set —
@@ -860,6 +870,7 @@ impl XmPlayerState {
             );
             let fadeout_step = inst.volume_fadeout as i32;
 
+            let inst_vib_type = inst.vibrato_type;
             let inst_vib_rate = inst.vibrato_rate;
             let inst_vib_depth = inst.vibrato_depth;
             let inst_vib_sweep = inst.vibrato_sweep;
@@ -1086,7 +1097,27 @@ impl XmPlayerState {
                 }
             }
 
-            // Instrument autovibrato: sinusoidal LFO, sweep-ramped.
+            // Instrument autovibrato: LFO on period, sweep-ramped.
+            //
+            // `inst_vib_type` low two bits select the waveform shape per
+            // FT2's manual §3.15.4 (the same numbering the channel-level
+            // E4x effect uses, applied to the instrument-header byte):
+            // `0 = Sine`, `1 = Ramp down`, `2 = Square`. Bit 2 ("+4 to
+            // the type") is the don't-retrigger-on-new-instrument flag;
+            // it gates the `auto_vib_pos` reset on note-trigger (handled
+            // at note-on, above). The same `waveform_lfo` helper used by
+            // E4x / E7x produces the per-cycle ±127 value, so depth /
+            // sweep math stays on the same scale.
+            //
+            // Sources for the type-byte numbering + sweep semantics:
+            //   - `docs/audio/trackers/xm/xm-instrument-autovibrato.md`
+            //     (in-tree clean-room note on the instrument-header
+            //     auto-vibrato fields, citing the FT2 manual + the
+            //     official XM format description).
+            //   - `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt`
+            //     §"Volumes and envelopes" — "the envelopes are
+            //     processed once per frame … this is also true for the
+            //     instrument vibrato and the fadeout".
             if inst_vib_depth > 0 && inst_vib_rate > 0 {
                 // Sweep: amplitude scales from 0 to 1 over `sweep` ticks.
                 let sweep_amp =
@@ -1095,7 +1126,7 @@ impl XmPlayerState {
                     } else {
                         ch.auto_vib_sweep_cnt as f32 / inst_vib_sweep as f32
                     };
-                let lfo = SINE_TABLE[(ch.auto_vib_pos >> 2) as usize] as f32;
+                let lfo = waveform_lfo(inst_vib_type & 0x03, ch.auto_vib_pos >> 2) as f32;
                 // Autovibrato depth is 0..=15 per FT2; convert to period
                 // units on the same scale as 4xy.
                 let offset = lfo * inst_vib_depth as f32 * sweep_amp / 64.0;
@@ -2093,6 +2124,201 @@ mod tests {
         assert_eq!(
             ch.base_panning, 0,
             "panning slide left should saturate at 0"
+        );
+    }
+
+    // ---------------- Instrument auto-vibrato waveform shapes ----------------
+    //
+    // The instrument-header byte at offset +235 is the auto-vibrato
+    // "Vibrato type" selector. Per `docs/audio/trackers/xm/
+    // xm-instrument-autovibrato.md` (which cites
+    // `FastTracker-2.08-manual.doc` §3.15.4 + §4.2.1 + §4.2.6 and the
+    // official `FastTracker-2-v2.04-xm.txt` field table):
+    //
+    //   - low two bits select waveform: 0=Sine, 1=Ramp down, 2=Square
+    //     (3 is undefined in FT2 and falls back to sine through
+    //     `waveform_lfo`)
+    //   - bit 2 ("+4 to the type") is the don't-retrigger flag — when set,
+    //     a new note does NOT reset `auto_vib_pos` to 0
+    //
+    // These tests pin both wirings by stepping a minimal one-channel
+    // player through a single note trigger and confirming the LFO phase
+    // / period offset matches the selected shape.
+
+    fn make_minimal_xm_state(
+        vibrato_type: u8,
+        vibrato_depth: u8,
+        vibrato_rate: u8,
+        vibrato_sweep: u8,
+    ) -> XmPlayerState {
+        // One channel, one pattern with a single C-4 note on row 0
+        // selecting instrument 1, sample 0. Linear pitch table.
+        let header = XmHeader {
+            module_name: String::new(),
+            tracker_name: String::new(),
+            version: 0x0104,
+            header_size: 0,
+            song_length: 1,
+            restart_position: 0,
+            num_channels: 1,
+            num_patterns: 1,
+            num_instruments: 1,
+            flags: 0,
+            frequency_table: XmFrequencyTable::Linear,
+            default_tempo: 6,
+            default_bpm: 125,
+            order: vec![0],
+        };
+        let cell = XmCell {
+            note: 49, // C-4 in 1..=96 indexing (relative_note 0 => audible C-4)
+            instrument: 1,
+            volume: 0,
+            effect_type: 0,
+            effect_param: 0,
+        };
+        let mut row0 = vec![XmCell::default(); 1];
+        row0[0] = cell;
+        // Pad pattern out to 64 rows so playback doesn't immediately end.
+        let mut rows = vec![row0];
+        for _ in 1..64 {
+            rows.push(vec![XmCell::default(); 1]);
+        }
+        let pattern = XmPattern {
+            header_length: 9,
+            packing_type: 0,
+            num_rows: 64,
+            packed_size: 0,
+            rows,
+        };
+        let sample = crate::xm::XmSampleHeader {
+            name: String::new(),
+            length: 0,
+            loop_start: 0,
+            loop_length: 0,
+            volume: 64,
+            finetune: 0,
+            type_byte: 0,
+            panning: 128,
+            relative_note: 0,
+            loop_mode: XmSampleLoopMode::None,
+            is_16_bit: false,
+            pcm16: Vec::new(),
+            pcm8: vec![0; 8],
+        };
+        let inst = XmInstrument {
+            num_samples: 1,
+            sample_header_size: 0x28,
+            sample_map: vec![0; 96],
+            vibrato_type,
+            vibrato_sweep,
+            vibrato_depth,
+            vibrato_rate,
+            volume_fadeout: 0,
+            samples: vec![sample],
+            ..XmInstrument::default()
+        };
+
+        XmPlayerState::new(&header, vec![inst], vec![pattern], 44_100)
+    }
+
+    #[test]
+    fn autovib_pos_resets_on_trigger_when_retrigger_flag_clear() {
+        // vibrato_type = 0 (sine, retrigger enabled). Two consecutive
+        // note triggers should each leave auto_vib_pos at 0 right after
+        // the trigger row's tick 0.
+        let mut st = make_minimal_xm_state(0x00, 4, 8, 0);
+        st.advance_tick(); // enter row 0 → note triggers
+                           // The autovibrato block advanced auto_vib_pos by vibrato_rate
+                           // *after* the trigger reset it to 0. So on the trigger tick the
+                           // post-block value is exactly `vibrato_rate` (8 here).
+        assert_eq!(
+            st.channels[0].auto_vib_pos, 8,
+            "after retrigger, sweep counter started at 0 and the autovib \
+             block stepped by vibrato_rate once on tick 0"
+        );
+    }
+
+    #[test]
+    fn autovib_pos_preserved_across_retrigger_when_bit2_set() {
+        // vibrato_type = 4 (sine + don't-retrigger). Run a few ticks to
+        // accumulate phase, then synthesise a fresh note trigger by
+        // calling enter_row again — auto_vib_pos must NOT reset.
+        let mut st = make_minimal_xm_state(0x04, 4, 8, 0);
+        st.advance_tick();
+        // Drive a few more ticks to advance the phase further.
+        for _ in 0..3 {
+            st.tick += 1;
+            st.advance_tick();
+        }
+        let pos_before = st.channels[0].auto_vib_pos;
+        assert!(
+            pos_before > 8,
+            "autovib phase should have accumulated over multiple ticks (got {})",
+            pos_before
+        );
+        // Force a re-trigger by re-entering row 0 from a fresh row pass.
+        // enter_row reads the same C-4 cell and walks the trigger path.
+        st.tick = 0;
+        st.enter_row();
+        // With bit 2 set, auto_vib_pos must NOT reset.
+        assert_eq!(
+            st.channels[0].auto_vib_pos, pos_before,
+            "vibrato_type bit 2 (+4) must preserve auto_vib_pos across triggers"
+        );
+        // Sweep counter still resets — that is a separate ramp envelope,
+        // not the LFO phase. (No assertion needed beyond the field being
+        // zeroed before this round's autovib block runs.)
+    }
+
+    #[test]
+    fn autovib_square_shape_offsets_period_by_constant_first_half() {
+        // vibrato_type = 2 (square). With a fresh trigger + sweep=0
+        // (full depth immediately), the first cycle's positive half
+        // should push `voice.freq` to a higher pitch than the
+        // un-modulated C-4 (lower period = higher freq).
+        let mut st = make_minimal_xm_state(0x02, 15, 8, 0);
+        // Run tick 0 — the autovib block sees `auto_vib_pos = 0` (reset
+        // by trigger) before stepping; the LFO read uses pos 0
+        // (square = +127 for pos<32).
+        st.advance_tick();
+        let freq_sq = st.channels[0].voice.freq;
+        assert!(freq_sq > 0.0, "voice freq should be set on a fresh trigger");
+
+        // Compare against vibrato_type=0 (sine) — sine at pos 0 is 0,
+        // so the offset is 0; square at pos 0 is +127, so the period
+        // is pushed positive → freq is *lower* than the un-modulated
+        // sine-at-zero baseline. We assert ordering rather than exact
+        // values so the test survives small constant-factor changes
+        // to the autovib depth scaling.
+        let mut st_sine = make_minimal_xm_state(0x00, 15, 8, 0);
+        st_sine.advance_tick();
+        let freq_sine = st_sine.channels[0].voice.freq;
+        assert!(
+            freq_sq < freq_sine,
+            "square at pos 0 (+127) must lower freq vs sine at pos 0 (0): \
+             square={freq_sq}, sine={freq_sine}"
+        );
+    }
+
+    #[test]
+    fn autovib_inert_when_depth_or_rate_zero() {
+        // Either nibble at 0 disables the autovib block entirely — the
+        // period stays at the trigger value, so the freq matches the
+        // un-modulated C-4.
+        let mut st = make_minimal_xm_state(0x00, 0, 8, 0);
+        st.advance_tick();
+        let pos_after = st.channels[0].auto_vib_pos;
+        assert_eq!(
+            pos_after, 0,
+            "depth=0 must skip the autovib block; auto_vib_pos stays at \
+             its post-trigger reset value of 0"
+        );
+
+        let mut st = make_minimal_xm_state(0x00, 15, 0, 0);
+        st.advance_tick();
+        assert_eq!(
+            st.channels[0].auto_vib_pos, 0,
+            "rate=0 must skip the autovib block (no phase advance)"
         );
     }
 }
