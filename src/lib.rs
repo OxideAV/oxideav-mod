@@ -29,15 +29,20 @@
 //! - A **container** (`stm`) that recognises Scream Tracker v1 modules
 //!   (pre-S3M, 4-channel-fixed), parses the header + instrument table +
 //!   pattern data + sample bodies, and exposes them for downstream
-//!   consumers. A minimum STM playback engine is wired via the shared
-//!   [`mixer::MixerVoice`] core and [`mixer::StmC3Pitch`] pitch model;
-//!   drive it via [`stm_player::StmPlayerState::render`]. The associated
-//!   codec id [`CODEC_ID_STM_STR`] = `"stm"` is still a parsing-only
-//!   decoder registration (it validates the packet then returns an
-//!   explicit `unsupported`), because effect support and global mixer
-//!   parameters are not yet feature-complete; callers wiring STM into
-//!   the broader oxideav pipeline should hook up
-//!   `StmPlayerState::render` directly for now.
+//!   consumers. The associated codec id [`CODEC_ID_STM_STR`] = `"stm"`
+//!   is a **full playback decoder**: it parses the packet, builds an
+//!   [`stm_player::StmPlayerState`] over the shared [`mixer::MixerVoice`]
+//!   core + [`mixer::StmC3Pitch`] pitch model, and emits interleaved
+//!   `S16` stereo PCM at the same output rate as the MOD decoder.
+//!   Honours every effect that the Scream Tracker v1 spec lists as "in
+//!   ProTracker format" — `0xy` arpeggio, `1xy` / `2xy` portamento up /
+//!   down, `3xy` / `5xy` tone portamento (with volume slide), `4xy` /
+//!   `6xy` vibrato (with volume slide), `7xy` tremolo, `Axy` volume
+//!   slide, `Bxy` position jump, `Cxx` set volume, `Dxy` pattern break,
+//!   `Fxx` speed/tempo split, and the `E1x` / `E2x` / `EAx` / `EBx` /
+//!   `ECx` / `EDx` Exy subcommands. Callers that need structural-only
+//!   access (no PCM) can still reach for [`stm::parse_header`] /
+//!   [`stm::parse_patterns`] / [`stm::extract_samples`] directly.
 //! - A **container** (`xm`) that recognises FastTracker 2 Extended
 //!   Module files by the 17-byte `"Extended Module: "` ASCII banner at
 //!   offset 0. Parses the 336-byte file header (banner, module/tracker

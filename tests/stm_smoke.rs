@@ -5,8 +5,9 @@
 //! - `probe_stm` via the container registry, including the boost for
 //!   the `!Scream!` tracker-name banner.
 //! - `open_stm` → demuxer metadata + single-packet emission.
-//! - The stub STM decoder: parses/validates, then returns an explicit
-//!   `unsupported` error rather than silent zeros.
+//! - The full STM decoder: parses/validates the packet then emits one
+//!   or more interleaved S16 stereo `AudioFrame`s via
+//!   `StmPlayerState::render`.
 //! - `stm::parse_patterns` + `stm::extract_samples` on the packet
 //!   payload emitted by the demuxer, the route callers use today for
 //!   structural STM inspection.
@@ -14,7 +15,7 @@
 use std::io::Cursor;
 
 use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
     container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, stm, CODEC_ID_STM_STR,
@@ -125,10 +126,13 @@ fn open_stm_populates_metadata_and_emits_one_packet() {
 }
 
 #[test]
-fn stm_decoder_rejects_with_unsupported_but_is_constructible() {
-    // The decoder is a stub — it validates the STM header then returns
-    // `unsupported`. That's the contract: parsing infrastructure is
-    // wired, playback isn't. Later work can turn this into real audio.
+fn stm_decoder_emits_pcm_through_codec_pipeline() {
+    // The STM decoder now drives `StmPlayerState::render` through the
+    // codec pipeline, mirroring the MOD decoder shape. We accept the
+    // packet, pull at least one audio frame whose sample buffer has the
+    // expected stereo-interleaved width, and confirm the decoder reports
+    // the audio sample rate that matches `OUTPUT_SAMPLE_RATE` via the
+    // codec's contract.
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STM_STR));
@@ -138,15 +142,31 @@ fn stm_decoder_rejects_with_unsupported_but_is_constructible() {
 
     let bytes = build_minimal_stm();
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
-    match dec.send_packet(&pkt) {
-        Err(Error::Unsupported(msg)) => {
-            assert!(
-                msg.contains("STM"),
-                "error message should mention STM, got: {msg}"
-            );
+    dec.send_packet(&pkt).expect("stm send_packet must succeed");
+
+    // Drain a few frames; the minimal STM file has only one note on row 0,
+    // so we don't require silence to be non-zero — only that the decoder
+    // produces an audio frame of the right shape, then either continues or
+    // terminates with `Eof`.
+    let mut got_frame = false;
+    for _ in 0..4 {
+        match dec.receive_frame() {
+            Ok(Frame::Audio(a)) => {
+                got_frame = true;
+                // One interleaved S16 stereo plane = 4 bytes per sample.
+                assert_eq!(a.data.len(), 1, "stm decoder emits interleaved stereo");
+                assert_eq!(
+                    a.data[0].len(),
+                    a.samples as usize * 4,
+                    "S16 stereo plane must be `samples * 4` bytes"
+                );
+            }
+            Ok(other) => panic!("expected Audio frame, got {other:?}"),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected decode error: {e:?}"),
         }
-        other => panic!("expected Unsupported on send_packet, got {other:?}"),
     }
+    assert!(got_frame, "stm decoder must emit at least one Audio frame");
 }
 
 #[test]

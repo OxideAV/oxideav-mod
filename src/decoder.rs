@@ -24,6 +24,7 @@ use crate::container::OUTPUT_SAMPLE_RATE;
 use crate::header::parse_header;
 use crate::player::{parse_patterns, PlayerState};
 use crate::samples::extract_samples;
+use crate::stm_player::StmPlayerState;
 
 pub fn register(reg: &mut CodecRegistry) {
     let mixed_caps = CodecCapabilities::audio("mod_sw")
@@ -50,9 +51,9 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_planar_decoder),
     );
 
-    // STM — parsing-only decoder. Emits a clear `unsupported` error on
-    // `send_packet`; structural inspection (title, patterns, instruments)
-    // is available through `oxideav_mod::stm::parse_header` etc.
+    // STM — full playback decoder. Drives `StmPlayerState` over the
+    // 4-channel Scream Tracker v1 pattern engine and emits interleaved
+    // S16 stereo at OUTPUT_SAMPLE_RATE, matching the MOD decoder shape.
     let stm_caps = CodecCapabilities::audio("stm_sw")
         .with_lossy(false)
         .with_lossless(true)
@@ -62,7 +63,7 @@ pub fn register(reg: &mut CodecRegistry) {
     reg.register(
         CodecInfo::new(CodecId::new(crate::CODEC_ID_STM_STR))
             .capabilities(stm_caps)
-            .decoder(make_stm_stub_decoder),
+            .decoder(make_stm_decoder),
     );
 
     // XM — parsing-only decoder. Same rationale as STM: playback
@@ -98,9 +99,10 @@ fn make_planar_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-fn make_stm_stub_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(StmStubDecoder {
+fn make_stm_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(StmDecoder {
         codec_id: CodecId::new(crate::CODEC_ID_STM_STR),
+        state: StmDecoderState::AwaitingPacket,
     }))
 }
 
@@ -157,42 +159,86 @@ impl Decoder for XmStubDecoder {
     }
 }
 
-/// Stub STM decoder: exists so the codec id resolves cleanly, but returns
-/// an explicit `unsupported` error on `send_packet` rather than silently
-/// emitting zeros. STM uses C3-frequency-based sample pitching rather
-/// than the Amiga period model the MOD mixer assumes, so driving the
-/// existing `PlayerState` with STM data would produce nonsense — better
-/// to fail loudly until the mixer abstraction is broadened. Callers that
-/// want to inspect STM files structurally should use
-/// [`crate::stm::parse_header`] / [`crate::stm::parse_patterns`] /
-/// [`crate::stm::extract_samples`] directly off the packet payload.
-struct StmStubDecoder {
+/// STM (Scream Tracker v1) decoder. Consumes the whole-file packet from
+/// the STM container, parses the header / patterns / sample bodies, and
+/// drives a [`StmPlayerState`] forward, emitting interleaved S16 stereo
+/// PCM at [`OUTPUT_SAMPLE_RATE`] until the song ends. Mirrors the
+/// [`ModDecoder`] shape so callers can drive STM through the codec
+/// pipeline identically to MOD.
+struct StmDecoder {
     codec_id: CodecId,
+    state: StmDecoderState,
 }
 
-impl Decoder for StmStubDecoder {
+enum StmDecoderState {
+    /// Haven't seen the file yet.
+    AwaitingPacket,
+    /// File parsed; the player is driving the mixer.
+    Playing {
+        player: Box<StmPlayerState>,
+        emit_pts: i64,
+    },
+    /// All samples produced.
+    Done,
+}
+
+impl Decoder for StmDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Light validation so `unsupported` is only returned for otherwise
-        // well-formed STM files. If the blob is not recognisable as STM,
-        // surface an `invalid` error instead.
+        if !matches!(self.state, StmDecoderState::AwaitingPacket) {
+            return Err(Error::other(
+                "STM decoder received a second packet; only one is expected per song",
+            ));
+        }
+        // Light validation so an `invalid` error is returned for blobs
+        // that don't look like STM (rather than crashing parse_header on
+        // an arbitrary buffer).
         if !crate::stm::is_stm(&packet.data) {
             return Err(Error::invalid(
                 "STM: packet does not carry a valid Scream Tracker v1 header",
             ));
         }
-        Err(Error::unsupported(
-            "STM playback is not yet wired through the MOD mixer; use \
-             oxideav_mod::stm::parse_header() / parse_patterns() / extract_samples() \
-             directly for structural access",
-        ))
+        let header = crate::stm::parse_header(&packet.data)?;
+        let patterns = crate::stm::parse_patterns(&header, &packet.data);
+        let samples = crate::stm::extract_samples(&header, &packet.data);
+        let player = StmPlayerState::new(&header, samples, patterns, OUTPUT_SAMPLE_RATE);
+        self.state = StmDecoderState::Playing {
+            player: Box::new(player),
+            emit_pts: 0,
+        };
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        Err(Error::Eof)
+        match &mut self.state {
+            StmDecoderState::AwaitingPacket => Err(Error::NeedMore),
+            StmDecoderState::Done => Err(Error::Eof),
+            StmDecoderState::Playing { player, emit_pts } => {
+                let mut pcm = vec![0i16; CHUNK_FRAMES as usize * 2];
+                let produced = player.render(&mut pcm);
+                if produced == 0 {
+                    self.state = StmDecoderState::Done;
+                    return Err(Error::Eof);
+                }
+                pcm.truncate(produced * 2);
+
+                let mut bytes = Vec::with_capacity(pcm.len() * 2);
+                for s in &pcm {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+
+                let pts = *emit_pts;
+                *emit_pts += produced as i64;
+                Ok(Frame::Audio(AudioFrame {
+                    samples: produced as u32,
+                    pts: Some(pts),
+                    data: vec![bytes],
+                }))
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -200,6 +246,10 @@ impl Decoder for StmStubDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
+        // Drop the entire StmPlayerState (order cursor, per-channel pitch
+        // / vibrato / tremolo / porta memory, tick counter, global volume)
+        // so a fresh `send_packet` starts the song from the top.
+        self.state = StmDecoderState::AwaitingPacket;
         Ok(())
     }
 }
@@ -474,5 +524,92 @@ mod tests {
             other_nonzero, 0,
             "expected silence on channels 1..=3 (got {other_nonzero} non-zero samples)"
         );
+    }
+
+    #[test]
+    fn stm_decoder_emits_nonsilent_pcm() {
+        // The STM `build_ping_stm` fixture places a C-4 / instrument 1
+        // note-on on row 0 / channel 0 with a 64-sample square wave body,
+        // so the very first frames out of the codec pipeline should carry
+        // audible non-zero PCM. This exercises the StmDecoder path end to
+        // end: send_packet (parse + StmPlayerState construction) →
+        // receive_frame (interleaved S16 stereo emission) → Eof draining.
+        let bytes = crate::stm_player::tests::build_ping_stm();
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STM_STR));
+        let mut dec = make_stm_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
+        dec.send_packet(&pkt).unwrap();
+
+        let mut total_samples = 0u64;
+        let mut total_nonzero = 0u64;
+        // Cap iterations so a runaway player doesn't hang the test.
+        for _ in 0..200 {
+            match dec.receive_frame() {
+                Ok(Frame::Audio(a)) => {
+                    total_samples += a.samples as u64;
+                    let plane = &a.data[0];
+                    assert_eq!(
+                        plane.len(),
+                        a.samples as usize * 4,
+                        "S16 stereo: 4 bytes per sample"
+                    );
+                    for chunk in plane.chunks_exact(2) {
+                        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        if s != 0 {
+                            total_nonzero += 1;
+                        }
+                    }
+                }
+                Ok(_) => unreachable!("STM emits audio only"),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected decode error: {e:?}"),
+            }
+        }
+        assert!(
+            total_samples > 1000,
+            "expected substantial sample output, got {total_samples}"
+        );
+        assert!(
+            total_nonzero > 100,
+            "expected non-silent PCM, got {total_nonzero} non-zero samples"
+        );
+    }
+
+    #[test]
+    fn stm_decoder_rejects_non_stm_blob_as_invalid() {
+        // The light is_stm validation must still reject non-STM payloads
+        // with `invalid` rather than panicking parse_header.
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STM_STR));
+        let mut dec = make_stm_decoder(&params).unwrap();
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            vec![0u8; 0x410],
+        );
+        match dec.send_packet(&pkt) {
+            Err(Error::InvalidData(_)) => {}
+            other => panic!("expected InvalidData on non-STM blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stm_decoder_reset_allows_resend() {
+        // After draining or mid-playback, `reset()` must drop the player
+        // and let a fresh `send_packet` start the song again.
+        let bytes = crate::stm_player::tests::build_ping_stm();
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STM_STR));
+        let mut dec = make_stm_decoder(&params).unwrap();
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            bytes.clone(),
+        );
+        dec.send_packet(&pkt).unwrap();
+        // Pull one frame and then reset.
+        let _ = dec.receive_frame();
+        dec.reset().unwrap();
+        // After reset, send_packet must accept a fresh packet rather
+        // than complaining about a duplicate one.
+        dec.send_packet(&pkt).expect("reset clears the state");
     }
 }

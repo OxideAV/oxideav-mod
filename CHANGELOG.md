@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **STM codec id is now a full playback decoder** — `CODEC_ID_STM_STR`
+  = `"stm"` no longer returns `unsupported` on `send_packet`. The new
+  `StmDecoder` consumes the whole-file packet from the `stm` container,
+  parses the header / patterns / sample bodies, builds an
+  `StmPlayerState` over the shared `MixerVoice` core + `StmC3Pitch`
+  pitch model, and emits interleaved S16 stereo `AudioFrame`s at
+  `OUTPUT_SAMPLE_RATE` until the song ends — mirroring the `ModDecoder`
+  shape so a generic player can swap between `"mod"` and `"stm"` without
+  reshaping its audio pipeline. The `is_stm` light validation still
+  rejects non-STM payloads with `InvalidData` rather than panicking
+  `parse_header` on arbitrary bytes; `reset()` drops the player so a
+  subsequent `send_packet` restarts the song from the top. Three new
+  unit tests in `decoder::tests` pin the contract: non-silent PCM out
+  of the `build_ping_stm` fixture, `InvalidData` on a zero blob, and
+  reset-then-resend acceptance. The `stm_smoke` integration test that
+  previously asserted `Err(Unsupported)` is rewritten to drain audio
+  frames and assert the interleaved S16 stereo plane width. Effect
+  coverage is unchanged — every effect Scream Tracker v1 lists as "in
+  ProTracker format" (`0xy` arpeggio, `1xy`/`2xy` portamento, `3xy`/
+  `5xy` tone porta, `4xy`/`6xy` vibrato, `7xy` tremolo, `Axy` volume
+  slide, `Bxy` position jump, `Cxx` set volume, `Dxy` pattern break,
+  `Fxx` speed/tempo split, and the `E1x`/`E2x`/`EAx`/`EBx`/`ECx`/`EDx`
+  Exy subcommands) was already implemented in `StmPlayerState`; this
+  change simply removes the stub gate that was hiding the engine from
+  registry consumers.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-mod/compare/v0.0.8...v0.0.9) - 2026-05-30
 
 ### Other

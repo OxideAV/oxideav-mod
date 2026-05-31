@@ -20,12 +20,13 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
 
 ## Output modes
 
-Two decoder implementations are registered with distinct codec IDs:
+Three decoder implementations are registered with distinct codec IDs:
 
 | Codec id     | Output shape                                                   | Use case                               |
 | ------------ | -------------------------------------------------------------- | -------------------------------------- |
 | `mod`        | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Drop-in playback                       |
 | `mod_planar` | Planar `S16P` at 44.1 kHz, one plane per MOD tracker channel   | Per-channel mixing, analysis, DAW export |
+| `stm`        | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Scream Tracker v1 playback             |
 
 The mixed mode applies the Amiga hard-pan convention (channels 0 & 3 left,
 1 & 2 right; the pattern repeats every 4 for >4-channel files) and a
@@ -227,8 +228,14 @@ and the `FastTracker-2-v2.04-xm.txt` field table at +235..+238).
 ## Scream Tracker v1 (.stm) playback coverage
 
 `oxideav-mod` also drives a Scream Tracker v1 (`.stm`) playback engine
-(`stm_player::StmPlayerState`). STM declares its effects as "in ProTracker
-format" per
+(`stm_player::StmPlayerState`), now wired through the codec registry as
+codec id `"stm"`. The decoder accepts the whole-file packet emitted by
+the `stm` container, parses the header / patterns / sample bodies, and
+emits interleaved S16 stereo PCM at 44.1 kHz â€” the same output shape as
+the `"mod"` codec id, so a generic player can swap between MOD and STM
+without reshaping its audio pipeline.
+
+STM declares its effects as "in ProTracker format" per
 [`docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/stm),
 so the implemented columns track the ProTracker semantics documented under
 `docs/audio/trackers/mod/`:

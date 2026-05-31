@@ -755,7 +755,7 @@ fn apply_vol_slide(ch: &mut StmChannel, mem: u8) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::stm::{extract_samples, parse_header, parse_patterns};
 
