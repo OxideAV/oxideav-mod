@@ -101,9 +101,9 @@ cargo-fuzz = true
 #                  index-past-slice trap to verify is clamped.
 #
 # No external library worth dlopen-ing as a cross-decode oracle: the
-# clean-room wall bars libmodplug / libopenmpt / xmp / milkytracker /
-# mikmod source-reading; the existing `tests/libmodplug_compare.rs`
-# uses libmodplug as a black-box dlopen oracle for *render*
+# clean-room wall bars external tracker-renderer source-reading; the
+# existing `tests/tracker_reference_compare.rs` uses a runtime-loaded
+# reference dylib as a black-box dlopen oracle for *render*
 # similarity, not parse-fault correlation. The contract under fuzz
 # is "the call returns", not "the call returns the same thing as
 # library X".

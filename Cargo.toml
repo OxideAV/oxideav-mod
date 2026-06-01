@@ -22,8 +22,9 @@ oxideav-core = "0.1"
 # cached on disk under `target/test-fixtures/` after the first fetch so
 # repeat runs are offline and fast.
 ureq = "3"
-# `libloading` is used by `tests/libmodplug_compare.rs` to dlopen
-# `libmodplug.dylib` at runtime as a black-box reference oracle for
-# per-row playback comparison. The crate gracefully skips the test
-# if libmodplug isn't installed — there is no compile-time link.
+# `libloading` is used by `tests/tracker_reference_compare.rs` to
+# dlopen a trace reference impl at runtime as a black-box behaviour
+# oracle for per-row playback comparison. The crate gracefully skips
+# the test if the reference dylib isn't installed — there is no
+# compile-time link.
 libloading = "0.9"

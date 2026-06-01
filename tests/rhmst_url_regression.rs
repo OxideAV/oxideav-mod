@@ -353,7 +353,7 @@ fn rhmst_mod_url_regression() {
     // a future regression that disables the ramp (e.g. by setting
     // `RAMP_FRAMES = 0`) trips loudly on this fixture.
     //
-    // The 8000 ceiling matches what `openmpt123 --render` itself
+    // The 8000 ceiling matches what a black-box reference render itself
     // emits on this fixture (measured: max L≈8964 R≈8697); the
     // earlier 5000 ceiling was set under the assumption that the
     // 3300 Hz LED filter would remove most transient HF, but moving
@@ -390,14 +390,14 @@ fn rhmst_mod_url_regression() {
         "[rhmst] inter-frame step  max L={max_step_l} R={max_step_r}  mean L={mean_l:.1} R={mean_r:.1}"
     );
     // 9000 leaves a small headroom over the measured ~7500 max;
-    // openmpt's own render measures ~8950 here, so we're allowed to
-    // be slightly higher (anti-aliasing differences). Mean step <
-    // 800 catches the bulk-of-distribution regression while staying
-    // above the openmpt-mean (~690).
+    // a black-box reference render measures ~8950 here, so we're
+    // allowed to be slightly higher (anti-aliasing differences).
+    // Mean step < 800 catches the bulk-of-distribution regression
+    // while staying above the reference-mean (~690).
     assert!(
         max_step_l < 9000 && max_step_r < 9000,
         "max inter-frame step rose to L={max_step_l} R={max_step_r}; healthy renders \
-         on this fixture stay under ~7500 LSB (openmpt123 measures ~8950 itself). A \
+         on this fixture stay under ~7500 LSB (a reference render measures ~8950 itself). A \
          spike above 9000 means either the per-trigger ramp regressed or the LED \
          filter constant moved high enough to expose Paula DMA-step transients."
     );
@@ -405,7 +405,7 @@ fn rhmst_mod_url_regression() {
         mean_l < 800.0 && mean_r < 800.0,
         "mean inter-frame step rose to L={mean_l:.1} R={mean_r:.1}; the per-trigger \
          ramp + Amiga LED filter keeps the bulk distribution under ~600 LSB on this \
-         fixture (openmpt123 itself measures ~690). A mean above 800 means the ramp \
+         fixture (a reference render itself measures ~690). A mean above 800 means the ramp \
          is either bypassed or shorter than RAMP_FRAMES."
     );
 

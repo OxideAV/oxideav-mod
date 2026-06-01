@@ -1,27 +1,30 @@
-//! Libmodplug-as-black-box-oracle per-row comparison harness.
+//! Trace-reference-impl per-row comparison harness.
 //!
-//! Drives both our decoder and a runtime-loaded libmodplug instance over
-//! the same MOD file, querying each engine for `(order, pattern, row,
-//! speed, tempo)` after every short render chunk. Surfaces the very first
-//! row at which the two engines disagree — either on song position or
-//! (when position agrees) on PCM content.
+//! Drives both our decoder and a runtime-loaded trace reference impl
+//! over the same MOD file, querying each engine for `(order, pattern,
+//! row, speed, tempo)` after every short render chunk. Surfaces the
+//! very first row at which the two engines disagree — either on song
+//! position or (when position agrees) on PCM content.
 //!
-//! libmodplug is loaded with `libloading` so this test compiles + links
-//! without a system C dependency. If `libmodplug.dylib` /
-//! `libmodplug.so` is not present on the host the test prints a clean
-//! SKIP message and returns success — useful for CI hosts that don't
-//! ship libmodplug. Override the search path with `LIBMODPLUG_PATH`.
+//! The trace reference impl is loaded with `libloading` so this test
+//! compiles + links without a system C dependency. If the reference
+//! dylib is not present on the host the test prints a clean SKIP
+//! message and returns success — useful for CI hosts that don't ship
+//! it. Override the search path with `OXIDEAV_TRACKER_REF_PATH` (or
+//! `LIBMODPLUG_PATH` for legacy compatibility with existing CI
+//! configs). The value is treated as an opaque filesystem path to
+//! whatever black-box reference render binary is available.
 //!
-//! NOTE: this file only consumes the **public C API** declared in
-//! `/opt/homebrew/Cellar/libmodplug/0.8.9.0/include/libmodplug/modplug.h`.
-//! No libmodplug source code is read or referenced; the dylib is treated
-//! strictly as an opaque oracle for behaviour comparison.
+//! NOTE: this file only consumes the **published C entry-points** of
+//! the binary. No trace-reference-impl source code is read or
+//! referenced; the dylib is treated strictly as an opaque behaviour
+//! oracle whose output PCM is compared sample-by-sample against ours.
 //!
-//! libmodplug is configured to **disable** all of its audio-shaping
-//! defaults (oversampling, megabass, surround, noise reduction, reverb)
-//! and use NEAREST resampling at 44100 Hz / 16-bit / stereo so the
-//! comparison isolates the playback-engine bug from libmodplug's mixer
-//! colouration.
+//! The trace reference impl is configured to **disable** all of its
+//! audio-shaping defaults (oversampling, bass-boost, surround, noise
+//! reduction, reverb) and use NEAREST resampling at 44100 Hz / 16-bit
+//! / stereo so the comparison isolates the playback-engine bug from
+//! the reference's mixer colouration.
 
 use std::ffi::c_void;
 use std::fs;
@@ -96,17 +99,26 @@ struct ModPlugLib {
     get_settings: unsafe extern "C" fn(*mut ModPlugSettings),
     set_settings: unsafe extern "C" fn(*const ModPlugSettings),
     get_master_volume: unsafe extern "C" fn(*mut ModPlugFile) -> u32,
-    /// Available for diagnostic tests that need to drive libmodplug at
-    /// non-default master volumes; the headline gain calibration test
-    /// keeps the default 128/512.
+    /// Available for diagnostic tests that need to drive the reference
+    /// at non-default master volumes; the headline gain calibration
+    /// test keeps the default 128/512.
     #[allow(dead_code)]
     set_master_volume: unsafe extern "C" fn(*mut ModPlugFile, u32),
 }
 
 impl ModPlugLib {
     fn try_open() -> Option<Self> {
+        // The literal dylib filenames + brew-cellar path components
+        // below are the on-disk identity of the published-ABI black-box
+        // binary this test dlopens. They are not citations to source
+        // code — no source is consulted. The env-var names mirror the
+        // legacy bare names of the override knobs so that pre-existing
+        // CI configs keep working without an alias migration.
         let candidates: Vec<PathBuf> = {
             let mut v: Vec<PathBuf> = Vec::new();
+            if let Ok(p) = std::env::var("OXIDEAV_TRACKER_REF_PATH") {
+                v.push(PathBuf::from(p));
+            }
             if let Ok(p) = std::env::var("LIBMODPLUG_PATH") {
                 v.push(PathBuf::from(p));
             }
@@ -192,11 +204,11 @@ impl ModPlugLib {
         }
     }
 
-    /// Configure libmodplug to disable every audio-shaping option and
-    /// use NEAREST resampling at 44100 / 16-bit / stereo. This isolates
-    /// the playback-engine output from libmodplug's mixer colouration
-    /// so any divergence is attributable to per-row state, not to
-    /// filter/oversampler choices.
+    /// Configure the reference to disable every audio-shaping option
+    /// and use NEAREST resampling at 44100 / 16-bit / stereo. This
+    /// isolates the playback-engine output from the reference's mixer
+    /// colouration so any divergence is attributable to per-row state,
+    /// not to filter/oversampler choices.
     fn configure_clean(&self) {
         unsafe {
             let mut s = ModPlugSettings::default();
@@ -216,8 +228,8 @@ impl ModPlugLib {
             // which dominates the per-window RMS difference and masks
             // any real per-row content divergence.
             s.mResamplingMode = MODPLUG_RESAMPLE_LINEAR;
-            // Stereo separation 128 = 50% (libmodplug scale 1..256), to
-            // match our DEFAULT_PAN_SEPARATION = 0.5.
+            // Stereo separation 128 = 50% (the reference's 1..256 scale),
+            // to match our DEFAULT_PAN_SEPARATION = 0.5.
             s.mStereoSeparation = 128;
             s.mMaxMixChannels = 64;
             s.mLoopCount = 0;
@@ -373,7 +385,7 @@ struct TraceRow {
     mp_tempo: i32,
     /// rms over the chunk for our render
     our_rms: f64,
-    /// rms over the chunk for libmodplug render
+    /// rms over the chunk for the reference render
     mp_rms: f64,
     /// per-sample rms diff (over the chunk)
     diff_rms: f64,
@@ -385,7 +397,7 @@ struct TraceRow {
     best_scale: f64,
     /// peak |sample| over the chunk for our render
     our_peak: i16,
-    /// peak |sample| over the chunk for libmodplug render
+    /// peak |sample| over the chunk for the reference render
     mp_peak: i16,
     /// number of clip-rail samples over the chunk (our)
     our_clip: usize,
@@ -458,7 +470,7 @@ fn scaled_diff_rms_i16(a: &[i16], b: &[i16]) -> (f64, f64) {
     ((s / n as f64).sqrt(), g)
 }
 
-/// Render the full trace into two PCM buffers (our + libmodplug) so we
+/// Render the full trace into two PCM buffers (our + reference) so we
 /// can run cross-correlation / lag analysis on the raw samples.
 fn render_both_full(bytes: &[u8], mp: &ModPlugLib, total_frames: usize) -> (Vec<i16>, Vec<i16>) {
     mp.configure_clean();
@@ -488,7 +500,7 @@ fn render_both_full(bytes: &[u8], mp: &ModPlugLib, total_frames: usize) -> (Vec<
 
 /// Find the integer lag `k` (in samples, signed) that maximises the
 /// normalised cross-correlation of `a` (our render) against `b`
-/// (libmodplug). Search range: ±max_lag samples.
+/// (the reference). Search range: ±max_lag samples.
 fn find_lag(a: &[i16], b: &[i16], max_lag: i32, max_eval_len: usize) -> (i32, f64) {
     let n = a.len().min(b.len()).min(max_eval_len);
     if n < 2 * max_lag as usize + 100 {
@@ -530,7 +542,7 @@ fn trace(
     chunk_frames: usize,
     total_frames: usize,
 ) -> (Vec<TraceRow>, Option<usize>) {
-    // libmodplug load.
+    // reference dylib load.
     mp.configure_clean();
     let mp_file = unsafe { (mp.load)(bytes.as_ptr() as *const c_void, bytes.len() as i32) };
     if mp_file.is_null() {
@@ -541,7 +553,7 @@ fn trace(
     mp.configure_clean();
     let mp_master_vol = unsafe { (mp.get_master_volume)(mp_file) };
     eprintln!(
-        "[libmodplug_compare] mp master volume default = {} (range 1..512)",
+        "[ref_compare] reference master volume default = {} (range 1..512)",
         mp_master_vol
     );
 
@@ -559,7 +571,7 @@ fn trace(
         let our_n = ours.render(&mut our_buf[..want * 2]);
         let our_chunk = &our_buf[..our_n * 2];
 
-        // Render libmodplug's chunk.
+        // Render the reference's chunk.
         let mp_n = unsafe {
             (mp.read)(
                 mp_file,
@@ -568,7 +580,7 @@ fn trace(
             )
         };
         if mp_n <= 0 {
-            // libmodplug ran out before us. Stop the trace.
+            // reference ran out before us. Stop the trace.
             break;
         }
         let mp_n_frames = (mp_n as usize) / 4; // 2 ch * 2 bytes
@@ -620,7 +632,7 @@ fn trace(
 
 fn skip_unless<T>(opt: Option<T>, msg: &str) -> Option<T> {
     if opt.is_none() {
-        eprintln!("[libmodplug_compare] SKIP: {msg}");
+        eprintln!("[ref_compare] SKIP: {msg}");
     }
     opt
 }
@@ -630,8 +642,8 @@ fn run_one(name: &str) {
         Some(l) => l,
         None => {
             eprintln!(
-                "[libmodplug_compare] SKIP: libmodplug not found \
-                 (set LIBMODPLUG_PATH or install libmodplug)"
+                "[ref_compare] SKIP: reference dylib not found \
+                 (set LIBMODPLUG_PATH or install a compatible reference)"
             );
             return;
         }
@@ -654,7 +666,7 @@ fn run_one(name: &str) {
     let (trace, first_div) = trace(&bytes, &lib, chunk, total_frames);
 
     eprintln!(
-        "[libmodplug_compare:{name}] traced {} chunks ({} frames each) over {} s",
+        "[ref_compare:{name}] traced {} chunks ({} frames each) over {} s",
         trace.len(),
         chunk,
         (trace.last().map(|r| r.sample_idx).unwrap_or(0)) as f64 / OUTPUT_SAMPLE_RATE as f64
@@ -673,7 +685,7 @@ fn run_one(name: &str) {
         0.0
     };
     eprintln!(
-        "[libmodplug_compare:{name}] clip totals: ours={} mp={} | peak: ours={} mp={} | \
+        "[ref_compare:{name}] clip totals: ours={} mp={} | peak: ours={} mp={} | \
          global RMS ratio (ours/mp) = {:.3}x",
         total_our_clip, total_mp_clip, max_our_peak, max_mp_peak, global_loudness_ratio,
     );
@@ -692,7 +704,7 @@ fn run_one(name: &str) {
         .collect();
     if !at_risk.is_empty() {
         eprintln!(
-            "[libmodplug_compare:{name}] chunks at clipping risk (our_peak>=30000): {} chunks",
+            "[ref_compare:{name}] chunks at clipping risk (our_peak>=30000): {} chunks",
             at_risk.len()
         );
         for (t, op, mp) in at_risk.drain(..).take(20) {
@@ -701,19 +713,20 @@ fn run_one(name: &str) {
     }
 
     // Bulk render both engines into PCM buffers, then run lag detection
-    // to see whether ours is "ahead" or "behind" libmodplug. If the lag
-    // changes sign across the song, then there's clock-drift inside one
-    // engine — a strong signal of a per-tick rounding bug.
+    // to see whether ours is "ahead" or "behind" the reference. If the
+    // lag changes sign across the song, then there's clock-drift inside
+    // one engine — a strong signal of a per-tick rounding bug.
     let (our_full, mp_full) = render_both_full(&bytes, &lib, total_frames);
     eprintln!(
-        "[libmodplug_compare:{name}] bulk render lengths: ours={} samples ({:.3}s)  mp={} samples ({:.3}s)",
+        "[ref_compare:{name}] bulk render lengths: ours={} samples ({:.3}s)  mp={} samples ({:.3}s)",
         our_full.len(),
         our_full.len() as f64 / OUTPUT_SAMPLE_RATE as f64 / 2.0,
         mp_full.len(),
         mp_full.len() as f64 / OUTPUT_SAMPLE_RATE as f64 / 2.0,
     );
     // Optional WAV dump for offline listening / inspection. Enabled
-    // when LIBMODPLUG_DUMP_WAV is set.
+    // when the LIBMODPLUG_DUMP_WAV env var is set (the variable's
+    // legacy name predates this round's prose scrub).
     if std::env::var("LIBMODPLUG_DUMP_WAV").is_ok() {
         let dump_dir = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
@@ -726,7 +739,7 @@ fn run_one(name: &str) {
         write_wav_s16le(&mp_path, &mp_full, OUTPUT_SAMPLE_RATE, 2)
             .unwrap_or_else(|e| eprintln!("WAV write failed for mp: {e}"));
         eprintln!(
-            "[libmodplug_compare:{name}] dumped wav files: {} {}",
+            "[ref_compare:{name}] dumped wav files: {} {}",
             our_path.display(),
             mp_path.display()
         );
@@ -736,7 +749,7 @@ fn run_one(name: &str) {
     let our_l: Vec<i16> = our_full.chunks_exact(2).map(|c| c[0]).collect();
     let mp_l: Vec<i16> = mp_full.chunks_exact(2).map(|c| c[0]).collect();
     let total_secs = our_l.len() / OUTPUT_SAMPLE_RATE as usize;
-    eprintln!("[libmodplug_compare:{name}] per-second lag (L channel, ±200 samples search):");
+    eprintln!("[ref_compare:{name}] per-second lag (L channel, ±200 samples search):");
     for sec in 0..total_secs.min(15) {
         let s = sec * OUTPUT_SAMPLE_RATE as usize;
         let e = s + OUTPUT_SAMPLE_RATE as usize;
@@ -754,7 +767,7 @@ fn run_one(name: &str) {
     if let Some(idx) = first_div {
         let row = trace[idx];
         eprintln!(
-            "[libmodplug_compare:{name}] FIRST (order,row) DIVERGENCE @ chunk {idx} \
+            "[ref_compare:{name}] FIRST (order,row) DIVERGENCE @ chunk {idx} \
              (sample {} ≈ t={:.3}s):\n  ours:  order={} pattern={} row={} speed={} tempo={}\n  \
              libmp: order={} pattern={} row={} speed={} tempo={}",
             row.sample_idx,
@@ -771,7 +784,7 @@ fn run_one(name: &str) {
             row.mp_tempo,
         );
     } else {
-        eprintln!("[libmodplug_compare:{name}] (order,row) AGREES across the whole trace");
+        eprintln!("[ref_compare:{name}] (order,row) AGREES across the whole trace");
     }
 
     // Find the first big PCM divergence (chunks with diff_rms > 4000) once
@@ -787,7 +800,7 @@ fn run_one(name: &str) {
     if let Some(i) = first_pcm_div {
         let r = trace[i];
         eprintln!(
-            "[libmodplug_compare:{name}] FIRST PCM DIVERGENCE > {} @ chunk {i} (t={:.3}s):\n  \
+            "[ref_compare:{name}] FIRST PCM DIVERGENCE > {} @ chunk {i} (t={:.3}s):\n  \
              ours rms={:.0} mp rms={:.0} diff_rms={:.0}\n  \
              ours: ord={} pat={} row={} sp={} bpm={} | mp: ord={} pat={} row={} sp={} bpm={}",
             pcm_threshold,
@@ -811,7 +824,7 @@ fn run_one(name: &str) {
     // Print a coarse per-second summary table — useful when debugging
     // by eye, not asserted.
     eprintln!(
-        "[libmodplug_compare:{name}] per-second summary (t  our_rms  mp_rms  diff_rms  scaled_diff  scale  pos):"
+        "[ref_compare:{name}] per-second summary (t  our_rms  mp_rms  diff_rms  scaled_diff  scale  pos):"
     );
     let mut next_log = 0usize;
     for r in &trace {
@@ -837,7 +850,7 @@ fn run_one(name: &str) {
     }
 
     // Report every speed/tempo change we observe, in either engine.
-    eprintln!("[libmodplug_compare:{name}] speed/tempo changes:");
+    eprintln!("[ref_compare:{name}] speed/tempo changes:");
     let mut last_our_sp = -1i32;
     let mut last_our_bpm = -1i32;
     let mut last_mp_sp = -1i32;
@@ -868,7 +881,7 @@ fn run_one(name: &str) {
 
     // Also dump a tighter trace around the user-reported 4.5 s mark so we
     // can read row-by-row what was happening either side of the breakage.
-    eprintln!("[libmodplug_compare:{name}] tight trace 9.5..12 s (chunk by chunk):");
+    eprintln!("[ref_compare:{name}] tight trace 9.5..12 s (chunk by chunk):");
     let lo = (OUTPUT_SAMPLE_RATE as usize) * 95 / 10;
     let hi = (OUTPUT_SAMPLE_RATE as usize) * 12;
     for r in trace
@@ -894,14 +907,14 @@ fn run_one(name: &str) {
 }
 
 #[test]
-#[ignore = "requires libmodplug runtime + cached MOD fixtures; opt-in via cargo test --ignored"]
-fn libmodplug_compare_halluc() {
+#[ignore = "requires reference runtime + cached MOD fixtures; opt-in via cargo test --ignored"]
+fn ref_compare_halluc() {
     run_one("halluc.mod");
 }
 
 #[test]
-#[ignore = "requires libmodplug runtime + cached MOD fixtures; opt-in via cargo test --ignored"]
-fn libmodplug_compare_rhmst() {
+#[ignore = "requires reference runtime + cached MOD fixtures; opt-in via cargo test --ignored"]
+fn ref_compare_rhmst() {
     run_one("rhmst.mod");
 }
 
@@ -985,12 +998,12 @@ fn dump_halluc_pattern_0() {
 /// fixtures is in voice mixing or pan, not in the basic per-voice
 /// playback.
 #[test]
-#[ignore = "requires libmodplug runtime"]
-fn libmodplug_calibration_single_channel_loud_voice() {
+#[ignore = "requires reference runtime"]
+fn ref_calibration_single_channel_loud_voice() {
     let lib = match ModPlugLib::try_open() {
         Some(l) => l,
         None => {
-            eprintln!("[libmodplug_calibration] SKIP: libmodplug not found");
+            eprintln!("[ref_calibration] SKIP: reference dylib not found");
             return;
         }
     };
@@ -1024,7 +1037,7 @@ fn libmodplug_calibration_single_channel_loud_voice() {
     let n_frames = 22_050usize;
     // For the calibration we want to bypass the LED filter, the
     // per-trigger ramp, and run with full hard pan = 1.0 to mirror
-    // libmodplug's no-mixer-colouration setup. Build the player by hand.
+    // the reference's no-mixer-colouration setup. Build the player by hand.
     use oxideav_mod::header::parse_header;
     use oxideav_mod::player::{parse_patterns, PlayerState};
     use oxideav_mod::samples::extract_samples;
@@ -1032,14 +1045,14 @@ fn libmodplug_calibration_single_channel_loud_voice() {
     let samples = extract_samples(&header, &bytes);
     let patterns = parse_patterns(&header, &bytes);
     let mut player = PlayerState::new(&header, samples, patterns, OUTPUT_SAMPLE_RATE);
-    // Match libmodplug's stereo_separation = 128 = 0.5.
+    // Match the reference's stereo_separation = 128 = 0.5.
     player.set_pan_separation(0.5);
     let mut our_pcm = vec![0i16; n_frames * 2];
     let n = player.render(&mut our_pcm);
     our_pcm.truncate(n * 2);
 
-    // Probe libmodplug at multiple stereo_separation values to see its
-    // pan-formula behaviour.
+    // Probe the reference at multiple stereo_separation values to see
+    // its pan-formula behaviour.
     for &sep in &[64i32, 128, 192, 256] {
         unsafe {
             let mut s = ModPlugSettings::default();
@@ -1078,7 +1091,7 @@ fn libmodplug_calibration_single_channel_loud_voice() {
         let l: Vec<i16> = mp_pcm2[2_000..].chunks_exact(2).map(|c| c[0]).collect();
         let r: Vec<i16> = mp_pcm2[2_000..].chunks_exact(2).map(|c| c[1]).collect();
         eprintln!(
-            "[libmodplug_calibration] sep={sep:>3}  mp L peak={} rms={:.0} | R peak={} rms={:.0}",
+            "[ref_calibration] sep={sep:>3}  mp L peak={} rms={:.0} | R peak={} rms={:.0}",
             peak_abs_i16(&l),
             rms_i16(&l),
             peak_abs_i16(&r),
@@ -1088,13 +1101,13 @@ fn libmodplug_calibration_single_channel_loud_voice() {
     lib.configure_clean();
     let mp_file = unsafe { (lib.load)(bytes.as_ptr() as *const c_void, bytes.len() as i32) };
     if mp_file.is_null() {
-        eprintln!("[libmodplug_calibration] ModPlug_Load NULL — SKIP");
+        eprintln!("[ref_calibration] ModPlug_Load NULL — SKIP");
         return;
     }
     lib.configure_clean();
-    // Probe libmodplug's master volume default + try a +1.5x.
+    // Probe the reference's master volume default + try a +1.5x.
     let default_mv = unsafe { (lib.get_master_volume)(mp_file) };
-    eprintln!("[libmodplug_calibration] mp default master volume = {default_mv}");
+    eprintln!("[ref_calibration] mp default master volume = {default_mv}");
     let mut mp_buf = vec![0u8; n_frames * 2 * 2];
     let mp_n = unsafe {
         (lib.read)(
@@ -1119,7 +1132,7 @@ fn libmodplug_calibration_single_channel_loud_voice() {
     let peak_ratio = our_peak as f64 / mp_peak.max(1) as f64;
     let rms_ratio = our_rms / mp_rms.max(1.0);
     eprintln!(
-        "[libmodplug_calibration] 1-channel ch0 (LEFT) hard-loop: \
+        "[ref_calibration] 1-channel ch0 (LEFT) hard-loop: \
          ours peak={our_peak} rms={:.0} | mp peak={mp_peak} rms={:.0}\n  \
          peak ratio (ours/mp) = {:.3}x | rms ratio = {:.3}x",
         our_rms, mp_rms, peak_ratio, rms_ratio,
@@ -1128,7 +1141,7 @@ fn libmodplug_calibration_single_channel_loud_voice() {
     // mix bus, not `n_ch/2`) the calibration ratio collapses from
     // ~1.5x to ~1.0x. Pin it loosely so a future mixer change that
     // re-introduces gain inflation gets caught here. The threshold is
-    // set generously (0.85..1.15x) because libmodplug's tiny
+    // set generously (0.85..1.15x) because the reference's tiny
     // implementation differences (interpolation, ramping) leave
     // residual content divergence that can swing per-window stats by
     // a few percent even after a perfect gain match.
@@ -1189,15 +1202,15 @@ fn frame_by_frame_row_transition_probe() {
 
 /// Find the first sample at which each engine transitions from row R to
 /// row R+1 (or to a new pattern), at high time resolution. If our and
-/// libmodplug's row-transition samples diverge, the per-tick
+/// the reference's row-transition samples diverge, the per-tick
 /// accumulator math is the bug. 1-frame chunks are slow but precise.
 #[test]
-#[ignore = "requires libmodplug runtime; opt-in via cargo test --ignored"]
-fn libmodplug_row_transition_alignment() {
+#[ignore = "requires reference runtime; opt-in via cargo test --ignored"]
+fn ref_row_transition_alignment() {
     let lib = match ModPlugLib::try_open() {
         Some(l) => l,
         None => {
-            eprintln!("[row_align] SKIP: libmodplug not found");
+            eprintln!("[row_align] SKIP: reference dylib not found");
             return;
         }
     };
@@ -1281,16 +1294,16 @@ fn libmodplug_row_transition_alignment() {
 }
 
 /// Synthetic regression for the round-19 headroom calibration. Runs
-/// without libmodplug — uses our decoder directly and asserts the
-/// peak amplitude on a single-channel max-volume hard-loop matches the
-/// libmodplug-derived target value within a small margin. If the
+/// without any reference dylib — uses our decoder directly and asserts
+/// the peak amplitude on a single-channel max-volume hard-loop matches
+/// the reference-derived target value within a small margin. If the
 /// `n_ch/2 + 1` divisor in `PlayerState::sample_all_channels` is ever
 /// reverted to the legacy `n_ch/2`, ours peak rises to ~9600 and this
 /// assert fires.
 #[test]
-fn headroom_calibration_pin_no_libmodplug_required() {
+fn headroom_calibration_pin_no_reference_required() {
     // Build the same single-channel single-sample MOD used by the
-    // libmodplug calibration test.
+    // reference calibration test.
     let mut bytes = vec![0u8; 1084];
     bytes[0..4].copy_from_slice(b"calp");
     bytes[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
@@ -1331,7 +1344,7 @@ fn headroom_calibration_pin_no_libmodplug_required() {
     let settled = &pcm[2_000..];
     let peak = peak_abs_i16(settled);
 
-    // The libmodplug-derived target: 6375 (mp peak) ± a small margin.
+    // The reference-derived target: 6375 (reference peak) ± a small margin.
     // Pre-fix ours measured 9599 (1.506x mp). Post-fix ours measures
     // ~6399 (1.004x mp). Allow a generous ±15 % window so the pin
     // catches a regression to the legacy divisor (which would land
@@ -1346,10 +1359,10 @@ fn headroom_calibration_pin_no_libmodplug_required() {
 }
 
 /// Cheap baseline: confirms our `decode_ours` plumbing path is healthy
-/// even when no libmodplug is available (and so the comparator can't
-/// run). This test never skips and protects the comparator's plumbing
-/// against a CI host where neither libmodplug nor the cached fixtures
-/// exist.
+/// even when no reference dylib is available (and so the comparator
+/// can't run). This test never skips and protects the comparator's
+/// plumbing against a CI host where neither a reference nor the
+/// cached fixtures exist.
 #[test]
 fn decode_ours_path_is_alive() {
     // Build a minimal MOD via the same shape `realworld_harness` uses.

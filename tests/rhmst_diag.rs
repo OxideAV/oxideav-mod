@@ -4,7 +4,7 @@
 //! sample reported breaking around the same 4.5 s mark
 //! ("rhythm master"). Renders the first N seconds (default 30) into
 //! a WAV under `$TMPDIR`, dumps a row/tick CSV, and emits a tiny
-//! cross-correlation report against an openmpt123 reference render
+//! cross-correlation report against a black-box reference render
 //! (`rhmst_ref.wav`) when one is available next to the fixture.
 //!
 //! Marked `#[ignore]` so other developers' builds don't fail when they
@@ -55,7 +55,7 @@ fn write_wav(path: &Path, pcm_stereo_s16: &[i16]) -> std::io::Result<()> {
 
 /// Read a 16-bit little-endian PCM WAV into interleaved S16 samples
 /// alongside the channel count and sample rate. Tolerant minimal
-/// parser — enough for an openmpt123-produced reference.
+/// parser — enough for a black-box-reference-render-produced WAV.
 fn read_wav_s16(path: &Path) -> Option<(Vec<i16>, u16, u32)> {
     let bytes = fs::read(path).ok()?;
     if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
@@ -203,7 +203,7 @@ fn render_rhmst_to_wav_with_per_row_diagnostics() {
         );
     }
 
-    // Same step measurement on the openmpt123 reference render — gives
+    // Same step measurement on the black-box reference render — gives
     // us a reality check on what magnitude of inter-frame step is
     // actually expected of a healthy MOD renderer.
     if let Some((ref_pcm, ch, sr)) = read_wav_s16(Path::new(REF_WAV)) {

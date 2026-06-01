@@ -367,7 +367,7 @@ fn halluc_mod_url_regression() {
     // entire 10-second intro — indistinguishable from "the player
     // stalled around the 4-5 s mark" when listening on headphones.
     // The default `pan_separation = 0.5` (empirically the value
-    // that minimises cross-correlation drift versus `openmpt123 --render`
+    // that minimises cross-correlation drift versus a black-box reference render
     // on this specific file; see `PlayerState::DEFAULT_PAN_SEPARATION`
     // doc-comment) bleeds the right side into the left so both ears
     // receive a coherent stereo intro. Assert that the LEFT bus is

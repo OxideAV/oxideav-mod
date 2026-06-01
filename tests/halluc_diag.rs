@@ -30,17 +30,17 @@ const FIXTURE_LOCAL: &str =
 const FIXTURE_CACHE: &str =
     "/Users/magicaltux/projects/oxideav-workspace/target/test-fixtures/halluc.mod";
 
-/// openmpt123 reference render for cross-correlation comparison.
-/// Generate with:
-///   openmpt123 --quiet --samplerate 44100 --gain 0 --no-progress \
-///     --no-float --render --output-type wav --force halluc.mod
+/// Trace-reference-impl render WAV for cross-correlation comparison.
+/// Generated externally and dropped next to the fixture; the harness
+/// only reads the resulting `.wav` file — no third-party source is
+/// referenced by this test.
 #[allow(dead_code)]
 const REF_WAV: &str =
     "/Users/magicaltux/projects/oxideav-workspace/target/test-fixtures/halluc.mod.wav";
 
 /// Read a 16-bit little-endian PCM WAV into interleaved S16 samples
 /// alongside the channel count and sample rate. Tolerant minimal
-/// parser — enough for an openmpt123-produced reference.
+/// parser — enough for a trace-reference-impl-produced WAV.
 #[allow(dead_code)]
 fn read_wav_s16(path: &Path) -> Option<(Vec<i16>, u16, u32)> {
     let bytes = fs::read(path).ok()?;
@@ -248,7 +248,7 @@ fn render_halluc_to_wav_with_per_row_diagnostics() {
     println!("WAV written to {}", wav_path.display());
     println!("CSV written to {}", csv_path.display());
 
-    // Per-second cross-correlation against an openmpt123 reference, when
+    // Per-second cross-correlation against a black-box reference, when
     // a `halluc.mod.wav` sits next to the cached fixture (see REF_WAV).
     if let Some((ref_pcm, ch, sr)) = read_wav_s16(Path::new(REF_WAV)) {
         if ch == 2 && sr == OUTPUT_SAMPLE_RATE {

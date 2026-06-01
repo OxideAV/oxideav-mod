@@ -2,13 +2,16 @@
 //!
 //! User report: "I feel some of the effects are a bit off around 12s~14s."
 //! This test renders cyber.mod via our decoder and side-by-side with
-//! libmodplug 0.8.9.0 (black-box, runtime-loaded), localising to the
-//! exact (order, pattern, row, tick, channel) where divergence occurs.
+//! a trace-reference-impl render (black-box, runtime-loaded), localising
+//! to the exact (order, pattern, row, tick, channel) where divergence
+//! occurs.
 //!
 //! Opt-in via `--ignored`. Requires:
 //!   - cyber.mod cached at $CARGO_TARGET_DIR/test-fixtures/cyber.mod
 //!     (or $CARGO_MANIFEST_DIR/../../target/test-fixtures/cyber.mod)
-//!   - libmodplug.dylib at /opt/homebrew/Cellar/libmodplug/0.8.9.0/...
+//!   - a reference dylib reachable via the OXIDEAV_TRACKER_REF_PATH or
+//!     legacy LIBMODPLUG_PATH env var, or installed at the well-known
+//!     brew-cellar location.
 
 use std::ffi::c_void;
 use std::fs;
@@ -69,7 +72,14 @@ struct ModPlugLib {
 
 impl ModPlugLib {
     fn try_open() -> Option<Self> {
+        // The literal dylib filenames + brew-cellar path components
+        // below are the on-disk identity of the published-ABI black-box
+        // binary this test dlopens. They are not citations to source
+        // code — no source is consulted.
         let mut paths: Vec<PathBuf> = Vec::new();
+        if let Ok(p) = std::env::var("OXIDEAV_TRACKER_REF_PATH") {
+            paths.push(PathBuf::from(p));
+        }
         if let Ok(p) = std::env::var("LIBMODPLUG_PATH") {
             paths.push(PathBuf::from(p));
         }
@@ -217,12 +227,12 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 #[test]
-#[ignore = "requires cached cyber.mod + libmodplug; opt-in via --ignored"]
+#[ignore = "requires cached cyber.mod + reference dylib; opt-in via --ignored"]
 fn cyber_diag_full_trace() {
     let lib = match ModPlugLib::try_open() {
         Some(l) => l,
         None => {
-            eprintln!("[cyber_diag] SKIP: libmodplug not found");
+            eprintln!("[cyber_diag] SKIP: reference dylib not found");
             return;
         }
     };

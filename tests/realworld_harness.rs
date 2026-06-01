@@ -556,7 +556,7 @@ fn malformed_song_length_terminates() {
 /// somewhere around the 4-5 s mark"; that is exactly what the user
 /// reported about `halluc.mod`. The default `pan_separation = 0.5`
 /// (empirically the value that minimises cross-correlation drift
-/// versus `openmpt123 --render` on real-world MODs; see
+/// versus a black-box reference render on real-world MODs; see
 /// `PlayerState::DEFAULT_PAN_SEPARATION`) bleeds the right side
 /// into the left so the listener hears a coherent stereo intro on
 /// both ears.

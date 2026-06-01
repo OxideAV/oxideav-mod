@@ -170,7 +170,7 @@ a unit test in `src/player.rs`):
   (8xx) and 1503-1505 (E8x), and the monotonic 16-step ramp echoed in
   `multimedia-cx-protracker.html` E8x. The per-channel gain helper
   `pan_gains(p, s)` collapses to the prior hard-LRRL formula at the
-  endpoints (so the libmodplug-calibrated headroom divisor still
+  endpoints (so the trace-reference-impl-calibrated headroom divisor still
   holds bit-for-bit), and splits a centred channel evenly regardless
   of `s` — so a MOD that pans a lead voice to centre stays centred
   even at `pan_separation = 1.0`.

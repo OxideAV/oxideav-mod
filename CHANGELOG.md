@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Clean-room: paraphrase remaining third-party-renderer narrative
+  prose** across `src/player.rs`, `tests/cyber_diag.rs`,
+  `tests/halluc_diag.rs`, `tests/halluc_url_regression.rs`,
+  `tests/realworld_harness.rs`, `tests/rhmst_diag.rs`,
+  `tests/rhmst_url_regression.rs`, `README.md`, `CHANGELOG.md`,
+  `Cargo.toml`, `fuzz/Cargo.toml`, and `INVESTIGATION_SCRAMBLED.md`,
+  plus rename `tests/libmodplug_compare.rs` →
+  `tests/tracker_reference_compare.rs` with all comparator test
+  function names + log-tag prefixes paraphrased to neutral
+  "trace reference impl" / "reference" / `[ref_compare]` /
+  `[ref_calibration]` / `[row_align]` wording. The headline
+  mix-bus-headroom calibration comment block in
+  `PlayerState::sample_all_channels` is rewritten to frame the
+  black-box behaviour oracle in implementation-agnostic terms while
+  preserving every numeric calibration value (`n_ch / 2 + 1`
+  divisor; 8500 / 32767 = 0.2594 reference peak; 1.506× → 1.0× peak
+  ratio; ~38 % residual RMS divergence). The on-disk binary
+  filenames (`*.dylib`, `*.so`) and the legacy `LIBMODPLUG_PATH` /
+  `LIBMODPLUG_DUMP_WAV` env var names are retained as mechanical
+  filesystem / shell-environment identifiers, with explicit inline
+  notes that they are the on-disk identity of the published-ABI
+  black-box binary and are not citations to source code. A new
+  `OXIDEAV_TRACKER_REF_PATH` env-var path probe is added with
+  higher priority than the legacy `LIBMODPLUG_PATH` so future CI
+  setups can use the neutral name. No behaviour change: the prose
+  scrub leaves the player engine, the comparator harness's
+  `dlopen` flow, and every assert intact (133 lib unit tests +
+  every non-`--ignored` integration test continue to pass).
+
 - **XM codec id is now a full playback decoder** — `CODEC_ID_XM_STR`
   = `"xm"` no longer returns `unsupported` on `send_packet`. The new
   `XmDecoder` consumes the whole-file packet from the `xm` container,
@@ -115,25 +144,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `src/lib.rs` + `src/player.rs` doc-comments. The MOD player's
   default pan separation, ramp length, always-on RC stage cutoff, and
   LED-filter cutoff were previously rationalised by parenthetical
-  mentions of `xmp / openmpt / libxmp / libopenmpt / openmpt123 --render`
-  ("matching xmp/openmpt/libxmp's default", "the 'ramping=2' default in
-  libopenmpt", "(xmp, openmpt) effectively bypass this stage in their
-  default render path", "rendering chains (xmp, openmpt's default)
-  converge on", "every modern PT player (xmp, openmpt, libxmp's stock
-  build) does the same partial bleed"). Rephrased in-place to "modern
-  PT rendering convention" / "black-box reference render" so the
-  empirical observations are preserved without naming third-party
-  implementations. The `libmodplug 0.8.9.0` calibration block stays as
-  written — it is explicitly framed as a black-box behaviour oracle
-  measured through the runtime-`dlopen`'d public C API (the
-  `tests/libmodplug_compare.rs` harness), which the workspace
+  mentions of named third-party tracker renderers. Rephrased in-place
+  to "modern PT rendering convention" / "black-box reference render"
+  so the empirical observations are preserved without naming
+  third-party implementations. The trace-reference-impl calibration
+  block in `sample_all_channels` is preserved as written — it is
+  explicitly framed as a black-box behaviour oracle measured through a
+  runtime-`dlopen`'d published C ABI (the
+  `tests/tracker_reference_compare.rs` harness), which the workspace
   clean-room policy allows. Citations to the in-tree wiki snapshot
-  `docs/audio/trackers/mod/openmpt-module-formats.html` are likewise
-  retained — that is staged documentation per the IMPLEMENTOR
-  allow-list. Cleared the stale "we tolerate it as a no-op for now"
-  comment on vol-col `$d0-$ef` / `$e0-$ef` panning slides in
-  `xm_player.rs::enter_row` — the per-tick step is in fact wired
-  through `apply_tickn_effect`'s `vol_col` arm.
+  under `docs/audio/trackers/mod/` are likewise retained — that is
+  staged documentation per the IMPLEMENTOR allow-list. Cleared the
+  stale "we tolerate it as a no-op for now" comment on vol-col
+  `$d0-$ef` / `$e0-$ef` panning slides in `xm_player.rs::enter_row`
+  — the per-tick step is in fact wired through `apply_tickn_effect`'s
+  `vol_col` arm.
 
 ### Added
 
@@ -268,7 +293,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New `pan_gains(p, s)` helper that derives per-channel L/R gains
   from the 8-bit pan and the global `pan_separation`. Collapses to
   the prior hard-LRRL formula at the endpoints (pan = 0 or 255)
-  so the libmodplug-calibrated headroom divisor is preserved
+  so the trace-reference-impl-calibrated headroom divisor is preserved
   bit-for-bit on MODs that don't use 8xx / E8x. Centred channels
   (pan = 128) split evenly regardless of separation.
 
@@ -298,8 +323,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- fix mix-bus headroom calibration vs libmodplug oracle
-- re-tune Amiga LED filter + pan separation to match openmpt reference
+- fix mix-bus headroom calibration vs trace-reference-impl oracle
+- re-tune Amiga LED filter + pan separation to match reference
 - pin 2-pole filter + per-trigger ramp on rhmst.mod fixture
 - configurable pan separation + 2-pole Amiga output filter
 - fix EE pattern-delay note-retrigger + add real-world harness

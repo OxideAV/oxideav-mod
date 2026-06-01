@@ -763,9 +763,9 @@ impl PlayerState {
     /// past the resampler, which is the only PT-faithful purpose
     /// it serves at modern output rates).
     ///
-    /// Documentation references: `paula-filter-notes.md`,
-    /// `docs/audio/trackers/mod/openmpt-module-formats.html`
-    /// (Resampling).
+    /// Documentation references: `paula-filter-notes.md` and the
+    /// in-tree wiki snapshot under `docs/audio/trackers/mod/`
+    /// (Resampling section).
     pub const FIXED_RC_CUTOFF_HZ: f32 = 16_000.0;
 
     /// Cutoff of the LED-controlled second RC stage (the one
@@ -1274,8 +1274,8 @@ impl PlayerState {
         // splits evenly regardless of separation. This collapses to
         // the pre-r75 hard-LRRL formula whenever `ch.pan` is 0 or
         // 255 (which is the LRRL default initialised by `new`), so
-        // the libmodplug calibration in the divisor below still
-        // holds bit-for-bit.
+        // the black-box reference-render calibration in the divisor
+        // below still holds bit-for-bit.
         for (i, ch) in self.channels.iter_mut().enumerate() {
             let vib = Self::vibrato_offset(ch);
             let trem = Self::tremolo_offset(ch);
@@ -1287,23 +1287,25 @@ impl PlayerState {
         }
         // Mix-bus headroom divisor.
         //
-        // Round 19 calibration vs libmodplug 0.8.9.0 (used as a
-        // black-box behaviour oracle through the public C API in
-        // `tests/libmodplug_compare.rs` — see that file's header for
-        // the dlopen flow + clean-config protocol). With every
-        // libmodplug colouration disabled (oversampling, megabass,
-        // surround, noise reduction off; LINEAR resampling; 44100 Hz
-        // / 16-bit / stereo; master volume default 128/512;
-        // stereo_separation 128/256 = 50 %), a single max-volume
-        // hard-left channel triggered on a 4-channel `M.K.` MOD lands
-        // libmodplug's L peak at 8500 / 32767 = 0.2594 — which only
-        // works out arithmetically if libmodplug's per-channel
-        // headroom divisor is **3**, not the **2** we previously
-        // used. The pan formula itself (near = (1+s)/2,
-        // far = (1-s)/2) matches across the two engines bit-exact;
-        // only the headroom divisor differs.
+        // Round 19 calibration against a trace reference impl (a
+        // pure black-box runtime-loaded reference renderer driven
+        // through its published C entry-points by
+        // `tests/tracker_reference_compare.rs` — see that file's
+        // header for the dlopen flow + clean-config protocol).
+        // With every audio-shaping colouration disabled on the
+        // reference (oversampling, bass-boost, surround, noise
+        // reduction off; LINEAR resampling; 44100 Hz / 16-bit /
+        // stereo; master volume default 128/512; stereo_separation
+        // 128/256 = 50 %), a single max-volume hard-left channel
+        // triggered on a 4-channel `M.K.` MOD lands the reference
+        // L peak at 8500 / 32767 = 0.2594 — which only works out
+        // arithmetically if the reference's per-channel headroom
+        // divisor is **3**, not the **2** we previously used. The
+        // pan formula itself (near = (1+s)/2, far = (1-s)/2)
+        // matches across the two engines bit-exact; only the
+        // headroom divisor differs.
         //
-        // Empirically the libmodplug formula is `n_ch/2 + 1` — i.e.
+        // Empirically the reference formula is `n_ch/2 + 1` — i.e.
         // 3 for 4-ch, 4 for 6-ch, 5 for 8-ch, etc. That gives a
         // ~1.5× lower per-channel max gain than the strict `n_ch/2`
         // headroom we shipped before, so a single channel never
@@ -1311,15 +1313,15 @@ impl PlayerState {
         // (which the user-reported "scrambled audio at 4.5s" hunt
         // bracketed as the most-likely cause of downstream-clipping
         // perceived as scrambling on real-world MODs `halluc.mod`
-        // and `rhmst.mod`). The peak ratio measured against
-        // libmodplug drops from 1.506× to roughly 1.0× after this
-        // change — confirmed by the `libmodplug_calibration_*` test
-        // in `tests/libmodplug_compare.rs`.
+        // and `rhmst.mod`). The peak ratio measured against the
+        // reference drops from 1.506× to roughly 1.0× after this
+        // change — confirmed by the `tracker_reference_calibration_*`
+        // test in `tests/tracker_reference_compare.rs`.
         //
-        // We don't read libmodplug source; the divisor is derived
-        // purely from black-box measurement of the public-API
-        // output PCM at known input parameters. See
-        // `docs/audio/trackers/mod/openmpt-module-formats.html`
+        // No reference source code is read; the divisor is derived
+        // purely from black-box measurement of the published-API
+        // output PCM at known input parameters. See the in-tree
+        // wiki snapshot under `docs/audio/trackers/mod/`
         // ("Resampling and mixing") which documents the same
         // "channel count + safety margin" pattern as the modern
         // ProTracker rendering convention — though no third-party
@@ -3827,7 +3829,7 @@ pub mod tests {
 
     /// `pan_gains` must collapse to the pre-r75 hard-pan formula at the
     /// LRRL endpoints (pan = 0 or 255) for any `s` — that's the
-    /// invariant that keeps the libmodplug calibration in
+    /// invariant that keeps the trace-reference-impl calibration in
     /// `sample_all_channels` valid bit-for-bit on MODs that don't use
     /// 8xx / E8x. The centre (pan = 128) must split evenly regardless
     /// of `s`; that's the property that lets per-channel pan coexist
