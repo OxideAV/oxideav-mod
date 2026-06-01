@@ -36,9 +36,9 @@ pub fn register(reg: &mut ContainerRegistry) {
 
     // FastTracker 2 (.xm) registration — single-packet demuxer guarded
     // by the 17-byte "Extended Module: " banner probe. The codec id is
-    // a parsing-only stub today (see `make_xm_stub_decoder` in the
-    // decoder module); callers drive playback off the `xm::parse_*`
-    // helpers directly.
+    // wired to a full playback decoder (`make_xm_decoder` in the
+    // decoder module); structural-only callers can still drive the
+    // `xm::parse_*` helpers directly off the demuxed packet payload.
     reg.register_demuxer("xm", open_xm);
     reg.register_extension("xm", "xm");
     reg.register_probe("xm", probe_xm);

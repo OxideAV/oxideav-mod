@@ -1,20 +1,20 @@
-//! End-to-end smoke test for FastTracker 2 (`.xm`) structural support.
+//! End-to-end smoke test for FastTracker 2 (`.xm`) container + decoder.
 //!
 //! Exercises:
 //!
 //! - `probe_xm` via the container registry: the 17-byte
 //!   `"Extended Module: "` banner must dominate the STM and MOD probes.
 //! - `open_xm` → demuxer metadata + single-packet emission.
-//! - The stub XM decoder: parses/validates, then returns `unsupported`
-//!   rather than silent zeros (matches the STM decoder contract).
+//! - The XM playback decoder: parses/validates the packet, drives
+//!   `XmPlayerState`, and emits interleaved S16 stereo `AudioFrame`s.
 //! - `xm::parse_header` / `parse_patterns` / `parse_instruments` /
 //!   `extract_sample_bodies` on the packet payload emitted by the
-//!   demuxer — the route structural callers use today.
+//!   demuxer — the route structural-only callers use.
 
 use std::io::Cursor;
 
 use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
     container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, xm, CODEC_ID_XM_STR,
@@ -183,7 +183,13 @@ fn open_xm_populates_metadata_and_emits_one_packet() {
 }
 
 #[test]
-fn xm_decoder_rejects_with_unsupported_but_is_constructible() {
+fn xm_decoder_drains_audio_frames_off_minimal_packet() {
+    // The codec id "xm" is now wired to a full playback decoder. After
+    // send_packet the registry decoder must yield interleaved S16
+    // stereo AudioFrames until the song ends; this test pins the
+    // contract by draining all frames and asserting the plane width
+    // equals 4 × samples (S16 stereo = 4 bytes per audio frame) and
+    // that we get a non-zero number of output samples.
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_XM_STR));
@@ -193,15 +199,29 @@ fn xm_decoder_rejects_with_unsupported_but_is_constructible() {
 
     let bytes = build_minimal_xm();
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
-    match dec.send_packet(&pkt) {
-        Err(Error::Unsupported(msg)) => {
-            assert!(
-                msg.contains("XM"),
-                "error message should mention XM, got: {msg}"
-            );
+    dec.send_packet(&pkt).expect("send_packet accepts XM");
+
+    let mut total_samples = 0u64;
+    for _ in 0..200 {
+        match dec.receive_frame() {
+            Ok(Frame::Audio(a)) => {
+                total_samples += a.samples as u64;
+                assert_eq!(a.data.len(), 1, "interleaved output: one plane");
+                assert_eq!(
+                    a.data[0].len(),
+                    a.samples as usize * 4,
+                    "S16 stereo: 4 bytes per sample"
+                );
+            }
+            Ok(_) => unreachable!("XM emits audio only"),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected decode error: {e:?}"),
         }
-        other => panic!("expected Unsupported on send_packet, got {other:?}"),
     }
+    assert!(
+        total_samples > 0,
+        "expected at least one audio frame, got 0"
+    );
 }
 
 #[test]

@@ -53,19 +53,23 @@
 //!   effect-param, each optional per mask byte), and the instrument
 //!   table (per-note sample mapping, volume + panning envelopes, vibrato
 //!   state, fadeout, multiple samples per instrument with delta-encoded
-//!   8- or 16-bit PCM bodies). A minimum XM playback engine is wired via
-//!   the shared [`mixer::MixerVoice`] core and [`mixer::XmPitch`] pitch
-//!   model (both Amiga and Linear frequency tables supported); drive it
-//!   via [`xm_player::XmPlayerState::render`]. Volume + panning envelopes
-//!   (tick-based linear interpolation with sustain-point hold and
-//!   loop-start/loop-end looping), fadeout (on key-off / note 97), and
-//!   key-off events are supported. Vibrato, tone portamento, and the
-//!   bulk of the Bxy/Dxy/Exy/Fxy/Kxy/Lxy effect space remain
-//!   unimplemented. The codec id [`CODEC_ID_XM_STR`] = `"xm"` remains
-//!   a parsing-only decoder pending effect-set completeness — use
-//!   [`xm::parse_header`] / [`xm::parse_patterns`] / [`xm::parse_instruments`]
-//!   / [`xm::extract_sample_bodies`] for structural access, or drive
-//!   `XmPlayerState` directly for PCM output.
+//!   8- or 16-bit PCM bodies). The associated codec id
+//!   [`CODEC_ID_XM_STR`] = `"xm"` is a **full playback decoder**: it
+//!   parses the whole-file packet, builds an
+//!   [`xm_player::XmPlayerState`] over the shared [`mixer::MixerVoice`]
+//!   core and [`mixer::XmPitch`] pitch model (both Amiga and Linear
+//!   frequency tables supported), and emits interleaved `S16` stereo
+//!   PCM at the same output rate as the MOD and STM decoders. Volume +
+//!   panning envelopes (tick-based linear interpolation with
+//!   sustain-point hold and loop-start/loop-end looping), fadeout (on
+//!   key-off / note 97), key-off events, every FT2 standard effect
+//!   listed in `docs/audio/trackers/xm/FT2-effects-list.txt`, the
+//!   eleven volume-column kinds, and the instrument auto-vibrato
+//!   waveform-shape + don't-retrigger flag are honoured by the
+//!   playback engine. Callers that need structural-only access can
+//!   still reach for [`xm::parse_header`] / [`xm::parse_patterns`] /
+//!   [`xm::parse_instruments`] / [`xm::extract_sample_bodies`]
+//!   directly.
 //!
 //! The tracker convention of exposing per-channel streams alongside a
 //! mixed stereo mix is shared across tracker formats — see
@@ -97,7 +101,7 @@ pub const CODEC_ID_PLANAR_STR: &str = "mod_planar";
 /// Codec id for the STM (Scream Tracker v1) parsing-only decoder.
 pub const CODEC_ID_STM_STR: &str = "stm";
 
-/// Codec id for the XM (FastTracker 2 Extended Module) parsing-only decoder.
+/// Codec id for the XM (FastTracker 2 Extended Module) playback decoder.
 pub const CODEC_ID_XM_STR: &str = "xm";
 
 pub fn register_codecs(reg: &mut CodecRegistry) {

@@ -25,6 +25,7 @@ use crate::header::parse_header;
 use crate::player::{parse_patterns, PlayerState};
 use crate::samples::extract_samples;
 use crate::stm_player::StmPlayerState;
+use crate::xm_player::XmPlayerState;
 
 pub fn register(reg: &mut CodecRegistry) {
     let mixed_caps = CodecCapabilities::audio("mod_sw")
@@ -66,12 +67,11 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_stm_decoder),
     );
 
-    // XM — parsing-only decoder. Same rationale as STM: playback
-    // requires a broader pitch/envelope model than the MOD mixer, so
-    // the decoder validates the packet then returns an explicit
-    // `unsupported` error. Callers use `oxideav_mod::xm::parse_header`
-    // / `parse_patterns` / `parse_instruments` / `extract_sample_bodies`
-    // directly on the packet payload.
+    // XM — full playback decoder. Drives `XmPlayerState` over the
+    // FastTracker 2 pattern engine (Amiga + Linear pitch tables,
+    // volume/panning envelopes, fadeout, key-off, and the effect
+    // surface listed in the crate README) and emits interleaved S16
+    // stereo at OUTPUT_SAMPLE_RATE, matching the MOD/STM decoder shape.
     let xm_caps = CodecCapabilities::audio("xm_sw")
         .with_lossy(false)
         .with_lossless(true)
@@ -81,7 +81,7 @@ pub fn register(reg: &mut CodecRegistry) {
     reg.register(
         CodecInfo::new(CodecId::new(crate::CODEC_ID_XM_STR))
             .capabilities(xm_caps)
-            .decoder(make_xm_stub_decoder),
+            .decoder(make_xm_decoder),
     );
 }
 
@@ -106,48 +106,95 @@ fn make_stm_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-fn make_xm_stub_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(XmStubDecoder {
+fn make_xm_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(XmDecoder {
         codec_id: CodecId::new(crate::CODEC_ID_XM_STR),
+        state: XmDecoderState::AwaitingPacket,
     }))
 }
 
-/// Stub XM decoder: like `StmStubDecoder`, validates the packet as an
-/// XM file but returns `unsupported` from `send_packet`. XM playback
-/// needs an envelope-capable mixer that supports linear + Amiga pitch
-/// tables, per-instrument volume/pan envelopes, vibrato/fadeout, etc.
-/// Until that lands, structural consumers use
-/// `crate::xm::parse_header` / `parse_patterns` / `parse_instruments`
-/// / `extract_sample_bodies` on the packet payload directly.
-struct XmStubDecoder {
+/// XM (FastTracker 2 Extended Module) decoder. Consumes the whole-file
+/// packet from the XM container, parses the header / patterns /
+/// instruments / sample bodies, and drives an [`XmPlayerState`] forward,
+/// emitting interleaved S16 stereo PCM at [`OUTPUT_SAMPLE_RATE`] until
+/// the song ends. Mirrors the [`ModDecoder`] and [`StmDecoder`] shapes
+/// so callers can drive XM through the codec pipeline identically to
+/// MOD and STM.
+struct XmDecoder {
     codec_id: CodecId,
+    state: XmDecoderState,
 }
 
-impl Decoder for XmStubDecoder {
+enum XmDecoderState {
+    /// Haven't seen the file yet.
+    AwaitingPacket,
+    /// File parsed; the player is driving the mixer.
+    Playing {
+        player: Box<XmPlayerState>,
+        emit_pts: i64,
+    },
+    /// All samples produced.
+    Done,
+}
+
+impl Decoder for XmDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if !matches!(self.state, XmDecoderState::AwaitingPacket) {
+            return Err(Error::other(
+                "XM decoder received a second packet; only one is expected per song",
+            ));
+        }
+        // Light validation so an `invalid` error is returned for blobs
+        // that don't look like XM (rather than crashing parse_header on
+        // an arbitrary buffer).
         if !crate::xm::is_xm(&packet.data) {
             return Err(Error::invalid(
                 "XM: packet does not start with the 'Extended Module: ' banner",
             ));
         }
-        // Perform a structural sanity parse; surface parse errors as
-        // `invalid` rather than `unsupported` so callers can distinguish
-        // "malformed file" from "playback intentionally not wired".
-        crate::xm::parse_header(&packet.data)?;
-        Err(Error::unsupported(
-            "XM playback is not yet wired through the MOD mixer; use \
-             oxideav_mod::xm::parse_header() / parse_patterns() / \
-             parse_instruments() / extract_sample_bodies() directly for \
-             structural access",
-        ))
+        let header = crate::xm::parse_header(&packet.data)?;
+        let (patterns, after_patterns) = crate::xm::parse_patterns(&header, &packet.data)?;
+        let mut instruments = crate::xm::parse_instruments(&header, &packet.data, after_patterns)?;
+        crate::xm::extract_sample_bodies(&mut instruments, &packet.data);
+        let player = XmPlayerState::new(&header, instruments, patterns, OUTPUT_SAMPLE_RATE);
+        self.state = XmDecoderState::Playing {
+            player: Box::new(player),
+            emit_pts: 0,
+        };
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        Err(Error::Eof)
+        match &mut self.state {
+            XmDecoderState::AwaitingPacket => Err(Error::NeedMore),
+            XmDecoderState::Done => Err(Error::Eof),
+            XmDecoderState::Playing { player, emit_pts } => {
+                let mut pcm = vec![0i16; CHUNK_FRAMES as usize * 2];
+                let produced = player.render(&mut pcm);
+                if produced == 0 {
+                    self.state = XmDecoderState::Done;
+                    return Err(Error::Eof);
+                }
+                pcm.truncate(produced * 2);
+
+                let mut bytes = Vec::with_capacity(pcm.len() * 2);
+                for s in &pcm {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+
+                let pts = *emit_pts;
+                *emit_pts += produced as i64;
+                Ok(Frame::Audio(AudioFrame {
+                    samples: produced as u32,
+                    pts: Some(pts),
+                    data: vec![bytes],
+                }))
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -155,6 +202,11 @@ impl Decoder for XmStubDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
+        // Drop the entire XmPlayerState (order cursor, per-channel pitch
+        // / envelope / vibrato / fadeout state, tick counter, global
+        // volume) so a fresh `send_packet` restarts the song from the
+        // top.
+        self.state = XmDecoderState::AwaitingPacket;
         Ok(())
     }
 }
@@ -590,6 +642,110 @@ mod tests {
             Err(Error::InvalidData(_)) => {}
             other => panic!("expected InvalidData on non-STM blob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn xm_decoder_rejects_non_xm_blob_as_invalid() {
+        // The light is_xm validation must still reject non-XM payloads
+        // with `invalid` rather than panicking parse_header.
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_XM_STR));
+        let mut dec = make_xm_decoder(&params).unwrap();
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            vec![0u8; crate::xm::XM_MIN_HEADER_LEN],
+        );
+        match dec.send_packet(&pkt) {
+            Err(Error::InvalidData(_)) => {}
+            other => panic!("expected InvalidData on non-XM blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xm_decoder_rejects_second_packet() {
+        // Once a packet is accepted the decoder is committed to that
+        // song; sending another packet without `reset()` must be an
+        // explicit error rather than silently replacing the player.
+        let bytes = crate::xm_player::tests::build_ping_xm();
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_XM_STR));
+        let mut dec = make_xm_decoder(&params).unwrap();
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            bytes.clone(),
+        );
+        dec.send_packet(&pkt).unwrap();
+        match dec.send_packet(&pkt) {
+            Err(Error::Other(_)) => {}
+            other => panic!("expected Other on duplicate send_packet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xm_decoder_reset_allows_resend() {
+        // After draining or mid-playback, `reset()` must drop the player
+        // and let a fresh `send_packet` start the song again.
+        let bytes = crate::xm_player::tests::build_ping_xm();
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_XM_STR));
+        let mut dec = make_xm_decoder(&params).unwrap();
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            bytes.clone(),
+        );
+        dec.send_packet(&pkt).unwrap();
+        let _ = dec.receive_frame();
+        dec.reset().unwrap();
+        dec.send_packet(&pkt).expect("reset clears the state");
+    }
+
+    #[test]
+    fn xm_decoder_emits_nonsilent_pcm() {
+        // The XM `build_ping_xm` fixture places a C-5 / instrument 1
+        // note-on on row 0 / channel 0 with a non-zero PCM body, so the
+        // very first frames out of the codec pipeline should carry
+        // audible non-zero PCM. This exercises the XmDecoder path end
+        // to end: send_packet (parse + XmPlayerState construction) →
+        // receive_frame (interleaved S16 stereo emission) → Eof
+        // draining.
+        let bytes = crate::xm_player::tests::build_ping_xm();
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_XM_STR));
+        let mut dec = make_xm_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
+        dec.send_packet(&pkt).unwrap();
+
+        let mut total_samples = 0u64;
+        let mut total_nonzero = 0u64;
+        for _ in 0..200 {
+            match dec.receive_frame() {
+                Ok(Frame::Audio(a)) => {
+                    total_samples += a.samples as u64;
+                    let plane = &a.data[0];
+                    assert_eq!(
+                        plane.len(),
+                        a.samples as usize * 4,
+                        "S16 stereo: 4 bytes per sample"
+                    );
+                    for chunk in plane.chunks_exact(2) {
+                        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        if s != 0 {
+                            total_nonzero += 1;
+                        }
+                    }
+                }
+                Ok(_) => unreachable!("XM emits audio only"),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected decode error: {e:?}"),
+            }
+        }
+        assert!(
+            total_samples > 1000,
+            "expected substantial sample output, got {total_samples}"
+        );
+        assert!(
+            total_nonzero > 100,
+            "expected non-silent PCM, got {total_nonzero} non-zero samples"
+        );
     }
 
     #[test]

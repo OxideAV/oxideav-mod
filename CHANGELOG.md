@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **XM codec id is now a full playback decoder** — `CODEC_ID_XM_STR`
+  = `"xm"` no longer returns `unsupported` on `send_packet`. The new
+  `XmDecoder` consumes the whole-file packet from the `xm` container,
+  parses the header / patterns / instruments / delta-encoded sample
+  bodies, builds an `XmPlayerState` over the shared `MixerVoice` core
+  + `XmPitch` pitch model (both Amiga and Linear frequency tables
+  supported), and emits interleaved S16 stereo `AudioFrame`s at
+  `OUTPUT_SAMPLE_RATE` until the song ends — mirroring the `ModDecoder`
+  and `StmDecoder` shape so a generic player can swap between `"mod"`,
+  `"stm"`, and `"xm"` without reshaping its audio pipeline. The
+  `is_xm` light validation still rejects non-XM payloads with
+  `InvalidData` rather than panicking `parse_header` on arbitrary
+  bytes; `reset()` drops the player so a subsequent `send_packet`
+  restarts the song from the top. Four new unit tests in
+  `decoder::tests` pin the contract: non-silent PCM out of the new
+  `build_ping_xm` fixture, `InvalidData` on a zero blob, `Other` on a
+  duplicate `send_packet` without `reset()`, and reset-then-resend
+  acceptance. The `xm_smoke` integration test that previously
+  asserted `Err(Unsupported)` is rewritten to drain audio frames and
+  assert the interleaved S16 stereo plane width. Effect coverage is
+  unchanged — every FT2 standard effect listed in the
+  `docs/audio/trackers/xm/FT2-effects-list.txt` table plus the eleven
+  volume-column kinds plus the instrument auto-vibrato waveform-shape
+  + don't-retrigger flag was already implemented in `XmPlayerState`;
+  this change simply removes the stub gate that was hiding the engine
+  from registry consumers.
+
 - **STM codec id is now a full playback decoder** — `CODEC_ID_STM_STR`
   = `"stm"` no longer returns `unsupported` on `send_packet`. The new
   `StmDecoder` consumes the whole-file packet from the `stm` container,

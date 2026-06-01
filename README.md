@@ -177,10 +177,15 @@ a unit test in `src/player.rs`):
 
 ## FastTracker 2 (.xm) playback coverage
 
-`oxideav-mod` also ships an XM (FastTracker 2 Extended Module) playback
-engine (`xm_player::XmPlayerState`). The XM codec id is parsing-only at
-the registry level pending a few corner-case quirks, but the engine
-itself drives audio for every FT2 standard effect listed in
+`oxideav-mod` also drives an XM (FastTracker 2 Extended Module) playback
+engine (`xm_player::XmPlayerState`), now wired through the codec
+registry as codec id `"xm"`. The decoder accepts the whole-file packet
+emitted by the `xm` container, parses the header / patterns /
+instruments / delta-encoded sample bodies, and emits interleaved S16
+stereo PCM at 44.1 kHz — the same output shape as the `"mod"` and
+`"stm"` codec ids, so a generic player can swap between MOD, STM, and
+XM without reshaping its audio pipeline. The engine drives audio for
+every FT2 standard effect listed in
 [`docs/audio/trackers/xm/FT2-effects-list.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/xm)
 plus the eleven volume-column kinds. Recent rounds closed the surviving
 "captured but not honoured" items:

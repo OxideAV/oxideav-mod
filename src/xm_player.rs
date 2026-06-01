@@ -1772,9 +1772,9 @@ fn _loop_mode_unused(m: XmSampleLoopMode) -> XmSampleLoopMode {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
-    use crate::xm::XmEnvelope;
+    use crate::xm::{self, XmEnvelope};
 
     fn env_with_points(points: Vec<(u16, u16)>, type_bits: u8) -> XmEnvelope {
         XmEnvelope {
@@ -2320,5 +2320,131 @@ mod tests {
             st.channels[0].auto_vib_pos, 0,
             "rate=0 must skip the autovib block (no phase advance)"
         );
+    }
+
+    /// Build a tiny XM file with a single note-on on row 0, channel 0
+    /// against a 256-frame looped sine instrument. Designed so the
+    /// [`XmDecoder`](crate::decoder) round-trip emits audible non-zero
+    /// PCM on the very first frame batch.
+    ///
+    /// Header layout follows `tests/xm_smoke.rs::build_minimal_xm` (a
+    /// single 4-row pattern with a single packed cell) but the sample
+    /// body is a 256-frame sine — the same shape used by
+    /// `tests/xm_effects_round19.rs::build_xm` — so the rendered tick
+    /// produces audible PCM rather than the near-silent 4-sample ramp
+    /// the smoke-test fixture carries.
+    pub fn build_ping_xm() -> Vec<u8> {
+        let mut out = vec![0u8; xm::XM_MIN_HEADER_LEN];
+        out[0..17].copy_from_slice(xm::XM_BANNER);
+        out[17..37].copy_from_slice(b"ping-xm             ");
+        out[xm::XM_ID_BYTE_OFFSET] = 0x1A;
+        out[38..58].copy_from_slice(b"oxideav             ");
+        out[58..60].copy_from_slice(&xm::XM_VERSION_0104.to_le_bytes());
+        out[60..64].copy_from_slice(&0x114u32.to_le_bytes());
+        out[64..66].copy_from_slice(&1u16.to_le_bytes()); // song_length
+        out[66..68].copy_from_slice(&0u16.to_le_bytes()); // restart
+        out[68..70].copy_from_slice(&4u16.to_le_bytes()); // num_channels
+        out[70..72].copy_from_slice(&1u16.to_le_bytes()); // num_patterns
+        out[72..74].copy_from_slice(&1u16.to_le_bytes()); // num_instruments
+        out[74..76].copy_from_slice(&1u16.to_le_bytes()); // flags: linear
+        out[76..78].copy_from_slice(&6u16.to_le_bytes()); // tempo
+        out[78..80].copy_from_slice(&125u16.to_le_bytes()); // bpm
+        for i in 1..xm::XM_ORDER_TABLE_SIZE {
+            out[xm::XM_ORDER_TABLE_OFFSET + i] = 0xFF;
+        }
+
+        // Pattern #0: 4 rows × 4 channels. Row 0 / channel 0 carries
+        // note + instrument + volume (mask 0x07).
+        let mut packed: Vec<u8> = Vec::new();
+        for row in 0..4usize {
+            for ch in 0..4usize {
+                if row == 0 && ch == 0 {
+                    packed.push(0x80 | 0x01 | 0x02 | 0x04); // note + inst + vol
+                    packed.push(49); // note (C-4 in FT2's 1-based note table)
+                    packed.push(1); // instrument
+                    packed.push(0x50); // vol col SetVolume(0x40)
+                } else {
+                    packed.push(0x80); // empty
+                }
+            }
+        }
+        out.extend_from_slice(&9u32.to_le_bytes()); // pattern header length
+        out.push(0); // packing type
+        out.extend_from_slice(&4u16.to_le_bytes()); // 4 rows
+        out.extend_from_slice(&(packed.len() as u16).to_le_bytes());
+        out.extend(packed);
+
+        // Instrument #0 — one 8-bit sample, 256-frame sine body looped.
+        const HSIZE: u32 = 0x107;
+        let inst_start = out.len();
+        out.extend_from_slice(&HSIZE.to_le_bytes());
+        let mut nbuf = [0u8; 22];
+        nbuf[..3].copy_from_slice(b"sin");
+        out.extend_from_slice(&nbuf);
+        out.push(0); // instrument type
+        out.extend_from_slice(&1u16.to_le_bytes()); // num_samples = 1
+
+        out.extend_from_slice(&xm::XM_SAMPLE_HEADER_SIZE.to_le_bytes());
+        out.extend(vec![0u8; 96]); // sample_map
+
+        // Flat "always 64" volume envelope so output volume == channel
+        // volume × global × tremolo (no envelope ramp colouring of the
+        // first-frame audibility check).
+        let mut vol_env = [0u8; 48];
+        vol_env[0..2].copy_from_slice(&0u16.to_le_bytes());
+        vol_env[2..4].copy_from_slice(&64u16.to_le_bytes());
+        vol_env[4..6].copy_from_slice(&64u16.to_le_bytes());
+        vol_env[6..8].copy_from_slice(&64u16.to_le_bytes());
+        out.extend_from_slice(&vol_env);
+        out.extend_from_slice(&[0u8; 48]); // panning envelope
+        out.push(2); // num_vol_points
+        out.push(0); // num_pan_points
+        out.push(0); // vol sustain
+        out.push(0); // vol loop start
+        out.push(0); // vol loop end
+        out.push(0); // pan sustain
+        out.push(0); // pan loop start
+        out.push(0); // pan loop end
+        out.push(0x01); // vol type: On
+        out.push(0); // pan type
+        out.push(0); // vibrato type
+        out.push(0); // vibrato sweep
+        out.push(0); // vibrato depth
+        out.push(0); // vibrato rate
+        out.extend_from_slice(&0u16.to_le_bytes()); // fadeout
+        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        while out.len() - inst_start < HSIZE as usize {
+            out.push(0); // pad to HSIZE
+        }
+
+        // Sample header + 256-frame sine body, delta-encoded.
+        let n = 256usize;
+        let mut abs_pcm = vec![0i8; n];
+        for (i, slot) in abs_pcm.iter_mut().enumerate() {
+            let t = (i as f32) / (n as f32);
+            *slot = (96.0 * (2.0 * std::f32::consts::PI * t).sin()) as i8;
+        }
+        let mut delta = Vec::with_capacity(n);
+        let mut prev: i8 = 0;
+        for v in &abs_pcm {
+            delta.push(v.wrapping_sub(prev) as u8);
+            prev = *v;
+        }
+        let body_len = delta.len() as u32;
+        out.extend_from_slice(&body_len.to_le_bytes()); // length
+        out.extend_from_slice(&0u32.to_le_bytes()); // loop_start
+        out.extend_from_slice(&body_len.to_le_bytes()); // loop_length
+        out.push(0x40); // volume
+        out.push(0); // finetune
+        out.push(1); // type: 8-bit, forward loop
+        out.push(128); // panning = centre
+        out.push(0); // relative_note
+        out.push(0); // reserved
+        let mut sname = [0u8; 22];
+        sname[..3].copy_from_slice(b"sin");
+        out.extend_from_slice(&sname);
+        out.extend_from_slice(&delta);
+
+        out
     }
 }
