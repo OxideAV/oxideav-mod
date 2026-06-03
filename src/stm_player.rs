@@ -156,6 +156,18 @@ pub struct StmChannel {
     pub pending_volume: u8,
     /// True if the pending note-delay slot is populated.
     pub has_pending_delay: bool,
+
+    // -------- pattern loop (E6x) --------
+    /// Loop-start row recorded by the most recent `E60` on this
+    /// channel. Defaults to row 0 per
+    /// `Protracker-effects-MODFIL12.txt` E6 ("If no start point was
+    /// specified in the current pattern being played, the loop start
+    /// defaults to the first line in the pattern").
+    pub pat_loop_row: u8,
+    /// Remaining loop iterations after the first `E6y` is encountered.
+    /// Tracked per channel so two voices can drive independent loops
+    /// without trampling each other's counters.
+    pub pat_loop_count: u8,
 }
 
 /// STM player — owns decoded patterns / samples and a
@@ -183,6 +195,25 @@ pub struct StmPlayerState {
     /// Pending pattern-break row (Dxy): set on tick 0, consumed by
     /// `next_row`.
     pub pending_break_row: Option<u8>,
+    /// Pending pattern-loop row (`E6x`): when set, `next_row` rewinds
+    /// to this row within the *current* pattern without re-entering
+    /// `enter_row` past the rewind. Per the PT spec the loop runs
+    /// inside one pattern, so the order index is preserved.
+    pub pending_pat_loop_row: Option<u8>,
+
+    /// `EEx` pattern-delay counter: number of additional times the
+    /// current row should be repeated before genuinely advancing.
+    /// Per `Protracker-effects-MODFIL12.txt` EE the row's notes and
+    /// effects must continue undisturbed across the delay slices, so
+    /// the repeat must NOT re-fire `enter_row`. Per-tick effects keep
+    /// running so vibrato / volume slides / arpeggio still animate.
+    pub pattern_delay: u8,
+    /// True while a row is in its EE-induced repeat phase. Suppresses
+    /// `enter_row` re-execution on tick 0 of the repeated pass — see
+    /// the MOD player's identically-named flag for the same reason
+    /// (re-entering would reset `vib_pos`, retrigger held notes, and
+    /// compound fine-volume slides once per delay slice).
+    pub in_pattern_delay_repeat: bool,
 }
 
 impl StmPlayerState {
@@ -216,6 +247,9 @@ impl StmPlayerState {
             global_volume: header.global_volume.max(1),
             pending_order_jump: None,
             pending_break_row: None,
+            pending_pat_loop_row: None,
+            pattern_delay: 0,
+            in_pattern_delay_repeat: false,
         }
     }
 
@@ -369,8 +403,20 @@ impl StmPlayerState {
             apply_tick0_effect(ch);
         }
 
-        // Row-level song-state effects: Bxy / Dxy / Fxx.
-        for ch in self.channels.iter() {
+        // Row-level song-state effects: Bxy / Dxy / Fxx / E6x / EEx.
+        //
+        // E6x (pattern loop) is technically per-channel (it lives in a
+        // channel's row cell) but the *jump target* it schedules is
+        // song-level, so we resolve it in the same pass as Bxy / Dxy.
+        // Per `Protracker-effects-MODFIL12.txt` E6: a non-zero param
+        // schedules a rewind to the channel's previously-recorded
+        // start row, decrementing its iteration counter on each visit.
+        // EEx (pattern delay) writes the player-level `pattern_delay`
+        // counter; the repeat suppression then prevents `enter_row`
+        // from re-firing on the looped pass (see `advance_tick`).
+        let cur_row = self.row;
+        for ch_idx in 0..STM_CHANNELS {
+            let ch = &mut self.channels[ch_idx];
             match ch.effect {
                 0xB => {
                     self.pending_order_jump = Some(ch.effect_param);
@@ -392,6 +438,54 @@ impl StmPlayerState {
                         self.tempo = ch.effect_param;
                     }
                 }
+                0xE => {
+                    let x = ch.effect_param >> 4;
+                    let y = ch.effect_param & 0x0F;
+                    match x {
+                        0x6 => {
+                            // E6x — Pattern loop (per-channel).
+                            //
+                            // y == 0: record the current row as this
+                            //   channel's loop-start.
+                            // y > 0 (first visit): seed the iteration
+                            //   counter with `y` and schedule a rewind
+                            //   to the channel's loop-start.
+                            // y > 0 (subsequent visits): decrement the
+                            //   counter; if still > 0, schedule another
+                            //   rewind; if exhausted, fall through.
+                            //
+                            // Spec source:
+                            // `Protracker-effects-MODFIL12.txt` E6
+                            // ("If yyyy=0 … specifies the loop's start
+                            // point. Otherwise, it specifies the number
+                            // of times to play this line and the
+                            // preceding lines from the start point").
+                            if y == 0 {
+                                ch.pat_loop_row = cur_row;
+                            } else if ch.pat_loop_count == 0 {
+                                ch.pat_loop_count = y;
+                                self.pending_pat_loop_row = Some(ch.pat_loop_row);
+                            } else {
+                                ch.pat_loop_count -= 1;
+                                if ch.pat_loop_count > 0 {
+                                    self.pending_pat_loop_row = Some(ch.pat_loop_row);
+                                }
+                            }
+                        }
+                        0xE => {
+                            // EEx — Pattern delay. Writes the song-level
+                            // `pattern_delay` counter; the row repeats
+                            // that many additional times in `next_row`.
+                            // FT2 / PT semantics honour the last EEx
+                            // encountered on the row (channel order
+                            // does the resolution), so we just
+                            // overwrite — matching the MOD player's
+                            // last-channel-wins behaviour.
+                            self.pattern_delay = y;
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -399,7 +493,17 @@ impl StmPlayerState {
 
     fn advance_tick(&mut self) {
         if self.tick == 0 {
-            self.enter_row();
+            // EE-induced repeat passes must NOT re-enter the row, or
+            // we would retrigger held notes (resetting `voice.pos`) and
+            // re-fire tick-0 effects (compounding fine-volume slides).
+            // Per `Protracker-effects-MODFIL12.txt` EE the original
+            // row's notes and effects continue across the delay, so the
+            // tick-0 channel state is preserved from the first pass.
+            // Per-tick effects still run via the `else` branch on
+            // subsequent ticks of the repeated pass.
+            if !self.in_pattern_delay_repeat {
+                self.enter_row();
+            }
         } else {
             for ch in self.channels.iter_mut() {
                 apply_tickn_effect(ch);
@@ -541,8 +645,30 @@ impl StmPlayerState {
     }
 
     fn next_row(&mut self) {
-        // Consume pending Bxy / Dxy.
+        // EEx pattern-delay repeat. If `pattern_delay > 0`, hold the
+        // current row in place and decrement. The `in_pattern_delay_repeat`
+        // flag is what `advance_tick` reads on the next tick-0 to skip
+        // `enter_row`. Per PT semantics (see the MOD player's identical
+        // handling): EE counts *additional* row repeats, so the first
+        // repeat returns here with delay = original value, and we
+        // exhaust it before any other row-advance logic.
+        if self.pattern_delay > 0 {
+            self.pattern_delay -= 1;
+            self.in_pattern_delay_repeat = true;
+            return;
+        }
+        // Real row advance — clear the repeat flag so the next row's
+        // tick-0 processing runs normally.
+        self.in_pattern_delay_repeat = false;
+
+        // Consume pending Bxy / Dxy first (channel jumps trump E6x in
+        // the rare case of both on the same row — Bxy/Dxy land us in
+        // a different pattern, so the loop start row from the previous
+        // pattern is meaningless after the jump).
         if let Some(order) = self.pending_order_jump.take() {
+            // Clear the pat-loop pending state — a song jump invalidates
+            // the channel-local loop-start (which is per-pattern).
+            self.pending_pat_loop_row = None;
             self.order_index = order as usize;
             self.row = self.pending_break_row.take().unwrap_or(0);
             if self.order_index >= self.order.len() {
@@ -551,11 +677,21 @@ impl StmPlayerState {
             return;
         }
         if let Some(row) = self.pending_break_row.take() {
+            self.pending_pat_loop_row = None;
             self.row = row;
             self.order_index += 1;
             if self.order_index >= self.order.len() {
                 self.ended = true;
             }
+            return;
+        }
+
+        // E6x pattern-loop rewind. Stays in the current pattern; just
+        // rolls the row index back to the recorded start. Per spec the
+        // loop body runs within a single pattern, so the order index
+        // is preserved.
+        if let Some(row) = self.pending_pat_loop_row.take() {
+            self.row = row;
             return;
         }
 
@@ -1014,6 +1150,235 @@ pub mod tests {
                 "tick {tick}: 700 with empty memory must leave volume unmodulated, got {v}"
             );
         }
+    }
+
+    /// Place a no-note effect cell at (row, ch) of pattern 0 by
+    /// patching the existing `build_ping_stm` buffer. Uses note byte
+    /// 253 ("Dots") so no retrigger happens. `cmd` is the 4-bit
+    /// effect command, `param` is the byte parameter.
+    fn poke_effect(bytes: &mut [u8], row: u8, ch: u8, cmd: u8, param: u8) {
+        const PATTERN_OFF: usize = 0x410;
+        const BYTES_PER_ROW: usize = 4 * 4;
+        let off = PATTERN_OFF + (row as usize) * BYTES_PER_ROW + (ch as usize) * 4;
+        bytes[off] = 253;
+        bytes[off + 1] = 0;
+        bytes[off + 2] = cmd & 0x0F;
+        bytes[off + 3] = param;
+    }
+
+    /// Drive the player one full row's worth of ticks at the current
+    /// speed (mirrors the natural `render`-loop tick cadence).
+    fn step_one_row(p: &mut StmPlayerState) {
+        for t in 0..p.speed {
+            p.tick = t;
+            p.advance_tick();
+        }
+        p.tick = 0;
+        p.next_row();
+    }
+
+    #[test]
+    fn e6x_pattern_loop_rewinds_to_recorded_start_row() {
+        // Row 0: note + E60 (record loop start = row 0).
+        // Row 1: empty.
+        // Row 2: E62 (loop 2 extra times back to row 0).
+        // Row 3: empty.
+        //
+        // After visiting row 2 we expect: row 0 → 1 → 2 (rewind) →
+        //  0 → 1 → 2 (rewind) → 0 → 1 → 2 → 3 (exhausted).
+        let mut bytes = build_ping_stm();
+        // E60 on row 0 (sets loop start). Channel 0 already carries
+        // the C-4 trigger; piggy-back the effect bytes there.
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E; // command 0xE
+        bytes[PATTERN_OFF + 3] = 0x60; // sub-effect 6, value 0
+        poke_effect(&mut bytes, 2, 0, 0xE, 0x62);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        let mut visited = Vec::new();
+        for _ in 0..16 {
+            if p.ended {
+                break;
+            }
+            visited.push(p.row);
+            step_one_row(&mut p);
+        }
+        // Expected first 10 rows visited: 0 1 2 0 1 2 0 1 2 3.
+        let want: Vec<u8> = vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 3];
+        assert_eq!(
+            &visited[..want.len()],
+            &want[..],
+            "E6x loop didn't rewind correctly: visited = {visited:?}"
+        );
+    }
+
+    #[test]
+    fn e60_without_followup_does_not_loop() {
+        // E60 alone is just a start-marker; without an E6y (y>0) on
+        // the same channel later in the pattern there is no rewind,
+        // so playback should march straight through.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0x60;
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        let mut visited = Vec::new();
+        for _ in 0..6 {
+            if p.ended {
+                break;
+            }
+            visited.push(p.row);
+            step_one_row(&mut p);
+        }
+        assert_eq!(
+            visited,
+            vec![0u8, 1, 2, 3, 4, 5],
+            "E60 alone must not rewind"
+        );
+    }
+
+    #[test]
+    fn e6x_loop_state_is_per_channel() {
+        // Two channels declare *different* loop starts on the same
+        // pattern. The PT spec attaches the start row + counter to a
+        // channel, so two voices can drive independent loops. We test
+        // the recorded start by triggering channel 1's `E6y` (with
+        // y>0) while channel 0 has no loop-start recorded — the
+        // rewind must land on the row channel 1 set, not row 0.
+        let mut bytes = build_ping_stm();
+        // Channel 1 row 2: E60 (loop start = row 2).
+        poke_effect(&mut bytes, 2, 1, 0xE, 0x60);
+        // Channel 1 row 4: E61 (loop once back to row 2).
+        poke_effect(&mut bytes, 4, 1, 0xE, 0x61);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        let mut visited = Vec::new();
+        for _ in 0..12 {
+            if p.ended {
+                break;
+            }
+            visited.push(p.row);
+            step_one_row(&mut p);
+        }
+        // Rows: 0 1 2 3 4 (rewind to 2) 2 3 4 5 ...
+        assert_eq!(&visited[..9], &[0u8, 1, 2, 3, 4, 2, 3, 4, 5]);
+        // Channel 0 must NOT see a counter — only channel 1's loop ran.
+        assert_eq!(p.channels[0].pat_loop_count, 0);
+    }
+
+    #[test]
+    fn eex_pattern_delay_repeats_row_without_retriggering() {
+        // Row 0: note + EE2 (repeat row 0 two more times).
+        // Row 1: another note.
+        //
+        // The voice triggers exactly once across the three passes of
+        // row 0 — `voice.pos` advances monotonically and never resets.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0xE2; // EE2 = pattern delay 2
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Drive row 0 once (normal pass + 2 EE repeats = 3 row-equivalents).
+        let mut row0_count = 0;
+        for _ in 0..6 {
+            if p.row == 0 {
+                row0_count += 1;
+            } else {
+                break;
+            }
+            let pos_before = p.channels[0].voice.pos;
+            step_one_row(&mut p);
+            let pos_after = p.channels[0].voice.pos;
+            // pos must move forward (no retrigger reset to 0.0).
+            // On the very first row a fresh trigger sets pos = 0.0,
+            // so the *first* pass we accept pos_after > 0. On the
+            // EE-repeat passes pos must be strictly > the prior
+            // pos_after at the start of that pass — no retrigger
+            // would have moved it back.
+            assert!(
+                pos_after >= pos_before,
+                "EE-delay repeat must not retrigger the voice (pos moved {pos_before} → {pos_after})"
+            );
+        }
+        // Original row plus 2 EE-induced repeats = 3 visits.
+        assert_eq!(
+            row0_count, 3,
+            "EE2 must hold row 0 for 3 visits total, got {row0_count}"
+        );
+    }
+
+    #[test]
+    fn eex_zero_param_is_inert() {
+        // EE0 must not stall the row.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0xE0;
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        let mut visited = Vec::new();
+        for _ in 0..4 {
+            if p.ended {
+                break;
+            }
+            visited.push(p.row);
+            step_one_row(&mut p);
+        }
+        assert_eq!(visited, vec![0u8, 1, 2, 3], "EE0 must not delay");
+    }
+
+    #[test]
+    fn eex_and_e6x_compose_predictably() {
+        // Row 0: note + E60 (loop-start).
+        // Row 1: EE1 (delay this row by 1 extra pass).
+        // Row 2: E61 (loop once back to row 0).
+        //
+        // Expected visits: 0 1 1 (EE repeat) 2 (rewind) 0 1 1 2 3 ...
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0x60; // E60
+        poke_effect(&mut bytes, 1, 0, 0xE, 0xE1); // EE1 row 1
+        poke_effect(&mut bytes, 2, 0, 0xE, 0x61); // E61 row 2
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        let mut visited = Vec::new();
+        for _ in 0..14 {
+            if p.ended {
+                break;
+            }
+            visited.push(p.row);
+            step_one_row(&mut p);
+        }
+        // EE repeats hold *this* row in place, so row 1 is visited
+        // twice in a row; then E61 on row 2 rewinds to row 0; after
+        // exhausting the counter we advance past row 2.
+        // Sequence: 0 1 1 2 0 1 1 2 3 ...
+        assert_eq!(
+            &visited[..9],
+            &[0u8, 1, 1, 2, 0, 1, 1, 2, 3],
+            "EE + E6 interaction wrong: {visited:?}"
+        );
     }
 
     #[test]

@@ -258,9 +258,11 @@ so the implemented columns track the ProTracker semantics documented under
 | Dxy | Pattern break (FT2-style decimal landing row) | implemented |
 | Fxx | Speed / tempo split (≤$1F = speed, ≥$20 = tempo) | implemented |
 | E1x / E2x | Fine portamento up / down | implemented |
+| E6x | Pattern loop (per-channel start + count) | implemented |
 | EAx / EBx | Fine volume slide up / down | implemented |
 | ECx | Note cut | implemented |
 | EDx | Note delay | implemented |
+| EEx | Pattern delay (row repeats without retrigger) | implemented |
 
 Pitch effects operate in a fractional **semitone** domain (STM has no
 Amiga periods — pitch is derived from each instrument's C3 Hz), so the
@@ -282,6 +284,25 @@ without phase-bleed. Cited in
 tremolo will be used") and `multimedia-cx-protracker.html` 7xy ("Like
 vibrato, except we modify the output volume … clamped to 0 <= vol <=
 64").
+
+Pattern loop (`E6x`) and pattern delay (`EEx`) round out the structural
+side of the PT extended-command set. `E60` records the current row as
+the channel's loop-start; a later `E6y` (y > 0) seeds an iteration
+counter and schedules a rewind back to the recorded start row inside
+the *same* pattern, decrementing on each visit until exhausted (per
+`Protracker-effects-MODFIL12.txt` E6 — "If yyyy=0 … specifies the
+loop's start point. Otherwise, it specifies the number of times to
+play this line and the preceding lines from the start point"). Loop
+state is per-channel, so two voices can drive independent loops
+without trampling each other's counters. `EEx` stalls `next_row` by
+`y` additional row-equivalents while a `in_pattern_delay_repeat` flag
+suppresses `enter_row` on the looped tick-0 — so held notes don't
+retrigger, tick-0 effects don't re-fire, and fine-volume slides don't
+compound across the delay (per `Protracker-effects-MODFIL12.txt` EE —
+"All notes and effects continue during this delay"). Per-tick effects
+(vibrato, volume slides, arpeggio, tone porta) keep animating
+underneath, which is what gives EE its characteristic
+held-note-with-LFO-still-running texture on real-world rips.
 
 ## Fuzz harness
 

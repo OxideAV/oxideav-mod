@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **STM `E6x` pattern loop + `EEx` pattern delay**
+  (`src/stm_player.rs`). E6x is per-channel: `y=0` records the
+  current row as the channel's loop-start; a later `y>0` seeds an
+  iteration counter and schedules a rewind back to the recorded
+  start row inside the same pattern, decrementing on each visit
+  until exhausted. EEx is song-level: it stalls `next_row` for `y`
+  additional row-equivalents while suppressing `enter_row` on the
+  repeated tick-0 (so held notes don't retrigger, tick-0 effects
+  don't re-fire, and fine-volume slides don't compound). Per-tick
+  effects (vibrato, volume slides, arpeggio, tone porta) keep
+  animating across the delay. Six tests pin the surface:
+  `e6x_pattern_loop_rewinds_to_recorded_start_row`,
+  `e60_without_followup_does_not_loop`,
+  `e6x_loop_state_is_per_channel`,
+  `eex_pattern_delay_repeats_row_without_retriggering`,
+  `eex_zero_param_is_inert`, `eex_and_e6x_compose_predictably`
+  (the last covers the EE-inside-E6 composition). Spec sources:
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+  E6 ("If yyyy=0 … specifies the loop's start point") + EE
+  ("forces a small delay … all notes and effects continue during
+  this delay") — STM declares its effect column as "in ProTracker
+  format" per `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`,
+  so the PT semantics carry across verbatim.
+
 ### Changed
 
 - **Clean-room: paraphrase remaining third-party-renderer narrative
