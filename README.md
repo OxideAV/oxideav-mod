@@ -252,6 +252,7 @@ so the implemented columns track the ProTracker semantics documented under
 | 3xy / 5xy | Tone portamento, with volume slide | implemented |
 | 4xy / 6xy | Vibrato, with volume slide | implemented (XM-shared sine LFO) |
 | 7xy | Tremolo | implemented (independent `trem_pos` register; volume offset clamped to `[0, 64]`; per-nibble memory) |
+| 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk); `900` reuses the latched `xx` per the canonical PT memory reading |
 | Axy | Volume slide | implemented |
 | Bxy | Position jump | implemented |
 | Cxx | Set volume | implemented |

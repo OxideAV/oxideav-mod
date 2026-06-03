@@ -130,6 +130,14 @@ pub struct StmChannel {
     pub vib_depth: u8,
     /// Axy volume-slide parameter memory (shared with 5xy / 6xy).
     pub vol_slide_mem: u8,
+    /// 9xx sample-offset parameter memory. Per the canonical PT reading
+    /// in `Protracker-effects-MODFIL12.txt` 9:Set-sample-offset
+    /// ("9xx has its own memory. 900 plays the sample at
+    /// 9xx_memory*0x100"), a `900` row reuses the last non-zero `xx`
+    /// instead of being inert. The memory persists until a fresh
+    /// non-zero `9xx` overwrites it; a fresh non-zero `9xx` also
+    /// latches the value here so a later `900` continuation reuses it.
+    pub mem_sample_offset: u8,
 
     // -------- tremolo (7xy) state --------
     /// Tremolo sine-table position 0..=63. Walks like `vib_pos` but on
@@ -339,6 +347,16 @@ impl StmPlayerState {
                 0x5 | 0x6 | 0xA if ep != 0 => {
                     ch.vol_slide_mem = ep;
                 }
+                0x9 if ep != 0 => {
+                    // 9xx: latch a fresh non-zero offset parameter so a
+                    // subsequent `900` row can reuse it. The actual
+                    // cursor placement runs in the note-trigger arm
+                    // below, mirroring the MOD player's "offset only
+                    // applies on a note-on" semantics from
+                    // `Protracker-effects-MODFIL12.txt`
+                    // 9:Set-sample-offset.
+                    ch.mem_sample_offset = ep;
+                }
                 _ => {}
             }
 
@@ -369,6 +387,41 @@ impl StmPlayerState {
                                 None => continue,
                             };
                             if let Some(body) = self.samples.get(inst_idx) {
+                                // 9xx: resolve the cursor offset for this
+                                // trigger. A non-zero `xx` was already
+                                // latched into `mem_sample_offset` in the
+                                // memory pass above; a `900` row reuses
+                                // the latched value. The offset is in
+                                // units of 0x100 = 256 bytes per the
+                                // corrected reading in
+                                // `Protracker-effects-MODFIL12.txt`
+                                // 9:Set-sample-offset ("Don't multiply
+                                // by 512. You should multiply by 256").
+                                let offset_frames: u32 = if cell.command == 0x9 {
+                                    (ch.mem_sample_offset as u32) * 0x100
+                                } else {
+                                    0
+                                };
+
+                                // Out-of-range quirk: a 9xx that lands
+                                // at or past the end of the sample body
+                                // plays NO NOTE at all on this channel
+                                // (same line in the spec — "if the
+                                // effect is out of range (e.g. if it
+                                // tries to jump beyond the end of the
+                                // sample) NO NOTE WILL BE PLAYED!").
+                                // The note metadata is still latched so
+                                // subsequent porta / arpeggio anchor to
+                                // the intended pitch.
+                                let sample_len = body.pcm.len();
+                                if cell.command == 0x9 && offset_frames as usize >= sample_len {
+                                    ch.voice.active = false;
+                                    ch.voice.pos = 0.0;
+                                    ch.cur_semis = target;
+                                    ch.porta_target_semis = target;
+                                    continue;
+                                }
+
                                 let pitch = StmC3Pitch {
                                     c3_hz: body.c3_hz as f32,
                                 };
@@ -376,6 +429,12 @@ impl StmPlayerState {
                                 let vol =
                                     (ch.volume as f32 / 64.0) * (self.global_volume as f32 / 64.0);
                                 ch.voice.trigger(freq, vol);
+                                // Apply the 9xx offset after `trigger`
+                                // (which would otherwise reset the
+                                // cursor to 0).
+                                if cell.command == 0x9 {
+                                    ch.voice.pos = offset_frames as f32;
+                                }
                                 ch.cur_semis = target;
                                 ch.porta_target_semis = target;
                                 // Fresh note resets vibrato + tremolo
@@ -1378,6 +1437,213 @@ pub mod tests {
             &visited[..9],
             &[0u8, 1, 1, 2, 0, 1, 1, 2, 3],
             "EE + E6 interaction wrong: {visited:?}"
+        );
+    }
+
+    /// Build a fresh STM with a longer sample body so we can test
+    /// 9xx sample-offset landings both inside and past the sample.
+    /// `pcm_len` chooses the sample size (signed-8-bit values, even
+    /// indices at +100, odd at -100 so any forward-cursor jump lands
+    /// on audible data). `offset_param` is the row-0 9xx parameter.
+    fn build_offset_stm(pcm_len: usize, offset_param: u8) -> Vec<u8> {
+        const HEADER_PREFIX: usize = 0x30;
+        const ORDER_OFF: usize = 0x3D0;
+        const ORDER_SIZE: usize = 64;
+        const PATTERN_OFF: usize = 0x410;
+        const BYTES_PER_PATTERN: usize = 64 * 4 * 4;
+        let n_patterns = 1u8;
+        let mut out = vec![0u8; PATTERN_OFF];
+        out[0..4].copy_from_slice(b"poff");
+        out[0x14..0x1C].copy_from_slice(b"!Scream!");
+        out[0x1C] = 0x1A;
+        out[0x1D] = 2;
+        out[0x1E] = 2;
+        out[0x20] = 0x60;
+        out[0x21] = n_patterns;
+        out[0x22] = 64;
+        let inst_off = HEADER_PREFIX;
+        out[inst_off..inst_off + 3].copy_from_slice(b"snd");
+        out[inst_off + 16..inst_off + 18].copy_from_slice(&(pcm_len as u16).to_le_bytes());
+        out[inst_off + 22] = 64;
+        out[inst_off + 24..inst_off + 26].copy_from_slice(&8363u16.to_le_bytes());
+        for i in 0..ORDER_SIZE {
+            out[ORDER_OFF + i] = if i == 0 { 0 } else { 255 };
+        }
+        // Pattern 0, row 0, ch 0: note C-4, instrument 1, effect 0x9,
+        // param `offset_param`.
+        let mut pattern = vec![0u8; BYTES_PER_PATTERN];
+        pattern[0] = 0x40; // note byte: octave 4, semitone 0
+        pattern[1] = 1 << 3; // instrument 1, vol_lo = 0
+        pattern[2] = 0x09; // vol_hi 0, command 9
+        pattern[3] = offset_param;
+        out.extend(pattern);
+        for i in 0..pcm_len {
+            let v: i8 = if i % 2 == 0 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn nine_xx_starts_sample_at_param_times_0x100() {
+        // 9xx places the playback cursor at `xx * 0x100` bytes (per
+        // `Protracker-effects-MODFIL12.txt` 9:Set-sample-offset, with
+        // the corrected "multiply by 256" note). A 1024-byte sample +
+        // a 9x02 row should land at byte 0x200 = 512.
+        let bytes = build_offset_stm(1024, 0x02);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // enter_row runs at tick 0 of advance_tick.
+        p.tick = 0;
+        p.advance_tick();
+        let pos = p.channels[0].voice.pos;
+        assert!(
+            p.channels[0].voice.active,
+            "9x02 inside-range must still trigger the voice"
+        );
+        // pos is set before the first render_one advances it, so on
+        // the row's tick 0 the cursor sits exactly on the offset.
+        // (subsequent ticks advance by freq/sample_rate per `render`.)
+        assert!(
+            (pos - 512.0).abs() < 1.0,
+            "9x02 must place cursor at 512.0 frames, got {pos}"
+        );
+    }
+
+    #[test]
+    fn nine_xx_param_zero_reuses_memory() {
+        // 9xx with a non-zero param latches the value; a later `900`
+        // continuation must reuse the latched value (per the canonical
+        // "9xx has its own memory. 900 plays the sample at
+        // 9xx_memory*0x100" reading).
+        // Row 0: note + 9x04 → seed memory to 4. (offset 1024)
+        // Row 1: note + 900  → reuse 4. (also 1024)
+        // Use a 1536-byte sample so the 1024-byte landing is in-range.
+        let mut bytes = build_offset_stm(1536, 0x04);
+        // Patch row 1 ch 0 to be note C-4 + instrument 1 + 900.
+        const PATTERN_OFF: usize = 0x410;
+        const BYTES_PER_ROW: usize = 4 * 4;
+        let row1 = PATTERN_OFF + BYTES_PER_ROW;
+        bytes[row1] = 0x40; // C-4
+        bytes[row1 + 1] = 1 << 3; // instrument 1
+        bytes[row1 + 2] = 0x09; // command 9
+        bytes[row1 + 3] = 0x00; // 900 → reuse memory
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Row 0 / tick 0: 9x04 seeds memory to 4 and places cursor at
+        // 0x400 = 1024.
+        p.tick = 0;
+        p.advance_tick();
+        assert_eq!(
+            p.channels[0].mem_sample_offset, 0x04,
+            "9x04 must latch 0x04 into mem_sample_offset"
+        );
+        assert!((p.channels[0].voice.pos - 1024.0).abs() < 1.0);
+
+        // Step through row 0's remaining ticks and the row break.
+        for t in 1..p.speed {
+            p.tick = t;
+            p.advance_tick();
+        }
+        p.tick = 0;
+        p.next_row();
+        // Row 1 / tick 0: 900 should reuse memory (0x04) and place
+        // the cursor at 1024 again.
+        p.tick = 0;
+        p.advance_tick();
+        assert_eq!(p.row, 1);
+        assert_eq!(
+            p.channels[0].mem_sample_offset, 0x04,
+            "900 must NOT overwrite memory with zero"
+        );
+        assert!(
+            (p.channels[0].voice.pos - 1024.0).abs() < 1.0,
+            "900 must reuse the latched 0x04 → 1024 cursor, got {}",
+            p.channels[0].voice.pos
+        );
+    }
+
+    #[test]
+    fn nine_xx_out_of_range_plays_no_note() {
+        // Per the PT spec ("Note that if the effect is out of range
+        // (e.g. if it tries to jump beyond the end of the sample) NO
+        // NOTE WILL BE PLAYED!"), a 9xx whose target lands at or past
+        // the sample end silences the channel rather than letting the
+        // mixer wrap. With a 256-byte sample, a 9x02 → 512-byte offset
+        // is well past the end.
+        let bytes = build_offset_stm(256, 0x02);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        p.tick = 0;
+        p.advance_tick();
+        assert!(
+            !p.channels[0].voice.active,
+            "9xx past sample end must silence the channel"
+        );
+        // The note metadata is still latched (cur_semis at C-4) so a
+        // subsequent porta / arpeggio anchors to the right pitch.
+        assert!(
+            (p.channels[0].cur_semis - 48.0).abs() < 1e-4,
+            "out-of-range 9xx must still latch note pitch, got cur_semis = {}",
+            p.channels[0].cur_semis
+        );
+    }
+
+    #[test]
+    fn nine_xx_at_exact_end_plays_no_note() {
+        // Boundary: offset == sample length must also silence
+        // (the spec says "beyond the end" but the canonical PT
+        // behaviour is to treat == end as the same case — the cursor
+        // at byte N of an N-byte sample reads past the buffer).
+        // 256-byte sample + 9x01 → 256-byte offset.
+        let bytes = build_offset_stm(256, 0x01);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        p.tick = 0;
+        p.advance_tick();
+        assert!(
+            !p.channels[0].voice.active,
+            "9xx at exact sample end must silence the channel"
+        );
+    }
+
+    #[test]
+    fn nine_xx_just_inside_end_plays() {
+        // Symmetry check: a 9xx that lands at sample_len - 1 (still
+        // in-range) must NOT silence. 256-byte sample + 9x00 with
+        // memory zeroed = offset 0, which is the "no offset" case but
+        // since param 0 means "reuse memory" and memory starts at 0,
+        // the effective offset is 0. Use a setup where memory has
+        // been pre-loaded: a 512-byte sample + 9x01 lands at offset
+        // 256 with 256 bytes of headroom.
+        let bytes = build_offset_stm(512, 0x01);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        p.tick = 0;
+        p.advance_tick();
+        assert!(
+            p.channels[0].voice.active,
+            "9xx with offset < sample_len must trigger the voice"
+        );
+        assert!(
+            (p.channels[0].voice.pos - 256.0).abs() < 1.0,
+            "9x01 in a 512-byte sample must place cursor at 256, got {}",
+            p.channels[0].voice.pos
         );
     }
 

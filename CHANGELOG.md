@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **STM `9xx` set-sample-offset effect** (`src/stm_player.rs`). On a
+  note-trigger row, `9xx` places the channel's playback cursor at
+  `xx * 0x100` bytes into the sample body. A non-zero `xx` is latched
+  into a per-channel `mem_sample_offset` register so a subsequent
+  `900` row reuses the same offset (per the canonical PT reading in
+  `Protracker-effects-MODFIL12.txt` 9:Set-sample-offset: "9xx has its
+  own memory. 900 plays the sample at 9xx_memory*0x100"). If the
+  resulting offset lands at or past the end of the sample, the
+  channel is silenced rather than letting the mixer wrap the cursor
+  (the spec's "if the effect is out of range … NO NOTE WILL BE
+  PLAYED!" quirk). The note's pitch metadata still latches so a
+  follow-up tone-porta / arpeggio row anchors to the intended
+  semitone. STM declares its effect column as "in ProTracker format"
+  per `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`, so the PT
+  semantics carry across verbatim. Five tests pin the surface:
+  `nine_xx_starts_sample_at_param_times_0x100` (basic in-range
+  landing), `nine_xx_param_zero_reuses_memory` (900 reuses latched
+  `xx` and does not overwrite memory with zero),
+  `nine_xx_out_of_range_plays_no_note` (offset past sample end
+  silences but still latches pitch), `nine_xx_at_exact_end_plays_no_note`
+  (boundary == sample_len also silences), and
+  `nine_xx_just_inside_end_plays` (offset < sample_len still
+  triggers, cursor lands exactly on the requested frame).
+
 - **STM `E6x` pattern loop + `EEx` pattern delay**
   (`src/stm_player.rs`). E6x is per-channel: `y=0` records the
   current row as the channel's loop-start; a later `y>0` seeds an
