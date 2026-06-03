@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **STM `E9x` retrigger-note effect** (`src/stm_player.rs`). On each row
+  entry the `E9y` cell latches `y` as the per-channel retrigger period;
+  the per-tick handler in `advance_tick` then rewinds the active voice's
+  sample cursor to `0.0` (and resets the vibrato + tremolo LFO phases)
+  whenever the current tick is a non-zero multiple of `retrig_ticks`.
+  Tick 0 is the row's initial note-on so the modulo schedule starts from
+  tick 1; `E90` (explicit zero period) is documented as the inert /
+  no-op selection and leaves the cursor alone. The schedule is gated on
+  `voice.active`, so a silenced channel isn't resurrected by a residual
+  retrig schedule. The period register is row-scoped: row entry zeroes
+  `retrig_ticks` before the tick-0 effect handler captures a fresh `E9y`
+  value, so a row without `E9` cannot inherit the previous row's period.
+  Spec source: `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+  E9 ("re-trigger a specified sample at a particular note after yyyy
+  ticks during the line … This effect is used mostly with samples of
+  hi-hats") — STM declares its effect column as "in ProTracker format"
+  per `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`, so the PT
+  semantics carry across verbatim. Five tests pin the surface:
+  `e9x_retrigger_resets_sample_cursor_every_y_ticks` (E91 rewinds on
+  ticks 1 and 2), `e90_does_not_retrigger` (E90 captures period = 0 and
+  performs no rewind), `e9x_only_fires_on_tick_y_multiples` (E93 leaves
+  ticks 1, 2, 4 alone and rewinds tick 3),
+  `e9x_does_not_retrigger_on_inactive_voice` (silenced channel is not
+  resurrected), and `e9x_period_does_not_leak_into_next_row` (a fresh
+  row without E9 clears `retrig_ticks` so no spurious rewind fires).
+
 - **STM `9xx` set-sample-offset effect** (`src/stm_player.rs`). On a
   note-trigger row, `9xx` places the channel's playback cursor at
   `xx * 0x100` bytes into the sample body. A non-zero `xx` is latched

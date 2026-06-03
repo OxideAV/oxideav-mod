@@ -32,7 +32,8 @@
 //!    then values from the most recent prior tremolo will be used"
 //!    rule in `Protracker-effects-MODFIL12.txt` 7:Tremolo).
 //!  - Exy subcommands: E1x / E2x fine porta, EA x / EB x fine volume
-//!    slide, EC x note cut, ED x note delay.
+//!    slide, EC x note cut, ED x note delay, E9x retrig note (replay
+//!    the active sample every `y` ticks within the row).
 //!
 //! STM lacks period representation (pitch is derived from C3 Hz and a
 //! `(octave, semitone)` token), so pitch effects operate in the
@@ -176,6 +177,16 @@ pub struct StmChannel {
     /// Tracked per channel so two voices can drive independent loops
     /// without trampling each other's counters.
     pub pat_loop_count: u8,
+
+    // -------- retrigger (E9x) --------
+    /// `E9x` retrig period in ticks. Captured on row entry from the
+    /// `y` nibble of an `E9y` cell; consumed by the per-tick handler
+    /// which replays the sample whenever `tick % retrig_ticks == 0`.
+    /// Zero (the default and the explicit `E90` nibble) disables the
+    /// effect — per `Protracker-effects-MODFIL12.txt` E9, a zero
+    /// period is documented as "every yyyy ticks" with `yyyy = 0`
+    /// being the inert / no-op selection.
+    pub retrig_ticks: u8,
 }
 
 /// STM player — owns decoded patterns / samples and a
@@ -291,6 +302,11 @@ impl StmPlayerState {
             ch.note_cut_tick = 0;
             ch.note_delay_tick = 0;
             ch.has_pending_delay = false;
+            // E9x retrig period is row-scoped — clear here so a row
+            // without `E9y` cannot inherit the previous row's period.
+            // The tick-0 effect handler below repopulates it from the
+            // `y` nibble when `E9y` is present.
+            ch.retrig_ticks = 0;
 
             // Tone-porta detection: 3xy / 5xy turn the note (if any)
             // into a glide target, not a retrigger.
@@ -581,6 +597,30 @@ impl StmPlayerState {
                 ch.volume = 0;
             }
 
+            // E9x retrig: replay the active voice every `retrig_ticks`
+            // ticks within the current row. Tick 0 is the row's own
+            // initial trigger, so the modulo schedule kicks in from
+            // tick 1 onward. Per `Protracker-effects-MODFIL12.txt` E9
+            // ("re-trigger a specified sample … after yyyy ticks
+            // during the line") the voice's sample cursor and phase
+            // reset on each retrigger; the channel volume baseline,
+            // pitch state, and instrument selection are untouched (the
+            // effect is a cursor-rewind, not a fresh note-on with the
+            // accompanying envelope / sample-swap path).
+            if ch.retrig_ticks > 0
+                && cur_tick > 0
+                && cur_tick % ch.retrig_ticks == 0
+                && ch.voice.active
+            {
+                ch.voice.pos = 0.0;
+                // Fresh phase on each retrigger so the vibrato / tremolo
+                // LFOs realign with the new attack — matches the
+                // canonical PT retrigger behaviour (no-retrig waveform
+                // flags don't exist in STM, so this is unconditional).
+                ch.vib_pos = 0;
+                ch.trem_pos = 0;
+            }
+
             // Note delay: trigger voice at tick x.
             if ch.has_pending_delay && ch.note_delay_tick > 0 && cur_tick == ch.note_delay_tick {
                 let inst = ch.pending_instrument;
@@ -856,6 +896,20 @@ fn apply_tick0_effect(ch: &mut StmChannel) {
                 0xB => {
                     // EBx: fine volume slide down.
                     ch.volume = ch.volume.saturating_sub(y);
+                }
+                0x9 => {
+                    // E9x: retrig note — record the period; the
+                    // per-tick handler in `advance_tick` replays the
+                    // active sample whenever `tick % retrig_ticks == 0`
+                    // (excluding tick 0, which is the row's initial
+                    // trigger). Per `Protracker-effects-MODFIL12.txt`
+                    // E9 ("re-trigger a specified sample at a
+                    // particular note after yyyy ticks during the
+                    // line"), a zero `y` nibble is inert. STM declares
+                    // its effect column as "in ProTracker format" per
+                    // `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`,
+                    // so the PT semantics carry across verbatim.
+                    ch.retrig_ticks = y;
                 }
                 0xC => {
                     // ECx: note cut at tick x (0 = immediate).
@@ -1643,6 +1697,225 @@ pub mod tests {
         assert!(
             (p.channels[0].voice.pos - 256.0).abs() < 1.0,
             "9x01 in a 512-byte sample must place cursor at 256, got {}",
+            p.channels[0].voice.pos
+        );
+    }
+
+    /// Build an STM file with an `E9y` cell co-located on the row 0
+    /// note-on cell so we can drive a retrig schedule from tick 1 onward
+    /// without disturbing the existing `build_ping_stm` framing.
+    fn build_retrig_stm(period: u8) -> Vec<u8> {
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        // Row 0, channel 0 already carries the C-4 note + instrument 1.
+        // The effect bytes are command nibble 0xE + param `9y`.
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0x90 | (period & 0x0F);
+        bytes
+    }
+
+    #[test]
+    fn e9x_retrigger_resets_sample_cursor_every_y_ticks() {
+        // E91 = retrig every 1 tick. The row's note triggers on tick 0
+        // (cursor = 0), then ticks 1, 2, … re-zero the cursor before
+        // the mixer would advance it further. We simulate the mixer's
+        // cursor walk between ticks by bumping `voice.pos` manually so
+        // we can observe whether the per-tick handler rewinds it.
+        let bytes = build_retrig_stm(1);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Tick 0 — row entry triggers the note.
+        p.tick = 0;
+        p.advance_tick();
+        assert!(p.channels[0].voice.active, "tick 0 must trigger the voice");
+        assert_eq!(
+            p.channels[0].retrig_ticks, 1,
+            "E91 must latch retrig period = 1; got {}",
+            p.channels[0].retrig_ticks
+        );
+
+        // Simulate mixer advancing the cursor between ticks.
+        p.channels[0].voice.pos = 50.0;
+        p.tick = 1;
+        p.advance_tick();
+        assert!(
+            p.channels[0].voice.pos.abs() < 1e-3,
+            "E91 must reset the cursor on tick 1; pos = {}",
+            p.channels[0].voice.pos
+        );
+
+        // Same again on tick 2.
+        p.channels[0].voice.pos = 75.0;
+        p.tick = 2;
+        p.advance_tick();
+        assert!(
+            p.channels[0].voice.pos.abs() < 1e-3,
+            "E91 must reset the cursor on tick 2; pos = {}",
+            p.channels[0].voice.pos
+        );
+    }
+
+    #[test]
+    fn e90_does_not_retrigger() {
+        // E90 carries an explicit zero period. Per the canonical PT
+        // reading, that's the inert / no-op selection — the cursor
+        // must keep advancing monotonically across ticks (no rewind).
+        let bytes = build_retrig_stm(0);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        p.tick = 0;
+        p.advance_tick();
+        assert_eq!(
+            p.channels[0].retrig_ticks, 0,
+            "E90 must capture period = 0; got {}",
+            p.channels[0].retrig_ticks
+        );
+        // Simulate mixer advance.
+        p.channels[0].voice.pos = 100.0;
+        p.tick = 1;
+        p.advance_tick();
+        assert!(
+            (p.channels[0].voice.pos - 100.0).abs() < 1e-3,
+            "E90 must NOT rewind on tick 1; pos = {}",
+            p.channels[0].voice.pos
+        );
+    }
+
+    #[test]
+    fn e9x_only_fires_on_tick_y_multiples() {
+        // E93 = retrig every 3 ticks. Within one row (speed = 6) the
+        // retrig fires at ticks 3 and 6, but ticks 1, 2, 4, 5 must
+        // leave the cursor alone.
+        let bytes = build_retrig_stm(3);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        p.tick = 0;
+        p.advance_tick();
+        assert_eq!(p.channels[0].retrig_ticks, 3);
+
+        // Tick 1 — no rewind.
+        p.channels[0].voice.pos = 11.0;
+        p.tick = 1;
+        p.advance_tick();
+        assert!(
+            (p.channels[0].voice.pos - 11.0).abs() < 1e-3,
+            "E93 must not retrigger on tick 1; pos = {}",
+            p.channels[0].voice.pos
+        );
+
+        // Tick 2 — no rewind.
+        p.channels[0].voice.pos = 22.0;
+        p.tick = 2;
+        p.advance_tick();
+        assert!(
+            (p.channels[0].voice.pos - 22.0).abs() < 1e-3,
+            "E93 must not retrigger on tick 2; pos = {}",
+            p.channels[0].voice.pos
+        );
+
+        // Tick 3 — rewind to 0.
+        p.channels[0].voice.pos = 33.0;
+        p.tick = 3;
+        p.advance_tick();
+        assert!(
+            p.channels[0].voice.pos.abs() < 1e-3,
+            "E93 must retrigger on tick 3 (3 % 3 == 0); pos = {}",
+            p.channels[0].voice.pos
+        );
+
+        // Tick 4 — no rewind again (4 % 3 != 0).
+        p.channels[0].voice.pos = 44.0;
+        p.tick = 4;
+        p.advance_tick();
+        assert!(
+            (p.channels[0].voice.pos - 44.0).abs() < 1e-3,
+            "E93 must not retrigger on tick 4; pos = {}",
+            p.channels[0].voice.pos
+        );
+    }
+
+    #[test]
+    fn e9x_does_not_retrigger_on_inactive_voice() {
+        // If the channel's voice is silenced before the retrigger
+        // window (e.g. by a fresh row with no note or a Dxy break),
+        // the E9x schedule must not resurrect it. Mirrors the PT
+        // contract: retrig replays a *playing* sample; it doesn't
+        // ignite an idle channel.
+        let bytes = build_retrig_stm(1);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        p.tick = 0;
+        p.advance_tick();
+        // Manually deactivate the voice to simulate a kill from another
+        // path (e.g. an upstream Dash-note or cut).
+        p.channels[0].voice.active = false;
+        p.channels[0].voice.pos = 99.0;
+        p.tick = 1;
+        p.advance_tick();
+        // pos must NOT be reset to 0 because the voice is inactive
+        // and the retrigger gate is conditional on `voice.active`.
+        assert!(
+            (p.channels[0].voice.pos - 99.0).abs() < 1e-3,
+            "E91 must not touch an inactive voice; pos = {}",
+            p.channels[0].voice.pos
+        );
+    }
+
+    #[test]
+    fn e9x_period_does_not_leak_into_next_row() {
+        // E9 is row-scoped: a row without an `E9y` must NOT inherit
+        // the previous row's period. Place `E91` on row 0, a plain
+        // dot cell on row 1, then advance to row 1 and confirm the
+        // channel's `retrig_ticks` register is cleared.
+        let mut bytes = build_retrig_stm(1);
+        // Row 1 channel 0: plain dot cell (no effect, no note).
+        poke_effect(&mut bytes, 1, 0, 0x0, 0x00);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        // Walk through row 0's full tick range, then advance the row.
+        for t in 0..p.speed {
+            p.tick = t;
+            p.advance_tick();
+        }
+        p.tick = 0;
+        p.next_row();
+        assert_eq!(p.row, 1, "row advance should land us on row 1");
+        assert_eq!(
+            p.channels[0].retrig_ticks, 1,
+            "retrig_ticks should still be 1 before row 1's enter_row clears it"
+        );
+
+        // Enter row 1 and confirm retrig_ticks is cleared.
+        p.tick = 0;
+        p.advance_tick();
+        assert_eq!(
+            p.channels[0].retrig_ticks, 0,
+            "row 1 (no E9y) must clear retrig_ticks; got {}",
+            p.channels[0].retrig_ticks
+        );
+
+        // And confirm no rewind happens on the next tick of row 1.
+        p.channels[0].voice.pos = 77.0;
+        p.tick = 1;
+        p.advance_tick();
+        assert!(
+            (p.channels[0].voice.pos - 77.0).abs() < 1e-3,
+            "row 1 has no E9 — cursor must not be rewound; pos = {}",
             p.channels[0].voice.pos
         );
     }
