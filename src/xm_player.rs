@@ -262,8 +262,19 @@ pub struct XmChannel {
     /// `R..` itself when it fires. Increments every tick.
     pub multi_retrig_counter: u8,
     /// Multi-retrig (Rxy) parameter memory — `(x << 4) | y` of last
-    /// non-zero Rxy.
+    /// non-zero Rxy. Kept for legacy callers that read the combined
+    /// byte; the per-nibble memories below are the authoritative
+    /// source for the per-tick resolver.
     pub multi_retrig_mem: u8,
+    /// Multi-retrig (Rxy) volume-modifier memory — last nonzero `x`
+    /// nibble seen on this channel. Spec: `x = 0` reuses this value
+    /// rather than meaning "no change" (the wiki snapshot explicitly
+    /// flags the "None" wording as wrongly documented).
+    pub multi_retrig_x_mem: u8,
+    /// Multi-retrig (Rxy) speed memory — last nonzero `y` nibble seen
+    /// on this channel. Spec: `y = 0` reuses this value rather than
+    /// disabling the retrig.
+    pub multi_retrig_y_mem: u8,
     /// Tremor (Txy) tick counter, increments every tick.
     pub tremor_counter: u8,
     /// Tremor parameter memory: `x` = on-ticks - 1, `y` = off-ticks - 1.
@@ -587,11 +598,24 @@ impl XmPlayerState {
                     if ep != 0 => {
                         ch.pan_slide_mem = ep;
                     }
-                0x1B
-                    // Rxy: multi-retrig.
-                    if ep != 0 => {
+                0x1B => {
+                    // Rxy: multi-retrig. The combined-byte memory is
+                    // kept for legacy callers; the per-nibble memories
+                    // are the authoritative source for the per-tick
+                    // resolver. A zero nibble does NOT clobber its
+                    // memory slot (spec: "use the last nonzero value").
+                    let rx = ep >> 4;
+                    let ry = ep & 0x0F;
+                    if ep != 0 {
                         ch.multi_retrig_mem = ep;
                     }
+                    if rx != 0 {
+                        ch.multi_retrig_x_mem = rx;
+                    }
+                    if ry != 0 {
+                        ch.multi_retrig_y_mem = ry;
+                    }
+                }
                 0x1D
                     // Txy: tremor.
                     if ep != 0 => {
@@ -945,14 +969,28 @@ impl XmPlayerState {
             // Rxy — Multi-retrig. Counter increments every tick; when
             // it reaches `y`, the sample retriggers and a volume
             // modifier `x` is applied per the FT2 16-mode table.
+            //
+            // Per `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html`
+            // §2.1.22 the two nibbles have INDEPENDENT memory: `y = 0`
+            // reuses the last nonzero retrig speed in the channel, and
+            // `x = 0` reuses the last nonzero volume modifier in the
+            // channel (the wiki explicitly flags the "None" wording in
+            // the original FT2 documentation as wrongly documented).
+            // The memory slots are latched at row entry in `enter_row`'s
+            // 0x1B match arm; here we just consume them.
             if ch.effect == 0x1B {
-                let mem = if ch.effect_param != 0 {
-                    ch.effect_param
+                let row_x = ch.effect_param >> 4;
+                let row_y = ch.effect_param & 0x0F;
+                let rx = if row_x != 0 {
+                    row_x
                 } else {
-                    ch.multi_retrig_mem
+                    ch.multi_retrig_x_mem
                 };
-                let rx = mem >> 4;
-                let ry = mem & 0x0F;
+                let ry = if row_y != 0 {
+                    row_y
+                } else {
+                    ch.multi_retrig_y_mem
+                };
                 ch.multi_retrig_counter = ch.multi_retrig_counter.wrapping_add(1);
                 if ry > 0 && ch.multi_retrig_counter >= ry {
                     ch.voice.pos = 0.0;
@@ -960,9 +998,14 @@ impl XmPlayerState {
                     ch.voice.active = true;
                     ch.multi_retrig_counter = 0;
                     // Apply volume modifier per FT2's 16-entry table.
+                    // Entry 0 is unreachable here: `rx == 0` resolves
+                    // through the per-nibble memory above; if memory
+                    // was never seeded the volume is simply unchanged
+                    // (the spec's "leave the volume unchanged" default
+                    // also matches entry 8).
                     let v = ch.volume as i32;
                     let new_v = match rx {
-                        0 => v, // no change
+                        0 => v, // unseeded memory — leave unchanged
                         1 => v - 1,
                         2 => v - 2,
                         3 => v - 4,
@@ -2298,6 +2341,254 @@ pub mod tests {
             "square at pos 0 (+127) must lower freq vs sine at pos 0 (0): \
              square={freq_sq}, sine={freq_sine}"
         );
+    }
+
+    // ---------------- Rxy (multi-retrig) per-nibble memory ----------------
+    //
+    // The FT2 wiki snapshot at `multimedia-cx-fasttracker-2.html` §2.1.22
+    // documents Rxy with INDEPENDENT memory on the two nibbles:
+    //
+    //   - `y = 0` reuses the last nonzero retrig speed seen on the
+    //     channel.
+    //   - `x = 0` reuses the last nonzero volume modifier seen on the
+    //     channel — the snapshot explicitly flags the FT2 manual's
+    //     "None" wording as wrongly documented (so `x = 0` does NOT
+    //     mean "no change").
+    //
+    // The fixtures below craft minimal multi-row XMs that seed each
+    // nibble on row 0 and then leave the corresponding nibble at zero on
+    // row 1, asserting the row-1 behaviour reuses the seeded memory.
+
+    /// Build a one-channel multi-row XM where row `r` carries the cell
+    /// `cells[r]` (a `(note, effect, param)` triple; note 0 means "no
+    /// note"). Instrument 1 is the same 256-frame looped sine sample
+    /// the autovib fixtures use, so a triggered voice produces audible
+    /// PCM whose `voice.pos` we can monitor for retriggers.
+    fn make_multi_row_xm_state(cells: Vec<(u8, u8, u8)>) -> XmPlayerState {
+        let num_rows = cells.len() as u16;
+        let header = XmHeader {
+            module_name: String::new(),
+            tracker_name: String::new(),
+            version: 0x0104,
+            header_size: 0,
+            song_length: 1,
+            restart_position: 0,
+            num_channels: 1,
+            num_patterns: 1,
+            num_instruments: 1,
+            flags: 0,
+            frequency_table: XmFrequencyTable::Linear,
+            default_tempo: 3, // small ticks-per-row so rows advance fast
+            default_bpm: 125,
+            order: vec![0],
+        };
+        let rows: Vec<Vec<XmCell>> = cells
+            .into_iter()
+            .map(|(n, e, p)| {
+                vec![XmCell {
+                    note: n,
+                    instrument: if n != 0 { 1 } else { 0 },
+                    volume: 0,
+                    effect_type: e,
+                    effect_param: p,
+                }]
+            })
+            .collect();
+        let pattern = XmPattern {
+            header_length: 9,
+            packing_type: 0,
+            num_rows,
+            packed_size: 0,
+            rows,
+        };
+        let sample = crate::xm::XmSampleHeader {
+            name: String::new(),
+            length: 0,
+            loop_start: 0,
+            loop_length: 0,
+            volume: 64,
+            finetune: 0,
+            type_byte: 0,
+            panning: 128,
+            relative_note: 0,
+            loop_mode: XmSampleLoopMode::None,
+            is_16_bit: false,
+            pcm16: Vec::new(),
+            pcm8: vec![0; 256],
+        };
+        let inst = XmInstrument {
+            num_samples: 1,
+            sample_header_size: 0x28,
+            sample_map: vec![0; 96],
+            samples: vec![sample],
+            ..XmInstrument::default()
+        };
+        XmPlayerState::new(&header, vec![inst], vec![pattern], 44_100)
+    }
+
+    /// Walk a single row through all of its ticks (tick 0 first, then
+    /// ticks 1..speed), then leave the player parked at the next row's
+    /// tick 0 so the caller can advance again. Mirrors the inner loop
+    /// of `XmPlayerState::render` without driving any PCM emission.
+    fn walk_row(st: &mut XmPlayerState) {
+        let speed = st.speed;
+        for _ in 0..speed {
+            st.advance_tick();
+            st.tick += 1;
+            if st.tick >= speed {
+                st.tick = 0;
+                st.next_row();
+            }
+        }
+    }
+
+    #[test]
+    fn rxy_speed_nibble_zero_reuses_last_nonzero_speed() {
+        // Row 0: R01 — seeds y-memory = 1 (retrig every tick).
+        // Row 1: R00 — must reuse y_mem = 1 so the retrig keeps firing.
+        // Without memory reuse, R00 would never fire (ry stays 0 in the
+        // counter-vs-ry compare), the counter would climb monotonically,
+        // and the voice position would never reset.
+        //
+        // We drive the same per-tick walk over both rows and look at
+        // `multi_retrig_y_mem` (must hold 1) and the voice position at
+        // the END of row 1 (must be small, because a retrig on the
+        // last tick rewinds to 0).
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x1B, 0x01), // row 0: triggers, R01 (y=1)
+            (0, 0x1B, 0x00),  // row 1: R00 — must reuse y_mem
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        st.speed = 4;
+        walk_row(&mut st); // ticks of row 0
+                           // After row 0 the speed memory should have latched to 1.
+        assert_eq!(st.channels[0].multi_retrig_y_mem, 1);
+        // Walk row 1 — without reuse, no retrig fires; with reuse,
+        // every tick fires and counter is reset every tick.
+        walk_row(&mut st);
+        // After row 1 the counter must have been reset by at least one
+        // retrig fire — under no-reuse it would be 4 (no resets across
+        // the 4 ticks); under reuse it sits at 0 (just reset on the
+        // last tick's retrig).
+        assert_eq!(
+            st.channels[0].multi_retrig_counter, 0,
+            "R00 must reuse y_mem = 1 and retrig every tick of row 1"
+        );
+    }
+
+    #[test]
+    fn rxy_volume_nibble_zero_reuses_last_nonzero_modifier() {
+        // Row 0: R51 — seeds x-memory = 5 (volume modifier −16) and y = 1
+        // (retrig every tick). Row 1: R01 — x=0 must reuse the −16
+        // modifier, NOT mean "leave the volume unchanged".
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x1B, 0x51), // row 0: triggers, R51
+            (0, 0x1B, 0x01),  // row 1: R01 — must reuse x_mem = 5
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        // Walk row 0 — initial vol = 64; row has speed=3 ticks at y=1, so
+        // the retrig fires on ticks 1 and 2, applying −16 each time.
+        walk_row(&mut st);
+        let vol_after_row0 = st.channels[0].volume;
+        assert!(
+            vol_after_row0 < 64,
+            "row 0 R51 should have driven volume below 64 (got {vol_after_row0})"
+        );
+        // Memory should hold x = 5.
+        assert_eq!(st.channels[0].multi_retrig_x_mem, 5);
+        // Walk row 1 — R01 with x=0 must reuse x_mem = 5 (−16 per fire).
+        walk_row(&mut st);
+        let vol_after_row1 = st.channels[0].volume;
+        assert!(
+            vol_after_row1 < vol_after_row0,
+            "row 1 R01 must reuse x_mem=5 (−16 per fire) and drop the \
+             volume further (row0={vol_after_row0}, row1={vol_after_row1})"
+        );
+    }
+
+    #[test]
+    fn rxy_x_zero_without_memory_is_inert_on_volume() {
+        // Row 0 carries R03 — x=0, y=3 — with no prior nonzero Rxy on
+        // the channel, so the x-memory stays at its default 0. Volume
+        // must remain at 64 across the row even when the retrig fires.
+        // Use speed=4 so the retrig fires on ticks 3 (counter goes
+        // 0→1→2→3 across ticks 0..3 then resets to 0 on the y=3 fire).
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x1B, 0x03), // row 0: triggers, R03 (y=3 only, x unseeded)
+            (0, 0x00, 0x00),  // row 1: settle
+        ]);
+        st.speed = 4;
+        // Walk row 0; the sample-trigger path latches volume = 64 from
+        // the sample header on tick 0.
+        walk_row(&mut st);
+        // Retrig fired at least once across the 4 ticks; with unseeded
+        // x_mem = 0, the modifier table entry 0 leaves volume unchanged.
+        assert_eq!(
+            st.channels[0].volume, 64,
+            "R03 with no x-memory seeded must leave volume at 64"
+        );
+        // y memory latched as expected.
+        assert_eq!(st.channels[0].multi_retrig_y_mem, 3);
+        // x memory NOT latched (row's x nibble was 0).
+        assert_eq!(st.channels[0].multi_retrig_x_mem, 0);
+    }
+
+    #[test]
+    fn rxy_y_zero_without_memory_does_not_retrigger() {
+        // Row 0 carries R50 — x=5 (modifier −16), y=0 (speed unseeded).
+        // Without a prior nonzero y-memory the retrig must not fire at
+        // all, so the volume stays at 64 and the counter just climbs.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x1B, 0x50), // row 0: triggers, R50 (x=5, y unseeded)
+            (0, 0x00, 0x00),  // row 1: settle
+        ]);
+        walk_row(&mut st);
+        // No retrig fired — volume untouched.
+        assert_eq!(
+            st.channels[0].volume, 64,
+            "R50 with no y-memory seeded must not retrig and must leave \
+             the volume at 64"
+        );
+        // x memory latched, y memory not.
+        assert_eq!(st.channels[0].multi_retrig_x_mem, 5);
+        assert_eq!(st.channels[0].multi_retrig_y_mem, 0);
+        // Counter monotonically increased across the row's ticks
+        // because no retrig reset it.
+        let speed = st.speed;
+        assert!(
+            st.channels[0].multi_retrig_counter >= speed,
+            "R50 unseeded must let the counter climb at least `speed` \
+             ticks without resetting (got {}, speed {})",
+            st.channels[0].multi_retrig_counter,
+            speed,
+        );
+    }
+
+    #[test]
+    fn rxy_x_and_y_have_independent_memories() {
+        // Row 0: R52 — seeds x=5, y=2.
+        // Row 1: R03 — overrides y to 3, x falls through to 5 from
+        //   memory.
+        // Row 2: R00 — both nibbles zero, reuses x=5 and y=3.
+        // We assert the per-nibble memories evolve independently.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x1B, 0x52), // row 0
+            (0, 0x1B, 0x03),  // row 1
+            (0, 0x1B, 0x00),  // row 2
+            (0, 0x00, 0x00),  // row 3: settle
+        ]);
+        walk_row(&mut st);
+        assert_eq!(st.channels[0].multi_retrig_x_mem, 5);
+        assert_eq!(st.channels[0].multi_retrig_y_mem, 2);
+        walk_row(&mut st);
+        // Row 1's row_y = 3 latches into y_mem; x_mem stays at 5
+        // because the row's x nibble was 0.
+        assert_eq!(st.channels[0].multi_retrig_x_mem, 5);
+        assert_eq!(st.channels[0].multi_retrig_y_mem, 3);
+        walk_row(&mut st);
+        // Row 2 has both nibbles 0 — neither memory is overwritten.
+        assert_eq!(st.channels[0].multi_retrig_x_mem, 5);
+        assert_eq!(st.channels[0].multi_retrig_y_mem, 3);
     }
 
     #[test]

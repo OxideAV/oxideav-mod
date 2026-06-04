@@ -215,6 +215,25 @@ plus the eleven volume-column kinds. Recent rounds closed the surviving
   Pan envelope is left untouched, matching the FT2 reading. Cited in
   `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 226 and
   `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.20.
+- **Rxy multi-retrig per-nibble memory** — the two nibbles of `Rxy`
+  carry **independent** memories per
+  `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.22:
+  `y = 0` reuses the last nonzero retrig speed seen on the channel,
+  and `x = 0` reuses the last nonzero volume modifier seen on the
+  channel — the wiki snapshot explicitly flags the FT2 manual's
+  "None" wording for `x = 0` as wrongly documented (the actual
+  behaviour is "reuse last nonzero modifier", NOT "leave volume
+  unchanged"). The per-tick resolver in `advance_tick` now consults
+  separate `multi_retrig_x_mem` / `multi_retrig_y_mem` slots that
+  are latched at row entry only on a nonzero nibble; when a memory
+  slot has never been seeded, the unseeded fallback for `x` walks
+  through the existing modifier-table entry 0 ("leave unchanged")
+  and for `y` skips the retrig fire entirely. Five unit tests in
+  `xm_player::tests` pin the surface: `y = 0` reuses last nonzero
+  speed, `x = 0` reuses last nonzero modifier, `x = 0` with no
+  prior nonzero `x` leaves the volume at its trigger value, `y = 0`
+  with no prior nonzero `y` does not retrig, and the two memories
+  evolve independently across rows.
 
 The instrument-level autovibrato (`vibrato_type` byte) now honours the
 type byte's waveform shape and the +4 "don't retrigger" flag, sharing

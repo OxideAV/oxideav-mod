@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **XM `Rxy` multi-retrig per-nibble memory** (`src/xm_player.rs`).
+  The two nibbles of `Rxy` carry **independent** memories per the FT2
+  wiki snapshot at
+  `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.22:
+  `y = 0` reuses the last nonzero retrig speed seen on the channel,
+  and `x = 0` reuses the last nonzero volume modifier seen on the
+  channel — the wiki explicitly flags the FT2 manual's "None"
+  wording for `x = 0` as wrongly documented (the actual behaviour is
+  "reuse last nonzero modifier", NOT "leave volume unchanged"). Two
+  new per-channel state fields, `multi_retrig_x_mem` and
+  `multi_retrig_y_mem`, are latched at row entry on a nonzero nibble
+  (a zero nibble does NOT clobber its memory). The per-tick resolver
+  in `advance_tick` now consults the per-nibble memories instead of
+  the combined-byte fallback: `rx = row_x != 0 ? row_x : x_mem` and
+  `ry = row_y != 0 ? row_y : y_mem`. When a memory slot has never
+  been seeded, the `x` fallback walks through the existing modifier
+  table entry 0 ("leave volume unchanged") and the `y` fallback
+  short-circuits the retrig fire entirely (the `ry > 0` gate). The
+  combined-byte `multi_retrig_mem` field is preserved for legacy
+  callers. Five unit tests in `xm_player::tests` pin the surface:
+  `rxy_speed_nibble_zero_reuses_last_nonzero_speed` (R01 on row 0
+  seeds y_mem = 1, R00 on row 1 must reuse it and retrig every
+  tick), `rxy_volume_nibble_zero_reuses_last_nonzero_modifier` (R51
+  on row 0 seeds x_mem = 5 with modifier −16, R01 on row 1 must
+  reuse the −16 modifier and drop the volume further),
+  `rxy_x_zero_without_memory_is_inert_on_volume` (R03 with no prior
+  nonzero x leaves volume at 64),
+  `rxy_y_zero_without_memory_does_not_retrigger` (R50 with no prior
+  nonzero y never retriggers), and
+  `rxy_x_and_y_have_independent_memories` (a row with `(x=0, y=3)`
+  updates only y_mem, leaving x_mem at the previous row's value).
+  Spec source: `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html`
+  §2.1.22 ("If y is 0, use the last nonzero retrig speed value …" +
+  "Values for x: 0 — Use the last nonzero volume modifier …
+  Wrongly documented as: None").
+
 - **STM `E9x` retrigger-note effect** (`src/stm_player.rs`). On each row
   entry the `E9y` cell latches `y` as the per-channel retrigger period;
   the per-tick handler in `advance_tick` then rewinds the active voice's
