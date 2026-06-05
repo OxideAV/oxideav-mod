@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`header::Sample::is_looped` + `loop_region` typed accessors**
+  (`src/header.rs`). Two purely-additive methods on the public
+  `Sample` struct that fold the "repeat_length of `0` or `2` means
+  no loop" sentinel rule into one place: `is_looped()` returns
+  `true` iff `repeat_length > 2`, and `loop_region()` returns
+  `Some((repeat_start, repeat_length))` when the sample loops or
+  `None` when it does not. Per
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+  lines 357-365 ("A sample is only looped if this value is greater
+  than 2 bytes"), so callers (metadata reporters, tracker UIs,
+  diagnostics) that previously had to spell `s.repeat_length > 2`
+  inline at every check site now have one canonical accessor.
+  The accessors deliberately return the header-side raw values
+  without PCM-bounded clamping — `samples::extract_samples` still
+  owns the PCM-aware clamp when it builds the mixer-facing
+  `SampleBody`, because the extracted body length can be shorter
+  than the declared `length` on truncated rips and the two views
+  are documented as serving different consumers. Four unit tests
+  in `header::tests` pin the surface:
+  `sample_is_looped_rejects_repeat_length_zero_and_two` (both
+  no-loop sentinels return `false`),
+  `sample_is_looped_accepts_repeat_length_above_two` (length 3 +
+  4 + 256 all loop),
+  `sample_loop_region_none_when_not_looped` (`Option` shape
+  matches `is_looped`, and a non-zero `repeat_start` with the
+  no-loop length sentinel still returns `None` because PT
+  consults the length, not the start), and
+  `sample_loop_region_returns_header_pair_unclamped` (the raw
+  `(start, length)` pair passes through even when the values
+  exceed the declared `length`, which is the contract that lets
+  the PCM-aware path do its own clamp).
+
 - **XM `Rxy` multi-retrig per-nibble memory** (`src/xm_player.rs`).
   The two nibbles of `Rxy` carry **independent** memories per the FT2
   wiki snapshot at

@@ -99,6 +99,15 @@ Spec-level effect coverage per
 Loop handling is forward-only per MOD spec — ping-pong / bidi loops are an
 XM/IT/S3M-era extension and are deliberately not used here.
 
+The header-side `Sample` struct exposes typed accessors for the loop
+metadata: `Sample::is_looped()` returns `true` iff `repeat_length > 2`
+(the spec sentinel — `0` *and* `2` both mean "no loop"), and
+`Sample::loop_region()` returns `Some((repeat_start, repeat_length))`
+when looped or `None` otherwise. The pair is the raw header view, not
+the PCM-bounded clamp the mixer needs — callers reading the header for
+metadata or UI use these; the mixer goes through `SampleBody` which
+does its own clamp against the extracted body length.
+
 ## Real-world MOD fidelity
 
 Spec coverage above is one half of the story; the other half is matching

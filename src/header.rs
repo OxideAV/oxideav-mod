@@ -43,6 +43,46 @@ pub struct Sample {
     pub repeat_length: u32,
 }
 
+impl Sample {
+    /// True when the header declares a usable loop region.
+    ///
+    /// Per `Protracker-effects-MODFIL12.txt` lines 357-365 ("A sample
+    /// is only looped if this value is greater than 2 bytes"), a
+    /// `repeat_length` of `0` or `2` means the sample is one-shot.
+    /// PT writers commonly emit `repeat_length = 2` as the default
+    /// "no loop" sentinel, so callers must check both — a plain
+    /// `repeat_length > 0` test would flag non-looped samples as
+    /// looped.
+    pub fn is_looped(&self) -> bool {
+        self.repeat_length > 2
+    }
+
+    /// Header-declared loop region as a half-open `[start, start +
+    /// length)` byte-position pair, or `None` when [`is_looped`] is
+    /// `false`.
+    ///
+    /// Positions are in **samples** (matching `length`), already
+    /// doubled from the on-disk word counts. The values are taken
+    /// directly from the header without clamping against the
+    /// extracted PCM body — `samples::extract_samples` performs the
+    /// PCM-bounded clamp when building [`SampleBody`] for the mixer,
+    /// because the extracted body length can be shorter than the
+    /// declared `length` on truncated rips. Use this accessor when
+    /// the header is the source of truth (e.g. metadata reporters,
+    /// trackers showing the authored loop), and `SampleBody` when
+    /// the PCM-aware clamped region is needed.
+    ///
+    /// [`is_looped`]: Self::is_looped
+    /// [`SampleBody`]: crate::samples::SampleBody
+    pub fn loop_region(&self) -> Option<(u32, u32)> {
+        if self.is_looped() {
+            Some((self.repeat_start, self.repeat_length))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ModHeader {
     pub title: String,
@@ -208,5 +248,58 @@ mod tests {
     fn rejects_unknown_signature() {
         let bytes = make_fake_mod(b"XXXX", 1);
         assert!(parse_header(&bytes).is_err());
+    }
+
+    fn sample_with_repeat(start: u32, length: u32) -> Sample {
+        Sample {
+            name: String::new(),
+            length: 1024,
+            finetune: 0,
+            volume: 64,
+            repeat_start: start,
+            repeat_length: length,
+        }
+    }
+
+    #[test]
+    fn sample_is_looped_rejects_repeat_length_zero_and_two() {
+        // The two canonical "no loop" sentinels per
+        // Protracker-effects-MODFIL12.txt lines 357-365.
+        assert!(!sample_with_repeat(0, 0).is_looped());
+        assert!(!sample_with_repeat(0, 2).is_looped());
+        assert!(!sample_with_repeat(64, 2).is_looped());
+    }
+
+    #[test]
+    fn sample_is_looped_accepts_repeat_length_above_two() {
+        // The smallest legitimate loop region is length 4 (PT writes
+        // word-aligned values, so the next step above the no-loop
+        // sentinel is 4). length 3 still satisfies the strict ">2"
+        // spec wording.
+        assert!(sample_with_repeat(0, 3).is_looped());
+        assert!(sample_with_repeat(0, 4).is_looped());
+        assert!(sample_with_repeat(128, 256).is_looped());
+    }
+
+    #[test]
+    fn sample_loop_region_none_when_not_looped() {
+        assert_eq!(sample_with_repeat(0, 0).loop_region(), None);
+        assert_eq!(sample_with_repeat(0, 2).loop_region(), None);
+        // A non-zero repeat_start with the no-loop length sentinel is
+        // still "no loop" — PT consults the length, not the start.
+        assert_eq!(sample_with_repeat(64, 2).loop_region(), None);
+    }
+
+    #[test]
+    fn sample_loop_region_returns_header_pair_unclamped() {
+        // The accessor reflects what the header declares. PCM-bounded
+        // clamping happens in samples::extract_samples; the header-side
+        // view stays raw so metadata reporters see authored values.
+        assert_eq!(sample_with_repeat(128, 256).loop_region(), Some((128, 256)));
+        // Out-of-bounds-relative-to-length values pass through here;
+        // it's the PCM-aware path that clamps them.
+        let mut s = sample_with_repeat(2000, 4000);
+        s.length = 1024;
+        assert_eq!(s.loop_region(), Some((2000, 4000)));
     }
 }
