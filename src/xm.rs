@@ -401,6 +401,68 @@ impl XmSampleHeader {
             self.length
         }
     }
+
+    /// Typed view on the signed-byte `finetune` field as a fractional
+    /// semitone offset.
+    ///
+    /// The on-disk field at +13 of the sample header is a signed byte
+    /// (`docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +13 —
+    /// "Finetune (signed byte)"). The Linear-mode period formula in
+    /// the same document
+    /// (`Period = 10*12*16*4 - Note*16*4 - FineTune/2`) makes one
+    /// semitone worth 64 period units and one finetune unit worth
+    /// half a period unit, so the relation simplifies to **128
+    /// finetune units = 1 semitone**. This accessor folds the divide
+    /// into one canonical surface so a UI / analysis caller doesn't
+    /// have to re-derive the scale from the period formula.
+    ///
+    /// Returned values span `-1.0` (at finetune `-128`) up to just
+    /// under `+0.9921875` (at finetune `+127`). A value of `0.0`
+    /// means "no finetune — play this sample at its tabulated period
+    /// exactly". The result composes additively with
+    /// [`Self::transpose_semitones`] / [`Self::relative_note`] so the
+    /// total pitch offset relative to the cell's `C-4` is
+    /// `relative_note + finetune_semitones()`.
+    ///
+    /// Notes on doc wording: the spec's text labels the field as
+    /// "signed byte -16..+15" — that's the visible range in the FT2
+    /// editor UI (one tick on the +/-16 dial = 8 on the on-disk byte),
+    /// not the on-disk range. The mod XM-spec aggregator
+    /// `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` +213
+    /// repeats the UI wording verbatim; the period formula on +96 of
+    /// `FastTracker-2-v2.04-xm.txt` is the load-bearing definition
+    /// and confirms the -128..+127 byte range. Same pattern as
+    /// MOD's E5x ±8 nibble vs. the 16-entry period table indexing.
+    pub fn finetune_semitones(&self) -> f32 {
+        self.finetune as f32 / 128.0
+    }
+
+    /// Total pitch-offset of this sample relative to the
+    /// `relative_note = 0, finetune = 0` baseline, in fractional
+    /// semitones.
+    ///
+    /// FT2 splits the pitch transposition for a sample across two
+    /// fields:
+    /// - `relative_note` (signed byte at +16 of the sample header,
+    ///   `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +16) is
+    ///   the **integer-semitone** offset added to the cell's note;
+    ///   `0` means the cell's note plays the sample at its tabulated
+    ///   period exactly.
+    /// - `finetune` is the fractional-semitone offset captured by
+    ///   [`Self::finetune_semitones`] above.
+    ///
+    /// This accessor sums the two into the single offset a tuning UI
+    /// or transcription tool wants — i.e. "how many semitones above
+    /// the cell's note does this sample sound?". The xm_player
+    /// engine keeps the two fields separate because the period
+    /// formula consumes them at different scales (16 sub-units per
+    /// semitone for the `* 16 * 4` note term, 2 sub-units per period
+    /// for the `/ 2` finetune term — see `note_to_period` in
+    /// `xm_player.rs`), but a single floating-point offset is the
+    /// canonical surface for header-side metadata callers.
+    pub fn transpose_semitones(&self) -> f32 {
+        self.relative_note as f32 + self.finetune_semitones()
+    }
 }
 
 /// Decoded instrument: header + per-note sample mapping + envelopes +
@@ -1490,5 +1552,69 @@ mod tests {
         let h = sample_header_with(XmSampleLoopMode::PingPong, false, 100, 0, 50);
         assert!(h.is_looped());
         assert_eq!(h.loop_region_frames(), Some((0, 50)));
+    }
+
+    // ---- XmSampleHeader typed pitch-transpose accessors ----
+
+    fn sample_header_with_pitch(finetune: i8, relative_note: i8) -> XmSampleHeader {
+        XmSampleHeader {
+            finetune,
+            relative_note,
+            ..XmSampleHeader::default()
+        }
+    }
+
+    #[test]
+    fn xm_sample_finetune_semitones_is_zero_at_neutral() {
+        // Neutral finetune == "play at tabulated period exactly" ==
+        // zero semitone offset.
+        let h = sample_header_with_pitch(0, 0);
+        assert_eq!(h.finetune_semitones(), 0.0);
+    }
+
+    #[test]
+    fn xm_sample_finetune_semitones_scales_at_one_over_128() {
+        // The Linear period formula `Period = 10*12*16*4 - Note*16*4
+        // - FineTune/2` makes one semitone = 64 period units and one
+        // finetune unit = 1/2 period unit, so the conversion is
+        // FineTune / 128. Check the half-semitone and one-semitone
+        // anchors that the formula's grid lines up with.
+        let half_up = sample_header_with_pitch(64, 0);
+        assert!((half_up.finetune_semitones() - 0.5).abs() < 1e-6);
+        // Full-scale negative finetune lands at exactly -1 semitone.
+        let one_down = sample_header_with_pitch(-128, 0);
+        assert!((one_down.finetune_semitones() - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn xm_sample_finetune_semitones_symmetric_around_zero() {
+        // The signed-byte mapping is symmetric for the values that
+        // round-trip; +64 == +0.5 and -64 == -0.5.
+        let up = sample_header_with_pitch(64, 0);
+        let down = sample_header_with_pitch(-64, 0);
+        assert!((up.finetune_semitones() + down.finetune_semitones()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn xm_sample_transpose_semitones_sums_relative_note_and_finetune() {
+        // Net transpose is the integer-semitone relative_note plus the
+        // fractional-semitone finetune. Use a half-step finetune at a
+        // 12-semitone offset to verify both terms land in the sum.
+        let h = sample_header_with_pitch(64, 12);
+        assert!((h.transpose_semitones() - 12.5).abs() < 1e-6);
+
+        // Negative composition: -12 semitones minus 0.5 semitones.
+        let h2 = sample_header_with_pitch(-64, -12);
+        assert!((h2.transpose_semitones() - (-12.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn xm_sample_transpose_semitones_pure_relative_note() {
+        // Zero finetune: transpose equals relative_note exactly. This
+        // is the common case for typical instruments — the engine
+        // configures pitch via the relative_note field with
+        // finetune == 0.
+        let h = sample_header_with_pitch(0, 24);
+        assert_eq!(h.transpose_semitones(), 24.0);
     }
 }

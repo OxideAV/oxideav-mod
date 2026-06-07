@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed XM sample-header pitch-transpose accessors** (`src/xm.rs`).
+  Two purely additive methods on `XmSampleHeader` fold the FT2
+  pitch-field conventions into floating-point surfaces, mirroring
+  the byte-vs-frame split already shipping for the loop accessors:
+  - `XmSampleHeader::finetune_semitones()` converts the signed-byte
+    `finetune` field at +13 of the sample header
+    (`docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +13 —
+    "Finetune (signed byte)") to a fractional-semitone offset by
+    dividing by 128. The divisor comes straight from the Linear
+    period formula on +96 of the same doc
+    (`Period = 10*12*16*4 - Note*16*4 - FineTune/2`), where 64
+    period units = 1 semitone and 2 finetune units = 1 period
+    unit, so 128 finetune units = 1 semitone. Documents the
+    discrepancy between the spec's UI-range wording ("signed byte
+    -16..+15", echoed verbatim by the multimedia-cx aggregator on
+    +213) and the on-disk -128..+127 byte range — the period
+    formula is the load-bearing definition.
+  - `XmSampleHeader::transpose_semitones()` sums the integer-
+    semitone `relative_note` field (+16 of the sample header) with
+    the fractional `finetune_semitones()` result, returning the
+    total pitch offset relative to the cell's note as a single
+    `f32`. The xm_player engine keeps the two fields separate
+    because `note_to_period` consumes them at different sub-unit
+    scales (16 sub-units per semitone for the note term, 2
+    sub-units per period for the finetune term); this accessor
+    is the canonical metadata surface for tuning UIs and
+    transcription tools.
+  Five unit tests in `xm::tests` pin the surface:
+  `xm_sample_finetune_semitones_is_zero_at_neutral` (finetune 0
+  → 0.0 semitones),
+  `xm_sample_finetune_semitones_scales_at_one_over_128`
+  (finetune 64 → 0.5 semitones, finetune -128 → -1.0 semitone),
+  `xm_sample_finetune_semitones_symmetric_around_zero`,
+  `xm_sample_transpose_semitones_sums_relative_note_and_finetune`
+  (relative_note=12 + finetune=64 → 12.5 semitones), and
+  `xm_sample_transpose_semitones_pure_relative_note` (zero
+  finetune passes through unchanged).
+
 - **Typed XM sample-header accessors** (`src/xm.rs`). Three purely
   additive methods on `XmSampleHeader` fold the byte-vs-frame and
   loop-mode bookkeeping into one canonical surface, mirroring the

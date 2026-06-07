@@ -121,6 +121,22 @@ the typed accessors return what the file authored, the
 `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +0 / +4 / +8 /
 +14 of the sample header.
 
+For pitch-transposition metadata the same struct also exposes
+`finetune_semitones()` — a typed view that converts the signed-byte
+`finetune` field (+13 of the sample header) to a fractional-semitone
+offset by dividing by 128. The 128 divisor comes straight from the
+Linear-mode period formula on +96 of
+`docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt`
+(`Period = 10*12*16*4 - Note*16*4 - FineTune/2`), where 64 period
+units = 1 semitone and 2 finetune units = 1 period unit, so 128
+finetune units = 1 semitone — folding the conversion onto the
+header type instead of re-deriving it at each call site. The
+companion `transpose_semitones()` sums the integer-semitone
+`relative_note` (+16 of the sample header) with the fractional
+finetune offset and returns the total pitch shift relative to the
+cell's note, the canonical surface for tuning UIs and transcription
+tools.
+
 ## Real-world MOD fidelity
 
 Spec coverage above is one half of the story; the other half is matching
