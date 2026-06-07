@@ -326,6 +326,83 @@ pub struct XmSampleHeader {
     pub pcm8: Vec<i8>,
 }
 
+impl XmSampleHeader {
+    /// True when the header declares a usable loop region.
+    ///
+    /// Bits 0-1 of the type byte encode the loop mode per the FT2
+    /// sample-header field table in
+    /// `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +14
+    /// ("Bit 0-1: 0 = No loop, 1 = Forward loop, 2 = Ping-pong
+    /// loop"). The decoded [`Self::loop_mode`] captures that
+    /// classification; this accessor is the canonical "is there a
+    /// loop?" question, true for both forward and ping-pong modes
+    /// and false for [`XmSampleLoopMode::None`].
+    ///
+    /// A `loop_length` of `0` is **not** a sentinel for "no loop"
+    /// in XM — unlike MOD's `repeat_length == 2`, FT2 keys loop
+    /// presence on the type byte alone, so a length-zero forward
+    /// loop is still classified as looped here even though the
+    /// mixer-side region degenerates to an empty span (the
+    /// [`crate::mixer::SampleSource::loop_end`] impl above does the
+    /// PCM-aware clamp). This separation matches the MOD
+    /// `header::Sample::is_looped` / `samples::SampleBody` split
+    /// — header-view answers what the file declared, mixer-view
+    /// answers what's safe to read.
+    pub fn is_looped(&self) -> bool {
+        !matches!(self.loop_mode, XmSampleLoopMode::None)
+    }
+
+    /// Header-declared loop region as a half-open `[start, start +
+    /// length)` **frame-index** pair, or `None` when
+    /// [`Self::is_looped`] is `false`.
+    ///
+    /// FT2 stores `loop_start` / `loop_length` as **byte** offsets
+    /// in the on-disk sample header
+    /// (`docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +4 / +8);
+    /// for a 16-bit sample, one frame is two bytes, so this
+    /// accessor divides the on-disk byte counts by 2 when
+    /// [`Self::is_16_bit`] is set. The returned values are therefore
+    /// directly comparable to a frame-indexed cursor (the same view
+    /// the `SampleSource` impl uses), without leaking the byte-vs-
+    /// frame ambiguity into the caller. Loop fields for an 8-bit
+    /// sample pass through unchanged.
+    ///
+    /// Like MOD's [`crate::header::Sample::loop_region`], this is
+    /// the **raw header view** — there is no clamp against the
+    /// extracted PCM body length. The mixer's `SampleSource::
+    /// loop_end` impl owns the `.min(self.len())` clamp because a
+    /// truncated rip can have a body shorter than the declared
+    /// `length`. Use this accessor for metadata / diagnostics /
+    /// instrument UIs that want what the file authored; consult
+    /// the trait for what the mixer will actually read.
+    pub fn loop_region_frames(&self) -> Option<(u32, u32)> {
+        if self.is_looped() {
+            let div = if self.is_16_bit { 2 } else { 1 };
+            Some((self.loop_start / div, self.loop_length / div))
+        } else {
+            None
+        }
+    }
+
+    /// Frame-count view of the sample length.
+    ///
+    /// `length` is stored in **bytes** per the on-disk field
+    /// (`docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +0 of
+    /// the sample header — "Sample length"); for 16-bit samples
+    /// the frame count is `length / 2`. This accessor folds the
+    /// `is_16_bit` divisor into one canonical surface so callers
+    /// reasoning in frame indices don't have to repeat the
+    /// conditional. Pairs with [`Self::loop_region_frames`] —
+    /// both views are frame-indexed.
+    pub fn length_frames(&self) -> u32 {
+        if self.is_16_bit {
+            self.length / 2
+        } else {
+            self.length
+        }
+    }
+}
+
 /// Decoded instrument: header + per-note sample mapping + envelopes +
 /// sample headers. Sample PCM bodies are attached by
 /// [`extract_sample_bodies`].
@@ -1326,5 +1403,92 @@ mod tests {
         let (pats, _) = parse_patterns(&h, &bytes).unwrap();
         let us = estimate_duration_micros(&h, &pats);
         assert!(us > 0, "estimate_duration_micros returned {us}");
+    }
+
+    // ---- XmSampleHeader typed loop / length accessors ----
+
+    fn sample_header_with(
+        loop_mode: XmSampleLoopMode,
+        is_16_bit: bool,
+        length: u32,
+        loop_start: u32,
+        loop_length: u32,
+    ) -> XmSampleHeader {
+        XmSampleHeader {
+            loop_mode,
+            is_16_bit,
+            length,
+            loop_start,
+            loop_length,
+            ..XmSampleHeader::default()
+        }
+    }
+
+    #[test]
+    fn xm_sample_is_looped_tracks_loop_mode_enum() {
+        // None → false; Forward and PingPong → true. The mode comes from
+        // the type byte's bits 0-1, so the three states partition cleanly.
+        assert!(!sample_header_with(XmSampleLoopMode::None, false, 100, 0, 0).is_looped());
+        assert!(sample_header_with(XmSampleLoopMode::Forward, false, 100, 0, 50).is_looped());
+        assert!(sample_header_with(XmSampleLoopMode::PingPong, false, 100, 10, 40).is_looped());
+    }
+
+    #[test]
+    fn xm_sample_loop_region_none_when_not_looped() {
+        // Even when loop_start / loop_length carry nonzero leftover
+        // values, a `None` loop mode forces the typed accessor to None
+        // — the type byte is authoritative.
+        let h = sample_header_with(XmSampleLoopMode::None, false, 100, 32, 16);
+        assert_eq!(h.loop_region_frames(), None);
+    }
+
+    #[test]
+    fn xm_sample_loop_region_passes_through_8bit_bytes_as_frames() {
+        // 8-bit sample: one byte = one frame, so the on-disk loop
+        // fields are already frame indices and pass through unchanged.
+        let h = sample_header_with(XmSampleLoopMode::Forward, false, 100, 32, 16);
+        assert_eq!(h.loop_region_frames(), Some((32, 16)));
+    }
+
+    #[test]
+    fn xm_sample_loop_region_halves_16bit_bytes_into_frames() {
+        // 16-bit sample: two bytes per frame, so the on-disk byte
+        // counts have to be divided by 2 to land in the same index
+        // space as the SampleSource cursor.
+        let h = sample_header_with(XmSampleLoopMode::Forward, true, 200, 64, 32);
+        assert_eq!(h.loop_region_frames(), Some((32, 16)));
+    }
+
+    #[test]
+    fn xm_sample_loop_region_returns_header_pair_unclamped() {
+        // No PCM-side clamp — the typed view returns what the header
+        // declares even when start + length exceeds the declared length.
+        // The mixer's SampleSource::loop_end impl owns the
+        // `.min(self.len())` clamp.
+        let h = sample_header_with(XmSampleLoopMode::Forward, false, 32, 24, 64);
+        assert_eq!(h.loop_region_frames(), Some((24, 64)));
+    }
+
+    #[test]
+    fn xm_sample_length_frames_handles_both_widths() {
+        // 8-bit: bytes == frames. 16-bit: frames = bytes / 2.
+        assert_eq!(
+            sample_header_with(XmSampleLoopMode::None, false, 100, 0, 0).length_frames(),
+            100
+        );
+        assert_eq!(
+            sample_header_with(XmSampleLoopMode::None, true, 200, 0, 0).length_frames(),
+            100
+        );
+    }
+
+    #[test]
+    fn xm_sample_pingpong_is_classified_as_looped() {
+        // Distinct from MOD: XM's ping-pong loop mode is a separate
+        // type-byte encoding, and the typed accessor recognises it
+        // alongside forward.
+        let h = sample_header_with(XmSampleLoopMode::PingPong, false, 100, 0, 50);
+        assert!(h.is_looped());
+        assert_eq!(h.loop_region_frames(), Some((0, 50)));
     }
 }

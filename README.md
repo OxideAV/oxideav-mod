@@ -108,6 +108,19 @@ the PCM-bounded clamp the mixer needs — callers reading the header for
 metadata or UI use these; the mixer goes through `SampleBody` which
 does its own clamp against the extracted body length.
 
+The XM sample-header (`xm::XmSampleHeader`) ships the same shape on
+its own type-byte / byte-length terms: `is_looped()` returns `true`
+for `Forward` / `PingPong` loop modes (`None` returns `false`),
+`loop_region_frames()` returns `Some((start, length))` as
+**frame-indexed** values — the on-disk byte counts are divided by 2
+when the sample is 16-bit so the result is directly comparable to a
+mixer cursor — and `length_frames()` does the same byte→frame
+conversion for the sample length. Same header-vs-mixer split as MOD:
+the typed accessors return what the file authored, the
+`SampleSource` impl clamps against the extracted PCM body. Cited in
+`docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +0 / +4 / +8 /
++14 of the sample header.
+
 ## Real-world MOD fidelity
 
 Spec coverage above is one half of the story; the other half is matching

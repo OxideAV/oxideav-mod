@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed XM sample-header accessors** (`src/xm.rs`). Three purely
+  additive methods on `XmSampleHeader` fold the byte-vs-frame and
+  loop-mode bookkeeping into one canonical surface, mirroring the
+  `header::Sample::is_looped` / `loop_region` pair already shipping
+  for the MOD parser:
+  - `XmSampleHeader::is_looped()` returns `true` for `Forward` and
+    `PingPong` loop modes, `false` for `None` — keyed on the type
+    byte's bits 0-1 per the FT2 sample-header field table at
+    `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` +14
+    ("Bit 0-1: 0 = No loop, 1 = Forward loop, 2 = Ping-pong loop").
+    Unlike MOD's `repeat_length == 2` sentinel, FT2 keys loop
+    presence on the type byte alone, so a length-zero loop is still
+    classified as looped here (the mixer's `SampleSource::loop_end`
+    impl owns the PCM-aware clamp).
+  - `XmSampleHeader::loop_region_frames()` returns
+    `Some((start_frames, length_frames))` when looped, `None`
+    otherwise. The on-disk `loop_start` / `loop_length` fields are
+    **byte** offsets per the +4 / +8 entries of the same field
+    table; this accessor divides by 2 when `is_16_bit` is set so
+    callers reading the header land in the same frame-index space
+    as the `SampleSource` cursor. No clamp against the extracted
+    PCM body — that's still the trait impl's job, because the
+    extracted body length can be shorter than the declared
+    `length` on truncated rips.
+  - `XmSampleHeader::length_frames()` returns the frame count
+    (`length` divided by 2 for 16-bit samples), folding the same
+    width conversion into a single canonical surface so callers
+    reasoning in frame indices don't repeat the conditional.
+  Seven unit tests in `xm::tests` pin the surface:
+  `xm_sample_is_looped_tracks_loop_mode_enum` (None / Forward /
+  PingPong classification), `xm_sample_loop_region_none_when_not_looped`
+  (typed view returns None even when raw byte fields carry leftover
+  values — the type byte is authoritative),
+  `xm_sample_loop_region_passes_through_8bit_bytes_as_frames`,
+  `xm_sample_loop_region_halves_16bit_bytes_into_frames`,
+  `xm_sample_loop_region_returns_header_pair_unclamped` (raw values
+  pass through even when start + length exceed declared length),
+  `xm_sample_length_frames_handles_both_widths`, and
+  `xm_sample_pingpong_is_classified_as_looped`.
+
 - **STM `E3x` glissando control** (`src/stm_player.rs`). The Scream
   Tracker v1 player now honours the ProTracker `E3x` "set glissando
   on/off" sub-command per
