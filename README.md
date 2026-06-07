@@ -287,6 +287,7 @@ so the implemented columns track the ProTracker semantics documented under
 | Dxy | Pattern break (FT2-style decimal landing row) | implemented |
 | Fxx | Speed / tempo split (≤$1F = speed, ≥$20 = tempo) | implemented |
 | E1x / E2x | Fine portamento up / down | implemented |
+| E3x | Glissando control (snap tone-porta to nearest semitone) | implemented |
 | E6x | Pattern loop (per-channel start + count) | implemented |
 | E9x | Retrigger note every *x* ticks | implemented (cursor rewind + vibrato/tremolo phase reset on each retrig; row-scoped period; gated on `voice.active` so an idle channel isn't resurrected) |
 | EAx / EBx | Fine volume slide up / down | implemented |

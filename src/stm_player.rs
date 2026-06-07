@@ -31,9 +31,12 @@
 //!    nibble registers per the canonical "if either xxxx or yyyy are 0,
 //!    then values from the most recent prior tremolo will be used"
 //!    rule in `Protracker-effects-MODFIL12.txt` 7:Tremolo).
-//!  - Exy subcommands: E1x / E2x fine porta, EA x / EB x fine volume
-//!    slide, EC x note cut, ED x note delay, E9x retrig note (replay
-//!    the active sample every `y` ticks within the row).
+//!  - Exy subcommands: E1x / E2x fine porta, E3x glissando control
+//!    (snap tone-porta `cur_semis` to nearest semitone after each
+//!    linear step, per `Protracker-effects-MODFIL12.txt` E3),
+//!    EA x / EB x fine volume slide, EC x note cut, ED x note delay,
+//!    E9x retrig note (replay the active sample every `y` ticks within
+//!    the row).
 //!
 //! STM lacks period representation (pitch is derived from C3 Hz and a
 //! `(octave, semitone)` token), so pitch effects operate in the
@@ -187,6 +190,16 @@ pub struct StmChannel {
     /// period is documented as "every yyyy ticks" with `yyyy = 0`
     /// being the inert / no-op selection.
     pub retrig_ticks: u8,
+
+    // -------- glissando control (E3x) --------
+    /// `E3x` glissando control: when `true`, the tone-porta tick
+    /// step (3xy / 5xy) snaps `cur_semis` to the nearest whole
+    /// semitone after every linear-slide increment. Per
+    /// `Protracker-effects-MODFIL12.txt` E3 ("If glissando is on,
+    /// then the 'Slide to note' will slide a half note at a time"),
+    /// `y == 0` turns the snap off; any non-zero `y` turns it on.
+    /// Sticky across rows until cleared by a subsequent `E30`.
+    pub glissando: bool,
 }
 
 /// STM player — owns decoded patterns / samples and a
@@ -897,6 +910,21 @@ fn apply_tick0_effect(ch: &mut StmChannel) {
                     // EBx: fine volume slide down.
                     ch.volume = ch.volume.saturating_sub(y);
                 }
+                0x3 => {
+                    // E3x: set glissando control. `y == 0` turns the
+                    // tone-porta semitone-quantisation off; any
+                    // non-zero `y` turns it on. The flag is sticky
+                    // across rows until a later `E3y` overwrites it.
+                    // Per `Protracker-effects-MODFIL12.txt` E3
+                    // ("If glissando is on, then the 'Slide to note'
+                    // will slide a half note at a time. Otherwise,
+                    // it will perform the default smooth slide.").
+                    // STM declares its effect column as "in
+                    // ProTracker format" per
+                    // `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`,
+                    // so the PT semantics carry across verbatim.
+                    ch.glissando = y != 0;
+                }
                 0x9 => {
                     // E9x: retrig note — record the period; the
                     // per-tick handler in `advance_tick` replays the
@@ -955,25 +983,11 @@ fn apply_tickn_effect(ch: &mut StmChannel) {
         }
         0x3 => {
             // 3xy: tone porta — glide toward target.
-            let speed = (ch.porta_speed as f32) / SEMITONE_UNITS;
-            if (ch.cur_semis - ch.porta_target_semis).abs() <= speed {
-                ch.cur_semis = ch.porta_target_semis;
-            } else if ch.cur_semis < ch.porta_target_semis {
-                ch.cur_semis += speed;
-            } else {
-                ch.cur_semis -= speed;
-            }
+            tone_porta_step(ch);
         }
         0x5 => {
             // 5xy: tone porta + volume slide.
-            let speed = (ch.porta_speed as f32) / SEMITONE_UNITS;
-            if (ch.cur_semis - ch.porta_target_semis).abs() <= speed {
-                ch.cur_semis = ch.porta_target_semis;
-            } else if ch.cur_semis < ch.porta_target_semis {
-                ch.cur_semis += speed;
-            } else {
-                ch.cur_semis -= speed;
-            }
+            tone_porta_step(ch);
             apply_vol_slide(ch, ch.vol_slide_mem);
         }
         0x6 => {
@@ -1000,6 +1014,26 @@ fn apply_vol_slide(ch: &mut StmChannel, mem: u8) {
         ch.volume = (ch.volume as u16 + hi as u16).min(64) as u8;
     } else if lo != 0 {
         ch.volume = ch.volume.saturating_sub(lo);
+    }
+}
+
+/// Take one 3xy / 5xy tone-porta step toward `porta_target_semis` and,
+/// when E3x glissando is on, quantise the result to the nearest whole
+/// semitone. Mirrors the MOD / XM glissando contract from
+/// `Protracker-effects-MODFIL12.txt` E3 — when glissando is on the
+/// audible pitch only changes a half-note at a time even while the
+/// underlying linear slide continues at the configured `porta_speed`.
+fn tone_porta_step(ch: &mut StmChannel) {
+    let speed = (ch.porta_speed as f32) / SEMITONE_UNITS;
+    if (ch.cur_semis - ch.porta_target_semis).abs() <= speed {
+        ch.cur_semis = ch.porta_target_semis;
+    } else if ch.cur_semis < ch.porta_target_semis {
+        ch.cur_semis += speed;
+    } else {
+        ch.cur_semis -= speed;
+    }
+    if ch.glissando {
+        ch.cur_semis = ch.cur_semis.round();
     }
 }
 
@@ -1917,6 +1951,202 @@ pub mod tests {
             (p.channels[0].voice.pos - 77.0).abs() < 1e-3,
             "row 1 has no E9 — cursor must not be rewound; pos = {}",
             p.channels[0].voice.pos
+        );
+    }
+
+    // ---------------- E3x glissando control ----------------
+    //
+    // Sourced from `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+    // E3 ("If glissando is on, then the 'Slide to note' will slide a
+    // half note at a time. Otherwise, it will perform the default
+    // smooth slide.") — STM declares effects as "in ProTracker format"
+    // per `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt` so the
+    // PT semantics carry across verbatim.
+
+    #[test]
+    fn e3x_set_glissando_latches_flag_on() {
+        // Row 0: C-4 note + E31 → channel ends with glissando=true.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E; // command 0xE
+        bytes[PATTERN_OFF + 3] = 0x31; // x=3, y=1 → glissando ON
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+        p.tick = 0;
+        p.advance_tick();
+        assert!(
+            p.channels[0].glissando,
+            "E31 must turn glissando on; flag = {}",
+            p.channels[0].glissando
+        );
+    }
+
+    #[test]
+    fn e30_clears_glissando_flag() {
+        // Pre-seed the flag, then send E30 on row 0.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0x30;
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+        // Seed the flag manually as if a prior row had set it.
+        p.channels[0].glissando = true;
+        p.tick = 0;
+        p.advance_tick();
+        assert!(
+            !p.channels[0].glissando,
+            "E30 must clear glissando flag; got {}",
+            p.channels[0].glissando
+        );
+    }
+
+    #[test]
+    fn glissando_snaps_tone_porta_to_nearest_semitone() {
+        // Manually drive `tone_porta_step` with cur_semis at 48.0
+        // (C-4) walking up toward a target at 52.0 (E-4) at speed
+        // 0x18 (24 / SEMITONE_UNITS = 1.5 semis per tick). Without
+        // glissando, the sequence would be 49.5, 51.0, 52.0. With
+        // glissando, every emitted value must round to an integer
+        // semitone (the audible-stepwise contract per PT E3
+        // documentation: "slide a half note at a time").
+        let mut ch = StmChannel {
+            cur_semis: 48.0,
+            porta_target_semis: 52.0,
+            porta_speed: 0x18, // 24/16 = 1.5 semis per tick — large
+            // enough to cross the snap boundary
+            // every tick
+            glissando: true,
+            ..Default::default()
+        };
+        let mut sequence = Vec::new();
+        for _ in 0..6 {
+            tone_porta_step(&mut ch);
+            sequence.push(ch.cur_semis);
+        }
+        for v in &sequence {
+            let snapped = v.round();
+            assert!(
+                (v - snapped).abs() < 1e-4,
+                "glissando snap must round to integer semitones: got {v}, \
+                 full sequence = {sequence:?}"
+            );
+        }
+        // The sequence must strictly progress toward the target —
+        // ticks 1.5, 3.0, 4.5 (snap to 5), 4.5 (snap to 5) → reach
+        // target at tick 4 because the 'within speed of target'
+        // guard pins us once we are inside the speed window.
+        assert!(
+            (sequence.last().unwrap() - 52.0).abs() < 1e-4,
+            "glissando porta must reach target at fast-enough speeds; \
+             last = {:?}, full = {sequence:?}",
+            sequence.last()
+        );
+    }
+
+    #[test]
+    fn no_glissando_lets_tone_porta_walk_fractional_semitones() {
+        // Same setup as above but with glissando OFF — confirm the
+        // sequence carries fractional semitone values so the snap
+        // test isn't passing by accident on a path where everything
+        // is integer anyway.
+        let mut ch = StmChannel {
+            cur_semis: 48.0,
+            porta_target_semis: 50.0,
+            porta_speed: 4, // 0.25 semis per tick
+            glissando: false,
+            ..Default::default()
+        };
+        let mut saw_fraction = false;
+        for _ in 0..8 {
+            tone_porta_step(&mut ch);
+            if (ch.cur_semis - ch.cur_semis.round()).abs() > 1e-4 {
+                saw_fraction = true;
+            }
+        }
+        assert!(
+            saw_fraction,
+            "without glissando, tone porta with sub-semitone speed must \
+             produce fractional `cur_semis` values"
+        );
+    }
+
+    #[test]
+    fn glissando_works_with_5xy_tone_porta_plus_volume_slide() {
+        // 5xy uses the same `tone_porta_step` helper; this confirms
+        // the snap applies on the combined-effect path too.
+        let mut ch = StmChannel {
+            cur_semis: 48.0,
+            porta_target_semis: 50.0,
+            porta_speed: 4,
+            glissando: true,
+            volume: 32,
+            vol_slide_mem: 0x10, // +1 per tick
+            effect: 0x5,
+            ..Default::default()
+        };
+        apply_tickn_effect(&mut ch);
+        let snapped = ch.cur_semis.round();
+        assert!(
+            (ch.cur_semis - snapped).abs() < 1e-4,
+            "5xy with glissando must also snap cur_semis: got {}",
+            ch.cur_semis
+        );
+        assert_eq!(
+            ch.volume, 33,
+            "5xy must still apply the volume-slide piece: got {}",
+            ch.volume
+        );
+    }
+
+    #[test]
+    fn glissando_persists_across_rows_until_cleared() {
+        // Row 0: note + E31 → flag on.
+        // Row 1: a no-effect cell. Flag must stay set.
+        // Row 2: E30. Flag must clear.
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        const BYTES_PER_ROW: usize = 4 * 4;
+        // Row 0 ch 0: existing note + E31.
+        bytes[PATTERN_OFF + 2] = 0x0E;
+        bytes[PATTERN_OFF + 3] = 0x31;
+        // Row 1 ch 0: dots note + no effect.
+        let row1 = PATTERN_OFF + BYTES_PER_ROW;
+        bytes[row1] = 253; // dots
+        bytes[row1 + 1] = 0;
+        bytes[row1 + 2] = 0;
+        bytes[row1 + 3] = 0;
+        // Row 2 ch 0: dots note + E30.
+        let row2 = PATTERN_OFF + 2 * BYTES_PER_ROW;
+        bytes[row2] = 253;
+        bytes[row2 + 1] = 0;
+        bytes[row2 + 2] = 0x0E;
+        bytes[row2 + 3] = 0x30;
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+
+        step_one_row(&mut p);
+        assert!(
+            p.channels[0].glissando,
+            "after row 0 (E31): flag must be on"
+        );
+
+        step_one_row(&mut p);
+        assert!(
+            p.channels[0].glissando,
+            "after row 1 (no Exy): flag must persist across the row"
+        );
+
+        step_one_row(&mut p);
+        assert!(
+            !p.channels[0].glissando,
+            "after row 2 (E30): flag must be cleared"
         );
     }
 

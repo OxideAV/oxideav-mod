@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **STM `E3x` glissando control** (`src/stm_player.rs`). The Scream
+  Tracker v1 player now honours the ProTracker `E3x` "set glissando
+  on/off" sub-command per
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` E3 ("If
+  glissando is on, then the 'Slide to note' will slide a half note
+  at a time. Otherwise, it will perform the default smooth slide.")
+  — STM declares its effect column as "in ProTracker format" per
+  `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`, so the PT
+  semantics carry across verbatim. A new `glissando: bool` flag on
+  `StmChannel` is set by `E3y` (y != 0 → on, y == 0 → off) and is
+  sticky across rows until a subsequent `E3y` overwrites it. The
+  tone-porta tick handlers for `3xy` and `5xy` now go through a
+  shared `tone_porta_step` helper that, when the flag is on,
+  quantises `cur_semis` to the nearest whole semitone via
+  `.round()` after every linear-slide increment. Six tests pin
+  the surface in `stm_player::tests`: `e3x_set_glissando_latches_flag_on`,
+  `e30_clears_glissando_flag`,
+  `glissando_snaps_tone_porta_to_nearest_semitone` (`tone_porta_step`
+  walking 48.0 → 50.0 at speed 4 = 0.25 semis/tick produces only
+  integer-semitone values when glissando is on),
+  `no_glissando_lets_tone_porta_walk_fractional_semitones` (the
+  same walk produces fractional values when off),
+  `glissando_works_with_5xy_tone_porta_plus_volume_slide` (the
+  combined-effect path snaps too while the volume-slide piece
+  still increments), and `glissando_persists_across_rows_until_cleared`
+  (an `E31` flag survives an empty intermediate row and is cleared
+  by a later `E30`). README STM effect table picks up the row.
 - **`header::Sample::is_looped` + `loop_region` typed accessors**
   (`src/header.rs`). Two purely-additive methods on the public
   `Sample` struct that fold the "repeat_length of `0` or `2` means
