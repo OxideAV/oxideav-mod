@@ -108,6 +108,21 @@ the PCM-bounded clamp the mixer needs — callers reading the header for
 metadata or UI use these; the mixer goes through `SampleBody` which
 does its own clamp against the extracted body length.
 
+The pattern-row `player::Note` struct exposes the matching typed
+predicate set: `has_period()` / `has_sample()` / `has_effect()`
+return `true` when the respective field would change channel state
+(per `Protracker-effects-MODFIL12.txt` §3.4 the "no new note" /
+"sample #0" / "no effect" semantics each key on one or both of the
+four cell bytes being zero), and `is_empty()` returns `true` for the
+canonical `0000 0000-0000` idle row from `Protracker-mod.txt`
+§"Pattern data" — every field zero. `has_effect()` is the joint test
+across the command nibble and the parameter byte, because command 0
+with a non-zero parameter is the `0xy` arpeggio effect and command 0
+with a zero parameter is the canonical "no effect" placeholder.
+The internal playback engine consumes these predicates on the row-
+dispatch path so the typed surface is exercised by every spec test
+in `src/player.rs`.
+
 The XM sample-header (`xm::XmSampleHeader`) ships the same shape on
 its own type-byte / byte-length terms: `is_looped()` returns `true`
 for `Forward` / `PingPong` loop modes (`None` returns `false`),

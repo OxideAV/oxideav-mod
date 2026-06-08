@@ -207,6 +207,66 @@ impl Note {
             effect_param,
         }
     }
+
+    /// True when this row carries a new note to trigger on the
+    /// channel — i.e. the 12-bit period field is non-zero.
+    ///
+    /// Per `Protracker-effects-MODFIL12.txt` §3.4 (effects 1 / 2 / 3
+    /// — Slide up, Slide down, Slide to note), the trailing
+    /// paragraph in each section reads "at the beginning of the next
+    /// line, if there is not a new note to be played the period is
+    /// again decremented…" — i.e. a row with a zero period field is
+    /// the canonical "no new note" placeholder that lets the prior
+    /// channel state continue. This accessor folds that test into
+    /// one typed predicate so callers don't open-code
+    /// `note.period != 0` against the struct field directly.
+    #[inline]
+    pub fn has_period(&self) -> bool {
+        self.period != 0
+    }
+
+    /// True when this row specifies a sample to load — i.e. the
+    /// 8-bit sample number is non-zero.
+    ///
+    /// Per `Protracker-effects-MODFIL12.txt` §2.7 ("If sample number
+    /// is specified on a channel (sample #0), then the last sample
+    /// used on that channel will be remembered if new notes come
+    /// along."), a zero sample number means "do not change the
+    /// loaded sample on this channel." Counts 1..=31 are valid
+    /// sample indices into the header's sample table.
+    #[inline]
+    pub fn has_sample(&self) -> bool {
+        self.sample != 0
+    }
+
+    /// True when this row carries an effect — i.e. either the effect
+    /// command nibble or its parameter byte is non-zero.
+    ///
+    /// Per `Protracker-mod.txt` §"Pattern data" the effect occupies
+    /// 12 bits (a 4-bit command + an 8-bit argument); both halves
+    /// must be zero for the row to be considered effect-free, since
+    /// command 0 with a non-zero argument is the arpeggio `0xy`
+    /// effect and command 0 with a zero argument is the canonical
+    /// "no effect" placeholder. This predicate matches that joint
+    /// test.
+    #[inline]
+    pub fn has_effect(&self) -> bool {
+        self.effect != 0 || self.effect_param != 0
+    }
+
+    /// True when this row carries neither a new note, nor a sample
+    /// number, nor an effect — i.e. all four bytes are zero.
+    ///
+    /// Per `Protracker-mod.txt` §"Pattern data" the example pattern
+    /// row `0000          0000-00000000` is the canonical idle row
+    /// emitted by trackers when no channel event is requested.
+    /// `is_empty` returns `true` exactly for this case and lets
+    /// pattern-walker callers fast-skip the per-channel branches
+    /// when the row contributes nothing.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        !self.has_period() && !self.has_sample() && !self.has_effect()
+    }
 }
 
 /// A decoded pattern: 64 rows × N channels.
@@ -928,9 +988,9 @@ impl PlayerState {
             // portamento / note-delay row, where the trigger is
             // explicit). Otherwise, defer the swap and only latch the
             // default volume + finetune (used by the next note).
-            let has_note = note.period != 0;
+            let has_note = note.has_period();
             let is_note_delay_pre = note.effect == 0xE && (note.effect_param >> 4) == 0xD;
-            if note.sample != 0 {
+            if note.has_sample() {
                 let idx = note.sample as usize;
                 if idx >= 1 && idx <= self.samples.len() {
                     let body = &self.samples[idx - 1];
@@ -953,14 +1013,14 @@ impl PlayerState {
             let is_note_delay = effect == 0xE && x == 0xD;
 
             // Tone portamento: record target, but DO NOT retrigger.
-            if note.period != 0 && is_tone_porta {
+            if note.has_period() && is_tone_porta {
                 ch.tone_porta_target = note.period;
                 if effect == 0x3 && param != 0 {
                     ch.tone_porta_speed = param;
                 }
                 // Speed 0 on Cmd 3 inherits last; Cmd 5 never sets speed.
                 ch.arp_base_period = ch.period;
-            } else if note.period != 0 && is_note_delay {
+            } else if note.has_period() && is_note_delay {
                 // Delay the trigger to tick y; continue previous note until then.
                 ch.delay = Some(DelayedTrigger {
                     tick: y,
@@ -968,7 +1028,7 @@ impl PlayerState {
                     sample: note.sample,
                 });
                 ch.arp_base_period = ch.period;
-            } else if note.period != 0 {
+            } else if note.has_period() {
                 // Normal note trigger — apply E5 finetune if it lands on this row.
                 let mut note_period = note.period;
                 if effect == 0xE && x == 0x5 {
@@ -989,7 +1049,7 @@ impl PlayerState {
 
                 // Consume any deferred sample swap from a previous row
                 // that wrote a sample number without a note.
-                if note.sample == 0 && ch.pending_sample != 0 {
+                if !note.has_sample() && ch.pending_sample != 0 {
                     ch.sample_index = ch.pending_sample;
                 }
                 ch.pending_sample = 0;
@@ -3905,5 +3965,142 @@ pub mod tests {
             (0.25..=0.4).contains(&ratio),
             "RIGHT-to-LEFT bleed ratio for hard-LEFT ch at s=0.5 must be ~0.33; got {ratio}"
         );
+    }
+
+    // --- Note typed-predicate tests -----------------------------------
+    //
+    // These pin the three-part "row inspection" surface
+    // (`has_period`, `has_sample`, `has_effect`) plus the joint
+    // `is_empty` predicate that pattern walkers consult when fast-
+    // skipping idle rows. Spec grounding lives next to each method
+    // body; tests here exercise the field-combination boundary.
+
+    #[test]
+    fn note_has_period_keys_on_period_field() {
+        // Period 0 means "no new note" per the spec wording quoted on
+        // the method body — every other field is irrelevant.
+        assert!(!Note::default().has_period());
+        let n = Note {
+            sample: 5,
+            effect: 0xC,
+            effect_param: 0x40,
+            ..Default::default()
+        };
+        assert!(
+            !n.has_period(),
+            "sample/effect must not influence has_period"
+        );
+        let n = Note {
+            period: 428, // C-2 at finetune 0.
+            ..Default::default()
+        };
+        assert!(n.has_period());
+    }
+
+    #[test]
+    fn note_has_sample_keys_on_sample_field() {
+        // Sample 0 = "carry the last sample"; only fields 1..=31 are
+        // legitimate sample indices.
+        assert!(!Note::default().has_sample());
+        let n = Note {
+            period: 428,
+            effect: 0x1,
+            ..Default::default()
+        };
+        assert!(
+            !n.has_sample(),
+            "period/effect must not influence has_sample"
+        );
+        assert!(Note {
+            sample: 1,
+            ..Default::default()
+        }
+        .has_sample());
+        assert!(Note {
+            sample: 31,
+            ..Default::default()
+        }
+        .has_sample());
+    }
+
+    #[test]
+    fn note_has_effect_keys_on_both_command_and_param() {
+        // Command 0 with non-zero param is the 0xy arpeggio effect —
+        // an effect that must register as present.
+        assert!(!Note::default().has_effect());
+        let n = Note {
+            effect_param: 0x47,
+            ..Default::default()
+        };
+        assert!(
+            n.has_effect(),
+            "0x?? with command 0 is arpeggio — must register as an effect"
+        );
+        let n = Note {
+            effect: 0xC,
+            ..Default::default()
+        };
+        assert!(
+            n.has_effect(),
+            "command 0xC with zero param is C00 (set vol 0)"
+        );
+    }
+
+    #[test]
+    fn note_is_empty_requires_every_field_zero() {
+        // The canonical 0000 0000-0000 idle row from the spec.
+        assert!(Note::default().is_empty());
+
+        // Any one non-zero field flips it back.
+        assert!(!Note {
+            period: 1,
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!Note {
+            sample: 1,
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!Note {
+            effect: 1,
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(
+            !Note {
+                effect_param: 1,
+                ..Default::default()
+            }
+            .is_empty(),
+            "0x01 arpeggio param alone must count as non-empty"
+        );
+    }
+
+    #[test]
+    fn note_predicates_agree_on_decoded_pattern_row() {
+        // Decode a synthetic 4-byte cell carrying sample 5 + period
+        // 428 + effect C40 and verify the predicates report the same
+        // truth as direct field access.
+        //   Byte 0: ssss pppp -> 0x51 (sample hi 5, period hi 1)
+        //   Byte 1: pppp pppp -> 0xAC (period lo for 428 = 0x1AC)
+        //   Byte 2: ssss eeee -> 0x0C (sample lo 0, effect C)
+        //   Byte 3: xxxx xxxx -> 0x40
+        let n = Note::decode([0x51, 0xAC, 0x0C, 0x40]);
+        assert_eq!(n.period, 0x1AC);
+        assert_eq!(n.sample, 0x50);
+        assert_eq!(n.effect, 0xC);
+        assert_eq!(n.effect_param, 0x40);
+        assert!(n.has_period());
+        assert!(n.has_sample());
+        assert!(n.has_effect());
+        assert!(!n.is_empty());
+
+        // All-zero cell — the canonical idle row.
+        let n = Note::decode([0, 0, 0, 0]);
+        assert!(!n.has_period());
+        assert!(!n.has_sample());
+        assert!(!n.has_effect());
+        assert!(n.is_empty());
     }
 }

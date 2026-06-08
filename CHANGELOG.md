@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed MOD pattern-row predicates on `player::Note`**
+  (`src/player.rs`). Four purely additive `#[inline]` methods fold
+  the field-vs-zero idioms scattered across the playback engine
+  into one canonical surface, mirroring the
+  `header::Sample::is_looped` / `loop_region` pair and the XM
+  sample-header accessors already shipping in the crate:
+  - `Note::has_period()` — true when the 12-bit period field is
+    non-zero, i.e. the row carries a new note to trigger. The
+    "no new note" semantics come straight from
+    `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` §3.4
+    where each of effects 1 (Slide up), 2 (Slide down) and 3 (Slide
+    to note) closes with "at the beginning of the next line, if
+    there is not a new note to be played the period is again
+    decremented…" — a zero period field is the canonical
+    placeholder that lets the prior channel state continue.
+  - `Note::has_sample()` — true when the 8-bit sample number is
+    non-zero. Per the same spec §2.7 "If sample number is
+    specified on a channel (sample #0), then the last sample used
+    on that channel will be remembered if new notes come along."
+    Counts 1..=31 are valid sample indices into the header's
+    sample table.
+  - `Note::has_effect()` — true when either the command nibble or
+    the parameter byte is non-zero. The joint test is needed
+    because command 0 with a non-zero param is the `0xy` arpeggio
+    effect (not "no effect") and command 0 with a zero param is
+    the canonical "no effect" placeholder — single-field tests
+    would mis-classify both edges.
+  - `Note::is_empty()` — true iff every field is zero. Models the
+    `0000 0000-0000` idle row from the `Protracker-mod.txt` §"Pattern
+    data" sample table; pattern walkers can fast-skip per-channel
+    branches when the row contributes nothing.
+  Internal call sites in `player.rs` (the row-dispatch path around
+  the tone-portamento, note-delay and normal-trigger branches) now
+  consume these accessors instead of open-coding
+  `note.period != 0` / `note.sample != 0` against the struct
+  fields directly, so the typed surface is exercised by the
+  existing playback test suite rather than only the new unit
+  tests. Five unit tests in `player::tests` pin the surface:
+  `note_has_period_keys_on_period_field`,
+  `note_has_sample_keys_on_sample_field`,
+  `note_has_effect_keys_on_both_command_and_param`,
+  `note_is_empty_requires_every_field_zero`, and
+  `note_predicates_agree_on_decoded_pattern_row` (which feeds a
+  synthetic 4-byte cell through `Note::decode` and checks the
+  predicates agree with direct field inspection).
+
 - **Typed XM sample-header pitch-transpose accessors** (`src/xm.rs`).
   Two purely additive methods on `XmSampleHeader` fold the FT2
   pitch-field conventions into floating-point surfaces, mirroring
