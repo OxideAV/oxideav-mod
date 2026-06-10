@@ -206,6 +206,20 @@ a unit test in `src/player.rs`):
   the convention noted in `Pro-Noise-Soundtracker-rev4.txt:362-365`.
   `0x1F` is the largest speed value, `0x20` (= 32) is the smallest
   BPM value.
+- **Startrekker `FLT8` paired patterns** — `FLT8` files keep the plain
+  4-channel 0x400-byte pattern layout on disk and pair two consecutive
+  stored patterns into one logical 8-channel pattern: stored `2k`
+  carries channels 1-4, stored `2k+1` carries channels 5-8, and the
+  order table holds the even stored indices ("Divide all patterns in
+  the orderlist by 2"). `parse_header` halves the order entries up
+  front and `parse_patterns` resolves the paired layout, so the
+  player walks logical 8-channel patterns; previously the file was
+  misread as flat interleaved 8-channel rows (scrambling every cell
+  past channel 4 and mis-locating the sample bodies). `8CHN` / `OCTA`
+  / `CD81` are unaffected — only the `FLT8` signature pairs. Cited in
+  `docs/audio/trackers/mod/Startrekker-mod.txt` (format-author
+  description: "just take two 4 channel patterns together! So pattern
+  0 and 1 is one 8 channel pattern").
 - **`E6x` / `Dxy` same-row resolution** — both effects write to the
   same `pending_jump`; per the `Pro-Noise-Soundtracker-rev4.txt:375-377`
   channel-priority rule, the higher-numbered channel wins. The

@@ -276,17 +276,39 @@ pub struct Pattern {
 }
 
 /// Parse all patterns from a MOD bytestream.
+///
+/// Most signatures store one flat pattern per logical pattern: 64
+/// rows × N channels × 4 bytes, channels interleaved within the row.
+/// Startrekker `FLT8` is the exception ([`ModHeader::is_flt8`]): the
+/// file keeps the plain 4-channel 0x400-byte pattern layout and pairs
+/// two consecutive stored patterns into one logical 8-channel pattern
+/// — stored `2p` carries channels 0..4 and stored `2p+1` carries
+/// channels 4..8 for every row of logical pattern `p` (per
+/// `Startrekker-mod.txt`: "just take two 4 channel patterns together!
+/// So pattern 0 and 1 is one 8 channel pattern").
 pub fn parse_patterns(header: &ModHeader, bytes: &[u8]) -> Vec<Pattern> {
     let channels = header.channels as usize;
     let mut patterns = Vec::with_capacity(header.n_patterns as usize);
     let base = header.pattern_data_offset();
+    let flt8 = header.is_flt8();
 
     for p in 0..header.n_patterns as usize {
         let mut rows = Vec::with_capacity(PATTERN_ROWS);
         for r in 0..PATTERN_ROWS {
             let mut row = Vec::with_capacity(channels);
             for c in 0..channels {
-                let off = base + (p * PATTERN_ROWS + r) * channels * 4 + c * 4;
+                let off = if flt8 {
+                    // Paired stored layout: 4-channel stored patterns,
+                    // first of the pair = low channels, second = high.
+                    let (stored, sc) = if c < 4 {
+                        (2 * p, c)
+                    } else {
+                        (2 * p + 1, c - 4)
+                    };
+                    base + (stored * PATTERN_ROWS + r) * 4 * 4 + sc * 4
+                } else {
+                    base + (p * PATTERN_ROWS + r) * channels * 4 + c * 4
+                };
                 let raw = if off + 4 <= bytes.len() {
                     [bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]
                 } else {
@@ -2111,6 +2133,112 @@ pub mod tests {
         let samples = extract_samples(&header, bytes);
         let patterns = parse_patterns(&header, bytes);
         PlayerState::new(&header, samples, patterns, 44_100)
+    }
+
+    /// Build a synthetic Startrekker `FLT8` module: one logical
+    /// 8-channel pattern stored as TWO consecutive 4-channel 0x400
+    /// patterns (per `Startrekker-mod.txt` — "pattern 0 and 1 is one
+    /// 8 channel pattern"). The on-disk order table carries the
+    /// stored-pattern index (0), sample 1 is the same looping square
+    /// wave as `synth_square_mod`.
+    ///
+    /// Cells written:
+    /// - stored pattern 0 (logical channels 0..4): row 0 ch 0 →
+    ///   period 428, sample 1.
+    /// - stored pattern 1 (logical channels 4..8): row 0 ch 0 →
+    ///   period 320, sample 1 (= logical channel 4); row 1 ch 3 →
+    ///   period 381, sample 1 (= logical channel 7).
+    fn synth_flt8_mod() -> Vec<u8> {
+        let mut out = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        out[0..4].copy_from_slice(b"test");
+        out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        out[20 + 24] = 0;
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
+        out[950] = 1;
+        out[951] = 0x7F;
+        out[952] = 0; // stored-pattern index (even); logical pattern 0
+        out[1080..1084].copy_from_slice(b"FLT8");
+
+        let write_cell = |pat: &mut [u8], row: usize, ch: usize, period: u16| {
+            let off = row * 4 * 4 + ch * 4;
+            pat[off] = ((period >> 8) & 0x0F) as u8; // sample hi = 0
+            pat[off + 1] = (period & 0xFF) as u8;
+            pat[off + 2] = 1 << 4; // sample lo = 1, effect 0
+            pat[off + 3] = 0;
+        };
+
+        // Stored pattern 0 — logical channels 0..4.
+        let mut pat0 = vec![0u8; 64 * 4 * 4];
+        write_cell(&mut pat0, 0, 0, 428);
+        out.extend(pat0);
+        // Stored pattern 1 — logical channels 4..8.
+        let mut pat1 = vec![0u8; 64 * 4 * 4];
+        write_cell(&mut pat1, 0, 0, 320);
+        write_cell(&mut pat1, 1, 3, 381);
+        out.extend(pat1);
+
+        for i in 0..32 {
+            let v: i8 = if i < 16 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn flt8_pairs_stored_patterns_into_one_logical_pattern() {
+        let bytes = synth_flt8_mod();
+        let header = parse_header(&bytes).unwrap();
+        assert!(header.is_flt8());
+        assert_eq!(header.channels, 8);
+        assert_eq!(header.n_patterns, 1);
+
+        let patterns = parse_patterns(&header, &bytes);
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].rows.len(), 64);
+        assert_eq!(patterns[0].rows[0].len(), 8);
+
+        // Low half straight from stored pattern 0.
+        assert_eq!(patterns[0].rows[0][0].period, 428);
+        assert_eq!(patterns[0].rows[0][0].sample, 1);
+        // High half from stored pattern 1, remapped to channels 4..8.
+        assert_eq!(patterns[0].rows[0][4].period, 320);
+        assert_eq!(patterns[0].rows[0][4].sample, 1);
+        // Row/channel math inside the second stored pattern: its
+        // row 1 / channel 3 cell surfaces as logical row 1 / channel 7.
+        assert_eq!(patterns[0].rows[1][7].period, 381);
+        // Untouched cells stay empty — a flat-interleaved read would
+        // have smeared the stored-pattern-1 cells across these.
+        assert!(patterns[0].rows[0][1].is_empty());
+        assert!(patterns[0].rows[0][5].is_empty());
+        assert!(patterns[0].rows[1][0].is_empty());
+    }
+
+    #[test]
+    fn flt8_playback_triggers_both_pattern_halves() {
+        let bytes = synth_flt8_mod();
+        let mut player = make_player(&bytes);
+        assert_eq!(player.channels.len(), 8);
+
+        // Render past row 1 at default speed 6 / BPM 125 (one row =
+        // 6 ticks × 882 samples/tick ≈ 0.12 s): 0.3 s is plenty.
+        let mut buf = vec![0i16; 13_230 * 2];
+        let produced = player.render(&mut buf);
+        assert_eq!(produced, 13_230);
+
+        // The stored-pattern-0 note landed on logical channel 0, the
+        // stored-pattern-1 notes on logical channels 4 and 7 — i.e.
+        // BOTH halves of the pair drive voices.
+        assert!(player.channels[0].active);
+        assert!(player.channels[4].active);
+        assert!(player.channels[7].active);
+        // Channels with no cells written stay idle.
+        assert!(!player.channels[1].active);
+        assert!(!player.channels[5].active);
+
+        let nonzero = buf.iter().filter(|&&x| x != 0).count();
+        assert!(nonzero > 0, "FLT8 playback produced silence");
     }
 
     #[test]

@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Startrekker `FLT8` paired-pattern layout** (`src/header.rs`,
+  `src/player.rs`). `FLT8` modules keep the normal 4-channel
+  0x400-byte stored-pattern layout and pair two consecutive stored
+  patterns into one logical 8-channel pattern — stored `2k` carries
+  channels 1-4 and stored `2k+1` carries channels 5-8 for every row,
+  while the on-disk order table references the even stored-pattern
+  indices. Per `docs/audio/trackers/mod/Startrekker-mod.txt` (the
+  format author's own description: "the patterns are PAIRED … in a 8
+  track FLT8 module, patterns 00 and 01 is 'really' pattern 00", and
+  the format summary's "Divide all patterns in the orderlist by 2").
+  `parse_header` now halves the `FLT8` order entries so `order` /
+  `n_patterns` are in logical-pattern terms (which also fixes the
+  sample-body offset — the previous flat read over-counted the
+  pattern region whenever the order table held the doubled indices),
+  exposes the new `ModHeader::is_flt8()` predicate, and
+  `player::parse_patterns` resolves the paired layout into logical
+  64-row × 8-channel patterns. `8CHN` / `OCTA` / `CD81` keep the flat
+  interleaved read. Four tests pin the surface: order-halving +
+  byte-count identity (`flt8_order_entries_are_halved_to_logical_patterns`),
+  the 8CHN non-pairing control
+  (`non_flt8_eight_channel_signature_is_not_paired`), the paired
+  cell remap incl. the row/channel math inside the second stored
+  pattern (`flt8_pairs_stored_patterns_into_one_logical_pattern`),
+  and a playback smoke asserting voices fire on both halves of the
+  pair (`flt8_playback_triggers_both_pattern_halves`).
+
 - **STM `E4x` / `E7x` vibrato + tremolo waveform control**
   (`src/stm_player.rs`). The Scream Tracker v1 player now honours the
   ProTracker "set vibrato waveform" / "set tremolo waveform"

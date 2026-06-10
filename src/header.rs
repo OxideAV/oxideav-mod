@@ -102,7 +102,31 @@ impl ModHeader {
         HEADER_FIXED_SIZE
     }
 
+    /// True for Startrekker 8-channel `FLT8` modules, whose pattern
+    /// data is stored as **paired 4-channel patterns** rather than as
+    /// flat interleaved 8-channel rows.
+    ///
+    /// Per `Startrekker-mod.txt` (format-author description): "the
+    /// patterns are PAIRED … in a 8 track FLT8 module, patterns 00
+    /// and 01 is 'really' pattern 00. Patterns 02 and 03 together is
+    /// 'really' pattern 01." Each stored pattern keeps the normal
+    /// 4-channel × 64-row × 4-byte (0x400) layout; stored pattern
+    /// `2k` carries channels 1-4 and stored pattern `2k+1` carries
+    /// channels 5-8 of logical pattern `k`. The same doc's format
+    /// summary adds: "Divide all patterns in the orderlist by 2" —
+    /// the on-disk order table references the even stored-pattern
+    /// indices, so [`parse_header`] halves the entries up front and
+    /// `order` / `n_patterns` are already in logical-pattern terms.
+    pub fn is_flt8(&self) -> bool {
+        self.signature == *b"FLT8"
+    }
+
     /// Size of the pattern data region in bytes.
+    ///
+    /// The formula also holds for the paired `FLT8` layout: each
+    /// logical 8-channel pattern occupies two stored 4-channel
+    /// patterns of `PATTERN_ROWS * 4 * 4` bytes each, which is
+    /// exactly `PATTERN_ROWS * 8 * 4` bytes per logical pattern.
     pub fn pattern_data_size(&self) -> usize {
         self.n_patterns as usize * PATTERN_ROWS * self.channels as usize * 4
     }
@@ -145,11 +169,24 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
 
     let song_length = bytes[950];
     let restart = bytes[951];
-    let order: Vec<u8> = bytes[952..952 + ORDER_TABLE_SIZE].to_vec();
+    let mut order: Vec<u8> = bytes[952..952 + ORDER_TABLE_SIZE].to_vec();
 
     let mut signature = [0u8; 4];
     signature.copy_from_slice(&bytes[1080..1084]);
     let channels = channels_from_signature(&signature)?;
+
+    // Startrekker FLT8: the on-disk order table references the even
+    // stored-pattern indices ("Divide all patterns in the orderlist
+    // by 2" — Startrekker-mod.txt). Halve up front so `order` and
+    // `n_patterns` are in logical 8-channel-pattern terms and every
+    // downstream consumer (player position walk, metadata) can stay
+    // signature-agnostic. The paired stored layout is resolved by
+    // `player::parse_patterns` via `ModHeader::is_flt8`.
+    if signature == *b"FLT8" {
+        for o in order.iter_mut() {
+            *o /= 2;
+        }
+    }
 
     let n_patterns = 1 + *order.iter().take(song_length as usize).max().unwrap_or(&0);
 
@@ -248,6 +285,42 @@ mod tests {
     fn rejects_unknown_signature() {
         let bytes = make_fake_mod(b"XXXX", 1);
         assert!(parse_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn flt8_order_entries_are_halved_to_logical_patterns() {
+        // Startrekker-mod.txt: "Divide all patterns in the orderlist
+        // by 2" — the on-disk table references the even stored
+        // 4-channel pattern indices; the parsed header exposes
+        // logical 8-channel pattern numbers.
+        let mut bytes = make_fake_mod(b"FLT8", 3);
+        bytes[952] = 0;
+        bytes[953] = 2;
+        bytes[954] = 4;
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.channels, 8);
+        assert!(h.is_flt8());
+        assert_eq!(&h.order[..3], &[0, 1, 2]);
+        assert_eq!(h.n_patterns, 3);
+        // 3 logical patterns = 6 stored 0x400-byte 4-channel
+        // patterns, so the byte-count formula is unchanged.
+        assert_eq!(h.pattern_data_size(), 6 * 0x400);
+        assert_eq!(h.sample_data_offset(), HEADER_FIXED_SIZE + 6 * 0x400);
+    }
+
+    #[test]
+    fn non_flt8_eight_channel_signature_is_not_paired() {
+        // 8CHN / OCTA / CD81 use the flat interleaved 8-channel rows;
+        // only FLT8 gets the paired-stored-pattern treatment and the
+        // order-table halving.
+        let mut bytes = make_fake_mod(b"8CHN", 2);
+        bytes[952] = 0;
+        bytes[953] = 2;
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.channels, 8);
+        assert!(!h.is_flt8());
+        assert_eq!(&h.order[..2], &[0, 2]);
+        assert_eq!(h.n_patterns, 3);
     }
 
     fn sample_with_repeat(start: u32, length: u32) -> Sample {
