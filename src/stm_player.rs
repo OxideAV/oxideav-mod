@@ -22,18 +22,23 @@
 //!  - 2xy: porta down — shift pitch down.
 //!  - 3xy: tone portamento — glide semitone-offset toward the target
 //!    note without retriggering; per-channel `porta_target` + memory.
-//!  - 4xy: vibrato — sine LFO on pitch in semitone units; per-nibble
-//!    speed + depth memory.
+//!  - 4xy: vibrato — waveform LFO (sine by default, selectable via
+//!    E4x) on pitch in semitone units; per-nibble speed + depth memory.
 //!  - 5xy: tone porta + volume slide (combined).
 //!  - 6xy: vibrato + volume slide.
-//!  - 7xy: tremolo — sine LFO on output volume (clamped 0..=64); shares
-//!    no memory with vibrato (separate `trem_speed` / `trem_depth`
-//!    nibble registers per the canonical "if either xxxx or yyyy are 0,
-//!    then values from the most recent prior tremolo will be used"
-//!    rule in `Protracker-effects-MODFIL12.txt` 7:Tremolo).
+//!  - 7xy: tremolo — waveform LFO (sine by default, selectable via
+//!    E7x) on output volume (clamped 0..=64); shares no memory with
+//!    vibrato (separate `trem_speed` / `trem_depth` nibble registers
+//!    per the canonical "if either xxxx or yyyy are 0, then values
+//!    from the most recent prior tremolo will be used" rule in
+//!    `Protracker-effects-MODFIL12.txt` 7:Tremolo).
 //!  - Exy subcommands: E1x / E2x fine porta, E3x glissando control
 //!    (snap tone-porta `cur_semis` to nearest semitone after each
 //!    linear step, per `Protracker-effects-MODFIL12.txt` E3),
+//!    E4x / E7x vibrato / tremolo waveform select (0 sine, 1 ramp
+//!    down, 2 square, 3 random→sine fallback; +4 = "No Retrigger",
+//!    per `Protracker-effects-MODFIL12.txt` E4/E7 — the shared
+//!    [`crate::xm_player::waveform_lfo`] catalogue),
 //!    EA x / EB x fine volume slide, EC x note cut, ED x note delay,
 //!    E9x retrig note (replay the active sample every `y` ticks within
 //!    the row).
@@ -54,26 +59,19 @@ use crate::mixer::{MixerVoice, PitchModel, StmC3Pitch};
 use crate::stm::{
     StmCell, StmHeader, StmNoteKind, StmPattern, StmSampleBody, PATTERN_ROWS, STM_CHANNELS,
 };
+use crate::xm_player::waveform_lfo;
 
 /// Classic tracker pacing constants. STM's tempo field is related to the
 /// ticks-per-row and BPM-equivalent values; we keep the MOD defaults
 /// unless the file overrides them.
 pub const DEFAULT_SPEED_TICKS: u8 = 6;
 
-/// 64-entry signed sine table for vibrato — one quarter-wave reaches
-/// ±127 at indices 16 and 48. Matches the XM vibrato table so the STM
-/// and XM vibrato implementations behave identically.
-#[rustfmt::skip]
-const SINE_TABLE: [i8; 64] = [
-      0,  12,  25,  37,  49,  60,  71,  81,
-     90,  98, 106, 112, 117, 122, 125, 126,
-    127, 126, 125, 122, 117, 112, 106,  98,
-     90,  81,  71,  60,  49,  37,  25,  12,
-      0, -12, -25, -37, -49, -60, -71, -81,
-    -90, -98,-106,-112,-117,-122,-125,-126,
-   -127,-126,-125,-122,-117,-112,-106, -98,
-    -90, -81, -71, -60, -49, -37, -25, -12,
-];
+// The vibrato / tremolo LFO routes through the shared
+// [`crate::xm_player::waveform_lfo`] helper (±127 scale, 64-step
+// cycle), so the STM and XM modulation implementations behave
+// identically: shape 0 is the same 64-entry sine table both engines
+// historically used, and the E4x / E7x selectors pick the
+// `Protracker-effects-MODFIL12.txt` E4/E7 shape catalogue.
 
 /// Number of "porta units" per semitone. ProTracker's porta parameters
 /// are in Amiga period units, where one semitone ≈ 38 units near C-4.
@@ -154,6 +152,29 @@ pub struct StmChannel {
     pub trem_speed: u8,
     /// Tremolo depth memory (last non-zero 7xy `y` nibble).
     pub trem_depth: u8,
+
+    // -------- waveform control (E4x / E7x) --------
+    /// `E4x` vibrato waveform selector nibble. Low two bits pick the
+    /// shape from the `Protracker-effects-MODFIL12.txt` E4 catalogue
+    /// (0 sine — the default, 1 ramp down, 2 square, 3 random —
+    /// falls back to sine in [`waveform_lfo`] since no PRNG is
+    /// documented); bit 2 (+4) selects "No Retrigger" — the LFO
+    /// phase is NOT reset to the start of a cycle at the beginning
+    /// of each new note ("A 'retriggered' waveform will be reset to
+    /// the start of a cycle at the beginning of each new note. If a
+    /// wave is selected 'without retrigger', the previous waveform
+    /// will be continued"). STM declares its effect column as "in
+    /// ProTracker format" per
+    /// `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`, so the
+    /// PT semantics carry across verbatim. Sticky across rows until
+    /// a later `E4y` overwrites it.
+    pub vib_waveform: u8,
+    /// `E7x` tremolo waveform selector nibble. Same catalogue +
+    /// retrigger bit as `vib_waveform`, applied to the 7xy volume
+    /// LFO — per `Protracker-effects-MODFIL12.txt` E7 ("Line
+    /// command E4, this sets the waveform appearance for succeeding
+    /// 'tremolo' (volume) effects").
+    pub trem_waveform: u8,
 
     // -------- scheduling --------
     /// Pending note-cut tick (ECx): if >0, volume forced to 0 on that
@@ -467,15 +488,23 @@ impl StmPlayerState {
                                 ch.cur_semis = target;
                                 ch.porta_target_semis = target;
                                 // Fresh note resets vibrato + tremolo
-                                // phases (PT canonical retrigger:
+                                // phases unless the channel's E4x /
+                                // E7x waveform selector carries the
+                                // +4 "No Retrigger" bit — per
                                 // `Protracker-effects-MODFIL12.txt`
-                                // E7:Set-Tremolo-Waveform implies the
-                                // default waveform retriggers on a new
-                                // note unless E7x sets the no-retrig
-                                // bit, which STM's pre-FT2 effect set
-                                // doesn't expose).
-                                ch.vib_pos = 0;
-                                ch.trem_pos = 0;
+                                // E4 ("A 'retriggered' waveform will
+                                // be reset to the start of a cycle at
+                                // the beginning of each new note. If
+                                // a wave is selected 'without
+                                // retrigger', the previous waveform
+                                // will be continued. Waveforms are
+                                // usually retriggered").
+                                if ch.vib_waveform & 0x04 == 0 {
+                                    ch.vib_pos = 0;
+                                }
+                                if ch.trem_waveform & 0x04 == 0 {
+                                    ch.trem_pos = 0;
+                                }
                             }
                         }
                     }
@@ -627,11 +656,17 @@ impl StmPlayerState {
             {
                 ch.voice.pos = 0.0;
                 // Fresh phase on each retrigger so the vibrato / tremolo
-                // LFOs realign with the new attack — matches the
-                // canonical PT retrigger behaviour (no-retrig waveform
-                // flags don't exist in STM, so this is unconditional).
-                ch.vib_pos = 0;
-                ch.trem_pos = 0;
+                // LFOs realign with the new attack — unless the E4x /
+                // E7x waveform selector carries the +4 "No Retrigger"
+                // bit, in which case "the previous waveform will be
+                // continued" per `Protracker-effects-MODFIL12.txt` E4
+                // (the same gate as the row-entry note-on path).
+                if ch.vib_waveform & 0x04 == 0 {
+                    ch.vib_pos = 0;
+                }
+                if ch.trem_waveform & 0x04 == 0 {
+                    ch.trem_pos = 0;
+                }
             }
 
             // Note delay: trigger voice at tick x.
@@ -655,8 +690,16 @@ impl StmPlayerState {
                     ch.note = (po, ps);
                     ch.cur_semis = note_to_semis(po, ps);
                     ch.porta_target_semis = ch.cur_semis;
-                    ch.vib_pos = 0;
-                    ch.trem_pos = 0;
+                    // Same E4x / E7x "No Retrigger" gate as the
+                    // row-entry note-on path: a delayed trigger is
+                    // still "the beginning of [a] new note" per
+                    // `Protracker-effects-MODFIL12.txt` E4.
+                    if ch.vib_waveform & 0x04 == 0 {
+                        ch.vib_pos = 0;
+                    }
+                    if ch.trem_waveform & 0x04 == 0 {
+                        ch.trem_pos = 0;
+                    }
                 }
                 ch.has_pending_delay = false;
                 ch.note_delay_tick = 0;
@@ -667,7 +710,12 @@ impl StmPlayerState {
             let mut semis = ch.cur_semis;
             let vib_active = (ch.effect == 0x4 || ch.effect == 0x6) && ch.vib_depth > 0;
             if vib_active {
-                let lfo = SINE_TABLE[(ch.vib_pos & 0x3F) as usize] as f32;
+                // Shape selected by E4x (sine when never set) — the
+                // shared `waveform_lfo` helper masks the low two bits
+                // and returns the ±127-scale value, so the depth
+                // scaling below carries over unchanged from the
+                // historical sine-table lookup.
+                let lfo = waveform_lfo(ch.vib_waveform, ch.vib_pos) as f32;
                 // Peak deviation: depth * 16 / 128 / SEMITONE_UNITS semitones
                 // Simplify: (lfo / 128) * depth * 16 / SEMITONE_UNITS.
                 // With SEMITONE_UNITS=16, this is (lfo/128)*depth — i.e.
@@ -714,8 +762,9 @@ impl StmPlayerState {
                 }
             }
 
-            // Tremolo (7xy): oscillate the *output* volume with a sine
-            // LFO. Per `Protracker-effects-MODFIL12.txt` 7:Tremolo, the
+            // Tremolo (7xy): oscillate the *output* volume with a
+            // waveform LFO (sine unless E7x selected another shape).
+            // Per `Protracker-effects-MODFIL12.txt` 7:Tremolo, the
             // peak amplitude is `depth * (speed - 1)` volume units, and
             // the effect is "Like vibrato, except we modify the output
             // volume" per `multimedia-cx-protracker.html` 7xy with the
@@ -731,7 +780,9 @@ impl StmPlayerState {
             // doc, which is the same family of effects).
             let trem_active = ch.effect == 0x7 && ch.trem_depth > 0;
             let trem_off_units: f32 = if trem_active {
-                let lfo = SINE_TABLE[(ch.trem_pos & 0x3F) as usize] as f32;
+                // Shape selected by E7x (sine when never set), via the
+                // same shared `waveform_lfo` helper as vibrato.
+                let lfo = waveform_lfo(ch.trem_waveform, ch.trem_pos) as f32;
                 // Same shape as STM vibrato: (lfo * depth) / 32 → peak
                 // ≈ depth * 4 volume units. At depth 15 → ~±60 units.
                 let units = (lfo * ch.trem_depth as f32) / 32.0;
@@ -924,6 +975,30 @@ fn apply_tick0_effect(ch: &mut StmChannel) {
                     // `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`,
                     // so the PT semantics carry across verbatim.
                     ch.glissando = y != 0;
+                }
+                0x4 => {
+                    // E4x: set vibrato waveform "for succeeding
+                    // 'vibrato' effects" per
+                    // `Protracker-effects-MODFIL12.txt` E4. The nibble
+                    // is stored whole: low two bits select the shape
+                    // (0 sine / 1 ramp down / 2 square / 3 random →
+                    // sine fallback), bit 2 (+4) selects "No
+                    // Retrigger" (the LFO phase continues across new
+                    // notes instead of resetting). Sticky across rows
+                    // until a later `E4y` overwrites it. STM declares
+                    // its effect column as "in ProTracker format" per
+                    // `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`,
+                    // so the PT semantics carry across verbatim.
+                    ch.vib_waveform = y;
+                }
+                0x7 => {
+                    // E7x: set tremolo waveform — "Line command E4,
+                    // this sets the waveform appearance for succeeding
+                    // 'tremolo' (volume) effects" per
+                    // `Protracker-effects-MODFIL12.txt` E7. Same
+                    // nibble layout + stickiness as E4x, on the
+                    // independent tremolo register.
+                    ch.trem_waveform = y;
                 }
                 0x9 => {
                     // E9x: retrig note — record the period; the
@@ -2148,6 +2223,236 @@ pub mod tests {
             !p.channels[0].glissando,
             "after row 2 (E30): flag must be cleared"
         );
+    }
+
+    /// Like [`poke_effect`] but uses note byte 251 ("Empty") instead of
+    /// 253 ("Dots"): Dots is a note-off style marker that silences the
+    /// voice, whereas Empty leaves the playing voice untouched — needed
+    /// by the vibrato tests below because the per-tick frequency
+    /// recompute only runs on an active voice.
+    fn poke_effect_keep_voice(bytes: &mut [u8], row: u8, ch: u8, cmd: u8, param: u8) {
+        const PATTERN_OFF: usize = 0x410;
+        const BYTES_PER_ROW: usize = 4 * 4;
+        let off = PATTERN_OFF + (row as usize) * BYTES_PER_ROW + (ch as usize) * 4;
+        bytes[off] = 251;
+        bytes[off + 1] = 0;
+        bytes[off + 2] = cmd & 0x0F;
+        bytes[off + 3] = param;
+    }
+
+    /// Build an STM whose row 0 triggers the ping note with effect
+    /// `E4y` (`waveform` = y) and whose row 1 runs vibrato `41F`
+    /// (speed 1, depth 15) without touching the voice.
+    fn build_vib_waveform_stm(waveform: u8) -> Vec<u8> {
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        bytes[PATTERN_OFF + 2] = 0x0E; // command 0xE on the note row
+        bytes[PATTERN_OFF + 3] = 0x40 | (waveform & 0x0F); // E4y
+        poke_effect_keep_voice(&mut bytes, 1, 0, 0x4, 0x1F);
+        bytes
+    }
+
+    #[test]
+    fn e4x_square_vibrato_shifts_pitch_at_phase_zero() {
+        // Per `Protracker-effects-MODFIL12.txt` E4, shape 2 is the
+        // square wave ("a square wave, starting from +y" per the
+        // multimedia-cx shape catalogue): at LFO phase 0 it sits at
+        // its +127 peak, whereas the default sine is 0 at phase 0.
+        // So on the first tick of a fresh vibrato row, an E42-selected
+        // square must already deviate the pitch while the default
+        // sine leaves it on the base note.
+        let base = semis_to_freq(8363.0, 48.0);
+
+        // Square (E42 on the note row).
+        let bytes = build_vib_waveform_stm(2);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+        step_one_row(&mut p); // row 0: trigger + E42
+        p.tick = 0;
+        p.advance_tick(); // row 1 tick 0: vibrato at phase 0
+        let got_square = p.channels[0].voice.freq;
+        assert!(
+            got_square > base * 1.1,
+            "square waveform at phase 0 must sit at +peak: got {got_square}, base {base}"
+        );
+
+        // Control: default sine (E40 — same row layout, shape 0).
+        let bytes = build_vib_waveform_stm(0);
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+        step_one_row(&mut p);
+        p.tick = 0;
+        p.advance_tick();
+        let got_sine = p.channels[0].voice.freq;
+        assert!(
+            (got_sine - base).abs() < 1.0,
+            "sine waveform at phase 0 is zero deviation: got {got_sine}, base {base}"
+        );
+    }
+
+    #[test]
+    fn e4x_no_retrigger_bit_preserves_vibrato_phase_across_notes() {
+        // Per `Protracker-effects-MODFIL12.txt` E4: "A 'retriggered'
+        // waveform will be reset to the start of a cycle at the
+        // beginning of each new note. If a wave is selected 'without
+        // retrigger', the previous waveform will be continued."
+        // Row 0: note + E4y (y = 4 → sine, No Retrigger; y = 0 →
+        //   sine, retriggered).
+        // Row 1: vibrato 41F — walks vib_pos to 20 across the row's
+        //   non-zero ticks (speed 1 → +4/tick × 5 ticks).
+        // Row 2: fresh note + 400 (vibrato from memory). With the
+        //   no-retrigger bit the phase stays at 20 (sine[20] > 0 →
+        //   pitch deviates on tick 0); without it the phase resets
+        //   to 0 (sine[0] = 0 → no deviation).
+        let build = |y: u8| {
+            let mut bytes = build_vib_waveform_stm(y);
+            const PATTERN_OFF: usize = 0x410;
+            const BYTES_PER_ROW: usize = 4 * 4;
+            let row2 = PATTERN_OFF + 2 * BYTES_PER_ROW;
+            bytes[row2] = 0x40; // C-4
+            bytes[row2 + 1] = 1 << 3; // instrument 1
+            bytes[row2 + 2] = 0x04; // command 4 (vibrato)
+            bytes[row2 + 3] = 0x00; // param 0 → per-nibble memory
+            bytes
+        };
+        let base = semis_to_freq(8363.0, 48.0);
+
+        let run = |bytes: Vec<u8>| {
+            let h = parse_header(&bytes).unwrap();
+            let pats = parse_patterns(&h, &bytes);
+            let samples = extract_samples(&h, &bytes);
+            let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+            step_one_row(&mut p); // row 0: trigger + E4y
+            step_one_row(&mut p); // row 1: vibrato walks the phase
+            p.tick = 0;
+            p.advance_tick(); // row 2 tick 0: fresh note
+            (p.channels[0].vib_pos, p.channels[0].voice.freq)
+        };
+
+        let (pos_noretrig, freq_noretrig) = run(build(4));
+        assert_eq!(
+            pos_noretrig, 20,
+            "E44: vib phase must continue across the new note"
+        );
+        assert!(
+            (freq_noretrig - base).abs() > base * 0.05,
+            "E44: continued phase (sine[20] = 117) must deviate the pitch \
+             on tick 0: got {freq_noretrig}, base {base}"
+        );
+
+        let (pos_retrig, freq_retrig) = run(build(0));
+        assert_eq!(
+            pos_retrig, 0,
+            "E40: vib phase must reset at the beginning of each new note"
+        );
+        assert!(
+            (freq_retrig - base).abs() < 1.0,
+            "E40: reset phase (sine[0] = 0) means no deviation on tick 0: \
+             got {freq_retrig}, base {base}"
+        );
+    }
+
+    /// Build an STM whose row 0 triggers the ping note at volume 32
+    /// with effect `E7y` (`waveform` = y) and whose row 1 runs tremolo
+    /// `718` (speed 1, depth 8) without touching the voice.
+    fn build_trem_waveform_stm(waveform: u8) -> Vec<u8> {
+        let mut bytes = build_ping_stm();
+        const PATTERN_OFF: usize = 0x410;
+        // Volume 32: vol_lo = 32 & 7 = 0 in byte 1, vol_hi = 32 >> 3
+        // = 4 in byte 2's high nibble (see `parse_patterns` bit
+        // layout in `crate::stm`).
+        bytes[PATTERN_OFF + 1] = 1 << 3; // instrument 1, vol_lo 0
+        bytes[PATTERN_OFF + 2] = (4 << 4) | 0x0E; // vol_hi 4, command 0xE
+        bytes[PATTERN_OFF + 3] = 0x70 | (waveform & 0x0F); // E7y
+        poke_effect_keep_voice(&mut bytes, 1, 0, 0x7, 0x18);
+        bytes
+    }
+
+    #[test]
+    fn e7x_square_tremolo_lifts_volume_at_phase_zero() {
+        // Same phase-0 discriminator as the vibrato test, on the
+        // volume axis: square at phase 0 is +127 → tremolo offset
+        // = 127 * 8 / 32 ≈ +31.75 volume units over the 32 baseline
+        // (≈ 64/64 after clamping), while the default sine leaves
+        // the baseline 32/64 = 0.5 untouched on tick 0.
+        let run = |waveform: u8| {
+            let bytes = build_trem_waveform_stm(waveform);
+            let h = parse_header(&bytes).unwrap();
+            let pats = parse_patterns(&h, &bytes);
+            let samples = extract_samples(&h, &bytes);
+            let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+            step_one_row(&mut p); // row 0: trigger + E7y
+            p.tick = 0;
+            p.advance_tick(); // row 1 tick 0: tremolo at phase 0
+            p.channels[0].voice.volume
+        };
+
+        let vol_square = run(2);
+        assert!(
+            vol_square > 0.9,
+            "square tremolo at phase 0 must lift the volume to ~1.0: got {vol_square}"
+        );
+
+        let vol_sine = run(0);
+        assert!(
+            (vol_sine - 0.5).abs() < 1e-3,
+            "sine tremolo at phase 0 leaves the 32/64 baseline: got {vol_sine}"
+        );
+    }
+
+    #[test]
+    fn e9x_retrig_respects_no_retrigger_waveform_bit() {
+        // The E9x per-tick retrigger realigns the vibrato / tremolo
+        // LFO phases with the new attack — but an E4x / E7x selector
+        // carrying the +4 "No Retrigger" bit must keep its phase
+        // ("the previous waveform will be continued" per
+        // `Protracker-effects-MODFIL12.txt` E4). Drive the per-tick
+        // handler directly with hand-seeded channel state.
+        let bytes = build_ping_stm();
+        let h = parse_header(&bytes).unwrap();
+        let pats = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+
+        let run = |vib_wave: u8, trem_wave: u8| {
+            let pats = pats.clone();
+            let samples = samples.clone();
+            let mut p = StmPlayerState::new(&h, samples, pats, 44_100);
+            {
+                let ch = &mut p.channels[0];
+                ch.instrument = 1;
+                ch.voice.active = true;
+                ch.voice.pos = 40.0;
+                ch.retrig_ticks = 1;
+                ch.vib_waveform = vib_wave;
+                ch.trem_waveform = trem_wave;
+                ch.vib_pos = 12;
+                ch.trem_pos = 9;
+            }
+            p.tick = 1; // non-zero multiple of retrig_ticks = 1
+            p.advance_tick();
+            (
+                p.channels[0].voice.pos,
+                p.channels[0].vib_pos,
+                p.channels[0].trem_pos,
+            )
+        };
+
+        // No-retrigger bit set on both selectors: cursor rewinds but
+        // the LFO phases continue.
+        let (pos, vib, trem) = run(0x04, 0x04);
+        assert_eq!(pos, 0.0, "E9 retrig must still rewind the sample cursor");
+        assert_eq!(vib, 12, "vib phase must continue with the +4 bit set");
+        assert_eq!(trem, 9, "trem phase must continue with the +4 bit set");
+
+        // Default (retriggered) waveforms: phases realign to 0.
+        let (pos, vib, trem) = run(0x00, 0x00);
+        assert_eq!(pos, 0.0);
+        assert_eq!(vib, 0, "default waveform realigns vib phase on retrig");
+        assert_eq!(trem, 0, "default waveform realigns trem phase on retrig");
     }
 
     #[test]

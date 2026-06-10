@@ -129,7 +129,12 @@ const FADEOUT_MAX: i32 = 65536;
 /// `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` E4/E7,
 /// `docs/audio/trackers/mod/Protracker-2.3A-misc-info.txt` lines 387/390,
 /// and `docs/audio/trackers/mod/multimedia-cx-protracker.html` §4xy.
-fn waveform_lfo(shape: u8, pos: u8) -> i32 {
+///
+/// `pub(crate)` because the STM player shares this helper: STM declares
+/// its effect column as "in ProTracker format" per
+/// `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`, so the same
+/// E4x / E7x shape catalogue applies there verbatim.
+pub(crate) fn waveform_lfo(shape: u8, pos: u8) -> i32 {
     let p = (pos & 0x3F) as i32;
     match shape & 0x03 {
         // Downward saw: +127 at pos 0, stepping down by 2 each of the 64

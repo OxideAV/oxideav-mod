@@ -322,8 +322,8 @@ so the implemented columns track the ProTracker semantics documented under
 | 0xy  | Arpeggio | implemented (note / note+x / note+y half-steps cycling on `counter mod 3`; pure additive offset, inert at param 0) |
 | 1xy / 2xy | Portamento up / down | implemented (semitone-space, shared last-param memory) |
 | 3xy / 5xy | Tone portamento, with volume slide | implemented |
-| 4xy / 6xy | Vibrato, with volume slide | implemented (XM-shared sine LFO) |
-| 7xy | Tremolo | implemented (independent `trem_pos` register; volume offset clamped to `[0, 64]`; per-nibble memory) |
+| 4xy / 6xy | Vibrato, with volume slide | implemented (shared waveform LFO; sine default, shape set by E4x) |
+| 7xy | Tremolo | implemented (independent `trem_pos` register; volume offset clamped to `[0, 64]`; per-nibble memory; shape set by E7x) |
 | 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk); `900` reuses the latched `xx` per the canonical PT memory reading |
 | Axy | Volume slide | implemented |
 | Bxy | Position jump | implemented |
@@ -332,6 +332,7 @@ so the implemented columns track the ProTracker semantics documented under
 | Fxx | Speed / tempo split (≤$1F = speed, ≥$20 = tempo) | implemented |
 | E1x / E2x | Fine portamento up / down | implemented |
 | E3x | Glissando control (snap tone-porta to nearest semitone) | implemented |
+| E4x / E7x | Vibrato / tremolo waveform (sine / ramp-down / square / +4 no-retrigger bit) | implemented (shared `waveform_lfo` shape catalogue; the +4 bit keeps the LFO phase across note-ons, note-delay triggers, and E9x retrigs) |
 | E6x | Pattern loop (per-channel start + count) | implemented |
 | E9x | Retrigger note every *x* ticks | implemented (cursor rewind + vibrato/tremolo phase reset on each retrig; row-scoped period; gated on `voice.active` so an idle channel isn't resurrected) |
 | EAx / EBx | Fine volume slide up / down | implemented |

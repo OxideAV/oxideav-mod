@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **STM `E4x` / `E7x` vibrato + tremolo waveform control**
+  (`src/stm_player.rs`). The Scream Tracker v1 player now honours the
+  ProTracker "set vibrato waveform" / "set tremolo waveform"
+  sub-commands per `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+  E4/E7 — STM declares its effect column as "in ProTracker format" per
+  `docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`, so the PT
+  semantics carry across verbatim. Two new sticky per-channel
+  selectors (`vib_waveform` / `trem_waveform`) are latched by the
+  tick-0 Exy dispatcher; the 4xy/6xy vibrato and 7xy tremolo LFO
+  lookups now route through the shared
+  `crate::xm_player::waveform_lfo` helper (made `pub(crate)`; the
+  STM-local 64-entry sine table is removed since shape 0 of the
+  shared catalogue is the identical table) — 0 sine (default),
+  1 ramp down, 2 square, 3 random (deterministic sine fallback, no
+  PRNG documented). Bit 2 (+4) is the "No Retrigger" flag: per the
+  E4 doc table ("A 'retriggered' waveform will be reset to the start
+  of a cycle at the beginning of each new note. If a wave is
+  selected 'without retrigger', the previous waveform will be
+  continued"), the LFO phase reset is now gated on that bit at all
+  three realignment sites — row-entry note-on, EDx delayed trigger,
+  and the E9x per-tick retrigger (whose previous unconditional reset
+  was justified by the waveform flags not being honoured yet). Four
+  unit tests in `stm_player::tests` pin the surface:
+  `e4x_square_vibrato_shifts_pitch_at_phase_zero` (square at LFO
+  phase 0 sits at its +127 peak and deviates the pitch on the
+  row's first tick, while the default sine is zero-deviation),
+  `e4x_no_retrigger_bit_preserves_vibrato_phase_across_notes`
+  (E44 keeps `vib_pos = 20` across a fresh note-on and the
+  continued phase audibly deviates tick-0 pitch; E40 resets to 0),
+  `e7x_square_tremolo_lifts_volume_at_phase_zero` (square tremolo
+  lifts a 32/64 baseline to ~1.0 at phase 0; sine leaves it at
+  0.5), and `e9x_retrig_respects_no_retrigger_waveform_bit` (the
+  E9 cursor rewind still happens but the +4 bit keeps both LFO
+  phases). README STM effect table picks up the row.
+
 - **Typed MOD pattern-row predicates on `player::Note`**
   (`src/player.rs`). Four purely additive `#[inline]` methods fold
   the field-vs-zero idioms scattered across the playback engine
