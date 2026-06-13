@@ -267,6 +267,62 @@ impl Note {
     pub fn is_empty(&self) -> bool {
         !self.has_period() && !self.has_sample() && !self.has_effect()
     }
+
+    /// Rewrite an Ultimate SoundTracker effect column into the
+    /// equivalent ProTracker command so the standard player tick path
+    /// can interpret it.
+    ///
+    /// UST only defines two effects, both numbered differently from PT.
+    /// Per `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt`
+    /// ("Conversion of UST effects to PT (or MST)"):
+    ///
+    /// ```text
+    ///   Arpeggio:  1xy => 0xy
+    ///   Pitchbend: 20y => 10y   (20y = sub y from period = pitch up)
+    ///              2x0 => 20x   (2x0 = add x to period = pitch down)
+    /// ```
+    ///
+    /// So UST command `1` (arpeggio) maps onto PT command `0` with the
+    /// parameter byte unchanged, and UST command `2` (pitchbend) splits
+    /// on which nibble of the parameter is non-zero: a non-zero low
+    /// nibble (`20y`) is a portamento *up* (PT `1`, param `0y`) and a
+    /// non-zero high nibble (`2x0`) is a portamento *down* (PT `2`, with
+    /// the high nibble moved down into the low nibble as `0x`). A `200`
+    /// is inert in both numbering schemes (zero slide), and `2xy` with
+    /// both nibbles set is undefined in UST — the low-nibble (pitch-up)
+    /// reading is taken so the value still slides.
+    ///
+    /// Any other UST command value is left untouched: real UST modules
+    /// only ever carry `1xy` / `2xy`, and a foreign command is most
+    /// safely passed through verbatim rather than guessed at.
+    pub fn translate_ust_effect(&mut self) {
+        match self.effect {
+            // 1xy arpeggio => 0xy (param unchanged).
+            0x1 => {
+                self.effect = 0x0;
+            }
+            // 2xy pitchbend => PT slide up / down.
+            0x2 => {
+                let x = self.effect_param >> 4;
+                let y = self.effect_param & 0x0F;
+                if y != 0 {
+                    // 20y => 10y : slide up with param = low nibble.
+                    self.effect = 0x1;
+                    self.effect_param = y;
+                } else if x != 0 {
+                    // 2x0 => 20x : slide down with param = high nibble.
+                    self.effect = 0x2;
+                    self.effect_param = x;
+                } else {
+                    // 200 : no slide. PT command 0 with zero param is the
+                    // canonical "no effect" placeholder.
+                    self.effect = 0x0;
+                    self.effect_param = 0;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A decoded pattern: 64 rows × N channels.
@@ -291,6 +347,7 @@ pub fn parse_patterns(header: &ModHeader, bytes: &[u8]) -> Vec<Pattern> {
     let mut patterns = Vec::with_capacity(header.n_patterns as usize);
     let base = header.pattern_data_offset();
     let flt8 = header.is_flt8();
+    let ust = header.is_ust();
 
     for p in 0..header.n_patterns as usize {
         let mut rows = Vec::with_capacity(PATTERN_ROWS);
@@ -314,7 +371,11 @@ pub fn parse_patterns(header: &ModHeader, bytes: &[u8]) -> Vec<Pattern> {
                 } else {
                     [0; 4]
                 };
-                row.push(Note::decode(raw));
+                let mut note = Note::decode(raw);
+                if ust {
+                    note.translate_ust_effect();
+                }
+                row.push(note);
             }
             rows.push(row);
         }
@@ -4230,5 +4291,162 @@ pub mod tests {
         assert!(!n.has_sample());
         assert!(!n.has_effect());
         assert!(n.is_empty());
+    }
+
+    fn ust_translated(effect: u8, param: u8) -> (u8, u8) {
+        let mut n = Note {
+            period: 0,
+            sample: 0,
+            effect,
+            effect_param: param,
+        };
+        n.translate_ust_effect();
+        (n.effect, n.effect_param)
+    }
+
+    #[test]
+    fn ust_effect_arpeggio_1xy_maps_to_0xy() {
+        // Ultimate-Soundtracker-mod.txt: "Arpeggio: 1xy => 0xy".
+        assert_eq!(ust_translated(0x1, 0x47), (0x0, 0x47));
+        // A zero param stays a (now harmless) arpeggio-0 == no-op.
+        assert_eq!(ust_translated(0x1, 0x00), (0x0, 0x00));
+    }
+
+    #[test]
+    fn ust_effect_pitchbend_up_20y_maps_to_1_0y() {
+        // "Pitchbend: 20y => 10y" — low nibble set = slide UP (PT cmd 1).
+        assert_eq!(ust_translated(0x2, 0x05), (0x1, 0x05));
+        assert_eq!(ust_translated(0x2, 0x0F), (0x1, 0x0F));
+    }
+
+    #[test]
+    fn ust_effect_pitchbend_down_2x0_maps_to_2_0x() {
+        // "Pitchbend: 2x0 => 20x" — high nibble set = slide DOWN (PT cmd 2),
+        // and the high nibble moves down into the low nibble.
+        assert_eq!(ust_translated(0x2, 0x50), (0x2, 0x05));
+        assert_eq!(ust_translated(0x2, 0xF0), (0x2, 0x0F));
+    }
+
+    #[test]
+    fn ust_effect_pitchbend_200_is_inert() {
+        // 200 = no slide → PT no-effect placeholder (cmd 0, param 0).
+        assert_eq!(ust_translated(0x2, 0x00), (0x0, 0x00));
+    }
+
+    #[test]
+    fn ust_effect_pitchbend_both_nibbles_takes_up_reading() {
+        // 2xy with both nibbles set is undefined in UST; the low-nibble
+        // (pitch-up) reading wins so the value still slides.
+        assert_eq!(ust_translated(0x2, 0x34), (0x1, 0x04));
+    }
+
+    #[test]
+    fn ust_effect_foreign_command_passes_through() {
+        // Real UST only emits 1xy / 2xy; any other command is left
+        // verbatim rather than guessed at.
+        assert_eq!(ust_translated(0xC, 0x40), (0xC, 0x40));
+        assert_eq!(ust_translated(0x0, 0x00), (0x0, 0x00));
+    }
+
+    /// Build a synthetic 15-sample Ultimate SoundTracker module with one
+    /// 4-channel pattern. Sample 1 is the same 32-byte looping square
+    /// wave as `synth_square_mod`. `cells` writes `(row, channel, Note)`
+    /// entries (with UST-native effect numbering) into pattern 0.
+    fn synth_ust_mod(cells: &[(usize, usize, Note)]) -> Vec<u8> {
+        use crate::header::{
+            UST_BPM_OFFSET, UST_HEADER_FIXED_SIZE, UST_ORDER_TABLE_OFFSET, UST_SONG_LENGTH_OFFSET,
+        };
+        let mut out = vec![0u8; UST_HEADER_FIXED_SIZE];
+        out[0..4].copy_from_slice(b"ust\0");
+        // Sample 1 header at +20: length 16 words = 32 samples, vol 64,
+        // repeat start 0 (bytes), repeat length 16 words = 32 samples.
+        out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
+        out[UST_SONG_LENGTH_OFFSET] = 1;
+        out[UST_BPM_OFFSET] = 0x78;
+        out[UST_ORDER_TABLE_OFFSET] = 0;
+
+        let mut pat = vec![0u8; 64 * 4 * 4];
+        for &(row, channel, ref note) in cells {
+            let off = row * 4 * 4 + channel * 4;
+            let p_hi = ((note.period >> 8) & 0x0F) as u8;
+            let p_lo = (note.period & 0xFF) as u8;
+            let sample_hi = (note.sample & 0xF0) >> 4;
+            let sample_lo = note.sample & 0x0F;
+            pat[off] = (sample_hi << 4) | p_hi;
+            pat[off + 1] = p_lo;
+            pat[off + 2] = (sample_lo << 4) | note.effect;
+            pat[off + 3] = note.effect_param;
+        }
+        out.extend(pat);
+
+        for i in 0..32 {
+            let v: i8 = if i < 16 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn ust_module_parses_and_plays() {
+        use crate::header::parse_ust_header;
+        // Row 0 ch 0: period 428 (A-3), sample 1, UST arpeggio 1-3-5.
+        let note = Note {
+            period: 428,
+            sample: 1,
+            effect: 0x1,
+            effect_param: 0x35,
+        };
+        let bytes = synth_ust_mod(&[(0, 0, note)]);
+        let header = parse_ust_header(&bytes).unwrap();
+        assert!(header.is_ust());
+        assert_eq!(header.channels, 4);
+
+        let patterns = parse_patterns(&header, &bytes);
+        // The UST 1xy arpeggio was translated to PT 0xy in-place.
+        let cell = &patterns[0].rows[0][0];
+        assert_eq!(cell.period, 428);
+        assert_eq!(cell.sample, 1);
+        assert_eq!(cell.effect, 0x0);
+        assert_eq!(cell.effect_param, 0x35);
+
+        let samples = extract_samples(&header, &bytes);
+        assert_eq!(samples.len(), 15);
+        // Sample slot 0 (= note sample number 1) body extracted (32 samples).
+        assert_eq!(samples[0].pcm.len(), 32);
+
+        let mut player = PlayerState::new(&header, samples, patterns, 44_100);
+        let mut buf = vec![0i16; 4096];
+        let written = player.render(&mut buf);
+        assert!(written > 0);
+        // The square wave should produce non-silent output.
+        assert!(buf.iter().any(|&s| s != 0));
+    }
+
+    #[test]
+    fn ust_pitchbend_drives_period_slide() {
+        use crate::header::parse_ust_header;
+        // Row 0: note + sample. Row 1: UST 2x0 pitch-down (period rises).
+        let n0 = Note {
+            period: 428,
+            sample: 1,
+            effect: 0,
+            effect_param: 0,
+        };
+        let n1 = Note {
+            period: 0,
+            sample: 0,
+            effect: 0x2,
+            effect_param: 0x30, // 2x0 => slide down (period += 3/tick)
+        };
+        let bytes = synth_ust_mod(&[(0, 0, n0), (1, 0, n1)]);
+        let header = parse_ust_header(&bytes).unwrap();
+        let patterns = parse_patterns(&header, &bytes);
+        // Row 1 cell translated to PT slide-down (cmd 2, param 0x03).
+        let cell = &patterns[0].rows[1][0];
+        assert_eq!(cell.effect, 0x2);
+        assert_eq!(cell.effect_param, 0x03);
     }
 }

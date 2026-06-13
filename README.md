@@ -16,6 +16,10 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   sine-table vibrato / tremolo, sample-offset, tone portamento, pattern
   loop, note-delay / note-cut, pattern-delay, full 16-finetune × 36-note
   period table); mixes samples with linear interpolation.
+- **15-sample Ultimate SoundTracker**: the original Karsten-Obarski
+  layout (no `M.K.` signature, 15 sample slots, pattern data at +600) is
+  parsed by `header::parse_ust_header` and plays through the same
+  `PlayerState`. See *Ultimate SoundTracker (15-sample)* below.
 - **Decode only** — there is no MOD encoder, by design.
 
 ## Output modes
@@ -151,6 +155,49 @@ companion `transpose_semitones()` sums the integer-semitone
 finetune offset and returns the total pitch shift relative to the
 cell's note, the canonical surface for tuning UIs and transcription
 tools.
+
+## Ultimate SoundTracker (15-sample)
+
+The original Karsten-Obarski *Ultimate SoundTracker* (UST) module layout
+predates the `M.K.` format ID and uses **15** sample slots instead of 31,
+so every field after the sample table sits at a different offset and the
+fixed header is 600 bytes (vs 1084) before the pattern data. UST carries
+no 4-byte signature, so it cannot be probed from a magic — the parser
+entry point is selected explicitly: `header::parse_ust_header` instead of
+`header::parse_header`. The doc itself recommends a caller-side switch
+("either default to UST or provide a switch to toggle between UST and
+ST"), so this crate exposes the UST path as an explicit parser rather
+than guessing from heuristics.
+
+`parse_ust_header` produces the *same* `ModHeader` / `Sample` /
+pattern-cell shapes the 31-sample path produces, normalising the UST-only
+field conventions so the existing pattern / sample-extraction / player
+machinery runs unchanged:
+
+- **Layout** — title @+0, 15 × 30-byte samples @+20, song length @+470,
+  song-speed BPM byte @+471 (surfaced via `restart`; **not** a restart
+  position), order table @+472, pattern data @+600. `ModVariant`
+  records the origin and `ModHeader::pattern_data_offset` /
+  `sample_data_offset` resolve the right offsets.
+- **Repeat offset in bytes** — UST stores the loop start in *bytes*,
+  unlike PT / NT / ST-2.5 which use word counts, so `parse_ust_header`
+  passes it straight through without the ×2 word→sample scaling.
+- **No finetune** — UST has no finetune nibble (the byte at +24 is the
+  high half of the volume word), so `finetune` is fixed to 0.
+- **Effect translation** — UST defines only two effects, numbered
+  differently from PT, translated in-place during `parse_patterns`
+  (`Note::translate_ust_effect`): `1xy` arpeggio → PT `0xy`; pitchbend
+  `20y` (pitch up) → PT slide-up `1·0y`, `2x0` (pitch down) → PT
+  slide-down `2·0x`, `200` → no-op. A foreign command is passed through
+  verbatim. Cited in
+  `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt`
+  ("Conversion of UST effects to PT").
+
+The UST song-speed byte (+471) follows a different timer convention from
+the 31-sample BPM (`AMIGA Timer-IRQ = (240-bpm)*122`); the player runs at
+its default tempo and the byte is surfaced through `restart` for callers
+that want to derive the UST tick rate themselves. Honouring the UST
+timer math end-to-end in the tick scheduler is a follow-up.
 
 ## Real-world MOD fidelity
 

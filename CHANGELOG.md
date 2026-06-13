@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **15-sample Ultimate SoundTracker (UST) layout** (`src/header.rs`,
+  `src/player.rs`). Added `header::parse_ust_header` for the original
+  Karsten-Obarski layout — 15 sample slots (vs 31), no `M.K.`
+  signature, a 600-byte fixed header, song length @+470, BPM byte
+  @+471, order table @+472, and pattern data @+600. The new
+  `ModVariant` field on `ModHeader` makes `pattern_data_offset` /
+  `sample_data_offset` layout-aware, so the existing pattern parse,
+  sample extraction, and `PlayerState` run unchanged. UST field
+  conventions are normalised on parse: the loop start is read in
+  *bytes* (not words, unlike PT/NT/ST-2.5), there is no finetune
+  nibble (fixed to 0), and `restart` carries the +471 song-speed BPM
+  byte. The two UST-only effects are translated in-place during
+  `player::parse_patterns` via `Note::translate_ust_effect`: `1xy`
+  arpeggio → PT `0xy`; pitchbend `20y` (up) → PT slide-up `1·0y`,
+  `2x0` (down) → PT slide-down `2·0x`, `200` → no-op. Cited in
+  `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt` (layout
+  table, sample-header notes, and "Conversion of UST effects to PT").
+  Twenty new unit tests cover the header layout, sample-field
+  normalisation, every effect-translation branch, and an end-to-end
+  parse-and-render smoke test.
 - **Startrekker `FLT8` paired-pattern layout** (`src/header.rs`,
   `src/player.rs`). `FLT8` modules keep the normal 4-channel
   0x400-byte stored-pattern layout and pair two consecutive stored

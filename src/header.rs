@@ -28,6 +28,55 @@ pub const PATTERN_ROWS: usize = 64;
 pub const SAMPLE_COUNT: usize = 31;
 pub const ORDER_TABLE_SIZE: usize = 128;
 
+/// Ultimate SoundTracker (15-sample) header constants.
+///
+/// Per `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt` the UST
+/// layout differs from the 31-sample ProTracker/SoundTracker layout in
+/// the number of sample slots (15 vs 31) and therefore in the offsets of
+/// every field after the sample table:
+///
+/// ```text
+/// + 0    20 bytes      song/module working title
+/// + 20   15 * 30 bytes 15 sample headers
+/// + 470  1 byte        song length (number of steps in pattern table)
+/// + 471  1 byte        song speed in BPM (NOT a restart byte)
+/// + 472  128 bytes     pattern step (order) table
+/// + 600  …             pattern data (1024 bytes / 4-channel pattern)
+/// ```
+///
+/// 15 samples × 30 bytes = 450 bytes, so the fixed header preceding the
+/// pattern data is 600 bytes (vs 1084 for the 31-sample layout). There
+/// is no 4-byte signature at offset 1080 — UST predates the `M.K.`
+/// format ID, so the variant must be selected by the caller rather than
+/// detected from a magic.
+pub const UST_SAMPLE_COUNT: usize = 15;
+/// Fixed header size for the 15-sample UST layout (pattern data starts here).
+pub const UST_HEADER_FIXED_SIZE: usize = 600;
+/// Offset of the song-length byte in the UST layout.
+pub const UST_SONG_LENGTH_OFFSET: usize = 470;
+/// Offset of the BPM byte in the UST layout (`AMIGA Timer-IRQ = (240-bpm)*122`).
+pub const UST_BPM_OFFSET: usize = 471;
+/// Offset of the 128-entry pattern order table in the UST layout.
+pub const UST_ORDER_TABLE_OFFSET: usize = 472;
+
+/// Which on-disk header layout a [`ModHeader`] was parsed from.
+///
+/// The two variants share the [`ModHeader`] / [`Sample`] / pattern-cell
+/// shapes after parsing (the UST parser normalises its fields into the
+/// same units the 31-sample parser uses), but they differ in the byte
+/// offsets of the order table / pattern data / sample bodies and in how
+/// the pattern-cell effect column is interpreted. Downstream code keys
+/// off this enum via [`ModHeader::pattern_data_offset`] /
+/// [`ModHeader::sample_data_offset`] and the variant-aware effect
+/// translation in `player::parse_patterns`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModVariant {
+    /// The 31-sample ProTracker / SoundTracker-2.x family (signature at +1080).
+    Standard31,
+    /// The 15-sample Ultimate SoundTracker layout (no signature).
+    UltimateSoundTracker15,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sample {
     pub name: String,
@@ -94,12 +143,32 @@ pub struct ModHeader {
     pub channels: u8,
     /// Number of distinct patterns referenced by the order table.
     pub n_patterns: u8,
+    /// Which on-disk layout this header was parsed from.
+    pub variant: ModVariant,
 }
 
 impl ModHeader {
-    /// Total size of the header block preceding sample data (in bytes).
+    /// True for the 15-sample Ultimate SoundTracker layout.
+    ///
+    /// Cited in `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt`
+    /// ("15 sample headers", pattern data at +600). UST modules carry no
+    /// signature, so the variant is selected by the parser entry point
+    /// ([`parse_ust_header`] vs [`parse_header`]) rather than detected
+    /// from a magic.
+    pub fn is_ust(&self) -> bool {
+        self.variant == ModVariant::UltimateSoundTracker15
+    }
+
+    /// Total size of the header block preceding pattern data (in bytes).
+    ///
+    /// The 31-sample layout reserves a fixed 1084-byte header; the UST
+    /// 15-sample layout reserves only 600 bytes because it has 16 fewer
+    /// 30-byte sample slots and no 4-byte signature word.
     pub fn pattern_data_offset(&self) -> usize {
-        HEADER_FIXED_SIZE
+        match self.variant {
+            ModVariant::Standard31 => HEADER_FIXED_SIZE,
+            ModVariant::UltimateSoundTracker15 => UST_HEADER_FIXED_SIZE,
+        }
     }
 
     /// True for Startrekker 8-channel `FLT8` modules, whose pattern
@@ -133,7 +202,7 @@ impl ModHeader {
 
     /// Absolute offset where sample bodies begin.
     pub fn sample_data_offset(&self) -> usize {
-        HEADER_FIXED_SIZE + self.pattern_data_size()
+        self.pattern_data_offset() + self.pattern_data_size()
     }
 }
 
@@ -199,6 +268,92 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
         signature,
         channels,
         n_patterns,
+        variant: ModVariant::Standard31,
+    })
+}
+
+/// Parse the 15-sample Ultimate SoundTracker header layout.
+///
+/// UST predates the `M.K.` format ID, so there is no signature to detect
+/// the variant from — the caller selects this entry point explicitly
+/// (per the doc's recommendation to "either default to UST or provide a
+/// switch to toggle between UST and ST"). Fields are normalised into the
+/// same units the 31-sample [`parse_header`] uses so that the resulting
+/// [`ModHeader`] drives the existing pattern / sample / player path
+/// unchanged (modulo the variant-aware offsets and effect translation):
+///
+/// - sample `length` and `repeat_length`: on-disk **words** → samples
+///   (× 2), matching the 31-sample parser;
+/// - sample `repeat_start`: on-disk **bytes** in UST (NOT words as in
+///   PT / NT / ST-2.5) — passed straight through without the × 2 word
+///   scaling. Cited in `Ultimate-Soundtracker-mod.txt`: "Sample repeat
+///   offset is in bytes (unlike PT, NT, and ST 2.5, where it is
+///   specified as number of words)";
+/// - `finetune` is fixed to 0 — UST has no finetune nibble (the byte at
+///   +24 is the high half of the volume word, documented as not carrying
+///   a finetune value);
+/// - a synthetic `*b"M.K."` signature and 4-channel count are filled in
+///   so signature-keyed consumers see a 4-channel module (UST is always
+///   4 voices), while `variant` records the true UST origin.
+///
+/// The byte at +471 is the song speed in BPM, **not** a restart marker
+/// (`AMIGA Timer-IRQ value = (240-bpm)*122`); it is surfaced through the
+/// `restart` field for callers that want it, but is not interpreted as a
+/// loop position. Cited in `Ultimate-Soundtracker-mod.txt`.
+pub fn parse_ust_header(bytes: &[u8]) -> Result<ModHeader> {
+    if bytes.len() < UST_HEADER_FIXED_SIZE {
+        return Err(Error::NeedMore);
+    }
+    let title = read_padded_ascii(&bytes[0..20]);
+
+    let mut samples = Vec::with_capacity(UST_SAMPLE_COUNT);
+    for i in 0..UST_SAMPLE_COUNT {
+        let off = 20 + i * 30;
+        let name = read_padded_ascii(&bytes[off..off + 22]);
+        let len_words = u16::from_be_bytes([bytes[off + 22], bytes[off + 23]]) as u32;
+        // +24 is the volume word; UST documents no finetune nibble, and
+        // the high byte of the volume word does not carry one either.
+        let volume = bytes[off + 25].min(64);
+        // Repeat offset is in BYTES in UST (unlike the word counts of
+        // PT / NT / ST-2.5), so no word→sample scaling here.
+        let repeat_start_bytes = u16::from_be_bytes([bytes[off + 26], bytes[off + 27]]) as u32;
+        let repeat_length_words = u16::from_be_bytes([bytes[off + 28], bytes[off + 29]]) as u32;
+        samples.push(Sample {
+            name,
+            length: len_words.saturating_mul(2),
+            finetune: 0,
+            volume,
+            repeat_start: repeat_start_bytes,
+            repeat_length: repeat_length_words.saturating_mul(2),
+        });
+    }
+
+    let song_length = bytes[UST_SONG_LENGTH_OFFSET];
+    // +471 is the BPM speed byte, not a restart position. Surfaced via
+    // `restart` for completeness; the player does not treat it as a loop
+    // marker.
+    let restart = bytes[UST_BPM_OFFSET];
+    let order: Vec<u8> =
+        bytes[UST_ORDER_TABLE_OFFSET..UST_ORDER_TABLE_OFFSET + ORDER_TABLE_SIZE].to_vec();
+
+    // UST is always 4-channel; fill a synthetic signature so the rest of
+    // the pipeline (channel count, metadata) behaves like a 4-channel
+    // module while `variant` records the true origin.
+    let signature = *b"M.K.";
+    let channels = 4;
+
+    let n_patterns = 1 + *order.iter().take(song_length as usize).max().unwrap_or(&0);
+
+    Ok(ModHeader {
+        title,
+        samples,
+        song_length,
+        restart,
+        order,
+        signature,
+        channels,
+        n_patterns,
+        variant: ModVariant::UltimateSoundTracker15,
     })
 }
 
@@ -374,5 +529,92 @@ mod tests {
         let mut s = sample_with_repeat(2000, 4000);
         s.length = 1024;
         assert_eq!(s.loop_region(), Some((2000, 4000)));
+    }
+
+    #[test]
+    fn standard_header_reports_standard31_variant() {
+        let h = parse_header(&make_fake_mod(b"M.K.", 1)).unwrap();
+        assert_eq!(h.variant, ModVariant::Standard31);
+        assert!(!h.is_ust());
+        assert_eq!(h.pattern_data_offset(), HEADER_FIXED_SIZE);
+    }
+
+    /// Build a minimal valid 15-sample Ultimate SoundTracker file with
+    /// `song_length` order entries (all → pattern 0) and one 1024-byte
+    /// 4-channel pattern's worth of trailing space.
+    fn make_fake_ust(song_length: u8) -> Vec<u8> {
+        // 600-byte header + one 0x400 pattern.
+        let mut out = vec![0u8; UST_HEADER_FIXED_SIZE + 0x400];
+        out[0..4].copy_from_slice(b"ust\0");
+        out[UST_SONG_LENGTH_OFFSET] = song_length;
+        out[UST_BPM_OFFSET] = 0x78; // 120 BPM default
+        for i in 0..song_length as usize {
+            out[UST_ORDER_TABLE_OFFSET + i] = 0;
+        }
+        out
+    }
+
+    #[test]
+    fn ust_header_layout_and_variant() {
+        let h = parse_ust_header(&make_fake_ust(1)).unwrap();
+        assert_eq!(h.variant, ModVariant::UltimateSoundTracker15);
+        assert!(h.is_ust());
+        assert_eq!(h.title, "ust");
+        assert_eq!(h.channels, 4);
+        assert_eq!(h.signature, *b"M.K.");
+        assert_eq!(h.samples.len(), UST_SAMPLE_COUNT);
+        assert_eq!(h.song_length, 1);
+        // +471 is the BPM byte (0x78 = 120), surfaced through `restart`.
+        assert_eq!(h.restart, 0x78);
+        // Pattern data starts at +600, not +1084.
+        assert_eq!(h.pattern_data_offset(), UST_HEADER_FIXED_SIZE);
+        assert_eq!(h.n_patterns, 1);
+        // One 4-channel pattern = 64 rows × 4 ch × 4 bytes = 0x400.
+        assert_eq!(h.pattern_data_size(), 0x400);
+        assert_eq!(h.sample_data_offset(), UST_HEADER_FIXED_SIZE + 0x400);
+    }
+
+    #[test]
+    fn ust_too_short_needs_more() {
+        let short = vec![0u8; UST_HEADER_FIXED_SIZE - 1];
+        assert!(matches!(parse_ust_header(&short), Err(Error::NeedMore)));
+    }
+
+    #[test]
+    fn ust_sample_fields_repeat_offset_in_bytes_no_finetune() {
+        let mut bytes = make_fake_ust(1);
+        // Sample 0 header at +20.
+        let off = 20;
+        bytes[off..off + 4].copy_from_slice(b"snd\0");
+        // length in words = 100 → 200 samples.
+        bytes[off + 22..off + 24].copy_from_slice(&100u16.to_be_bytes());
+        // +24 is the high byte of the volume word (no finetune); +25 is volume.
+        bytes[off + 24] = 0xFF; // would be a finetune nibble in PT — ignored in UST
+        bytes[off + 25] = 40;
+        // Repeat offset (+26) is in BYTES in UST — pass straight through.
+        bytes[off + 26..off + 28].copy_from_slice(&50u16.to_be_bytes());
+        // Repeat length (+28) is in words → ×2 = samples.
+        bytes[off + 28..off + 30].copy_from_slice(&30u16.to_be_bytes());
+
+        let h = parse_ust_header(&bytes).unwrap();
+        let s = &h.samples[0];
+        assert_eq!(s.name, "snd");
+        assert_eq!(s.length, 200);
+        // No finetune nibble in UST regardless of the +24 byte.
+        assert_eq!(s.finetune, 0);
+        assert_eq!(s.volume, 40);
+        // Repeat start stays 50 (bytes), NOT 100 (would-be word doubling).
+        assert_eq!(s.repeat_start, 50);
+        // Repeat length doubled from words: 30 → 60.
+        assert_eq!(s.repeat_length, 60);
+        assert!(s.is_looped());
+    }
+
+    #[test]
+    fn ust_volume_clamped_to_64() {
+        let mut bytes = make_fake_ust(1);
+        bytes[20 + 25] = 100; // > 64
+        let h = parse_ust_header(&bytes).unwrap();
+        assert_eq!(h.samples[0].volume, 64);
     }
 }
