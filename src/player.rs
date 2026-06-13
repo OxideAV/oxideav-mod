@@ -735,10 +735,7 @@ pub struct PlayerState {
     /// Sallen-Key) pole at ~3.3 kHz, but the always-on first RC
     /// pole at ~5 kHz stays in place — that pole models the
     /// always-on anti-alias RC stage that sits between Paula's DAC
-    /// and the audio jacks on every A500 / A1200 motherboard
-    /// (documented in the MilkyTracker reference doc and the
-    /// Polynominal "Amiga filter test" page — both are documentation,
-    /// not third-party source).
+    /// and the audio jacks on every A500 / A1200 motherboard.
     led_filter: bool,
     /// First filter pole (always on). For mixed stereo the first two
     /// slots hold L/R state; for planar per-channel output one slot
