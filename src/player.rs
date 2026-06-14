@@ -76,6 +76,23 @@ pub const PROTRACKER_SINE_TABLE: [u8; 32] = [
     180, 161, 141, 120,  97,  74,  49,  24,
 ];
 
+/// 16-entry EFx (invert-loop / "funkrepeat") speed table. Indexed by the
+/// EFx parameter nibble `x` (0..=0xF); the value is the per-tick increment
+/// added to the channel's funkrepeat counter. When the counter reaches
+/// 128 a single loop byte is inverted and the counter resets to 0, so a
+/// larger table value means a faster inversion cadence.
+///
+/// Values from `multimedia-cx-protracker.html` §EFx ("This tells you how
+/// much to increment the internal counter by"): `0,5,6,7,8,10,11,13,16,
+/// 19,22,26,32,43,64,128`. Entry 0 is 0 (a parameter of `EF0` turns the
+/// effect off rather than running it). The corresponding per-byte cadence
+/// in ticks (128 / value, rounded up) is also tabulated there:
+/// `inf,26,22,19,16,13,12,10,8,7,6,5,4,3,2,1`.
+#[rustfmt::skip]
+pub const FUNK_TABLE: [u8; 16] = [
+    0, 5, 6, 7, 8, 10, 11, 13, 16, 19, 22, 26, 32, 43, 64, 128,
+];
+
 /// 16-finetune × 36-note Protracker period table. Indexed as
 /// `PERIOD_TABLE[finetune_index][note_index]` where
 /// `finetune_index = finetune & 0xF` (0..=7 = +0..+7, 8..=15 = -8..-1)
@@ -519,6 +536,23 @@ pub struct Channel {
     /// [`PlayerState::RAMP_FRAMES`] on every fresh trigger; counted
     /// down by `mix_one` once per output frame.
     pub ramp_remaining_frames: u32,
+
+    /// EFx invert-loop ("funkrepeat") per-tick counter increment, looked
+    /// up from [`FUNK_TABLE`] by the EFx nibble. `0` = the effect is off
+    /// for this channel. Per `multimedia-cx-protracker.html` §EFx.
+    pub funk_speed: u8,
+    /// EFx invert-loop accumulator. Incremented by `funk_speed` every
+    /// tick; when it reaches 128 a single loop byte is inverted and the
+    /// counter resets to 0 (`multimedia-cx-protracker.html` §EFx: "For
+    /// every tick, increment the channel's funkrepeat counter by its
+    /// funkrepeat speed. If the funkrepeat counter reaches 128, then
+    /// reset the counter to 0").
+    pub funk_counter: u8,
+    /// EFx invert-loop byte position relative to the current sample's
+    /// loop start (`loop_begin_in_bytes + funkrepeat_pos`). Advances by
+    /// one (mod loop length in bytes) each time a byte is inverted, and
+    /// resets to 0 when a new sample is latched on this channel.
+    pub funk_pos: u32,
 }
 
 /// Stores the note/sample/effect details of an EDy-delayed trigger so we
@@ -1080,6 +1114,13 @@ impl PlayerState {
                 if has_note || is_note_delay_pre {
                     // A trigger is happening on this row — latch the
                     // sample index so the new note plays the new sample.
+                    if ch.sample_index != note.sample {
+                        // New sample reached: reset the EFx invert-loop
+                        // byte position per `multimedia-cx-protracker.html`
+                        // §EFx ("Every time you reach a new sample value,
+                        // reset that channel's funkrepeat position to 0").
+                        ch.funk_pos = 0;
+                    }
                     ch.sample_index = note.sample;
                 } else {
                     // No trigger: remember the requested swap for the
@@ -1276,6 +1317,12 @@ impl PlayerState {
                 apply_tickn_effect(ch_idx, self.tick, &mut self.channels, &self.samples);
             }
         }
+        // EFx invert-loop ("funkrepeat") advances on *every* tick, tick 0
+        // included (`multimedia-cx-protracker.html` §EFx: "For every tick,
+        // increment the channel's funkrepeat counter…"). It mutates the
+        // shared sample bodies in place, so it runs after the per-tick
+        // effect dispatch and after `enter_row` has latched any new sample.
+        funkrepeat_step(&mut self.channels, &mut self.samples);
     }
 
     /// Move to next row (or jump).
@@ -1855,9 +1902,20 @@ fn apply_extended_tick0(
             // EEx: pattern delay — delay row by y more rows' worth of ticks.
             *pattern_delay = y;
         }
-        0xF => { /* EFx: invert loop — deliberately not implemented (spec
-             says "This effect is not supported in any player or
-             tracker. Don't bother with it"). */
+        0xF => {
+            // EFx: invert loop ("funkrepeat"). Per
+            // `multimedia-cx-protracker.html` §EFx: "If x is 0, then reset
+            // that channel's funkrepeat counter and funkrepeat position to
+            // 0. Otherwise, set that channel's funkrepeat speed to
+            // funkrepeat_table[x]." The per-tick inversion of loop bytes is
+            // driven by `funkrepeat_step` once per tick (all ticks,
+            // including tick 0). `FUNK_TABLE[0]` is 0, so `EF0` both
+            // disables the increment and clears the counter/position.
+            ch.funk_speed = FUNK_TABLE[(y & 0x0F) as usize];
+            if y == 0 {
+                ch.funk_counter = 0;
+                ch.funk_pos = 0;
+            }
         }
         _ => {}
     }
@@ -1993,6 +2051,58 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
             volume_slide_step(ch, slide);
         }
         _ => {}
+    }
+}
+
+/// Advance the EFx invert-loop ("funkrepeat") state for every channel by
+/// one tick, mutating the active samples' loop bytes in place.
+///
+/// `multimedia-cx-protracker.html` §EFx: "For every tick, increment the
+/// channel's funkrepeat counter by its funkrepeat speed. If the funkrepeat
+/// counter reaches 128, then reset the counter to 0, and then:
+///
+///   sampledata[current_sample][loop_begin_in_bytes + funkrepeat_pos] ^= 0xFF;
+///   funkrepeat_pos = (funkrepeat_pos + 1) % loop_length_in_bytes;
+///
+/// It does not affect samples which don't have loops in them."
+///
+/// MOD sample bodies are signed 8-bit, one byte per PCM frame, so the
+/// "byte" offsets are PCM indices directly. The loop region runs from
+/// `loop_start` for `loop_length` bytes. The XOR (`^= 0xFF`) is the logical
+/// NOT the spec calls for and deliberately overwrites the shared sample
+/// data — the effect's defining (and "nasty") characteristic.
+fn funkrepeat_step(channels: &mut [Channel], samples: &mut [SampleBody]) {
+    for ch in channels.iter_mut() {
+        if ch.funk_speed == 0 {
+            continue;
+        }
+        // Counter saturates well below u8::MAX (max single increment is
+        // 128); use a wider accumulator so the `>= 128` test never wraps.
+        let next = ch.funk_counter as u16 + ch.funk_speed as u16;
+        if next < 128 {
+            ch.funk_counter = next as u8;
+            continue;
+        }
+        ch.funk_counter = 0;
+        let idx = ch.sample_index as usize;
+        if idx < 1 || idx > samples.len() {
+            continue;
+        }
+        let body = &mut samples[idx - 1];
+        // Loop must be present (loop_length > 2 per the ProTracker "no
+        // loop" sentinel honoured elsewhere in this crate); a degenerate
+        // loop yields nothing to invert.
+        let loop_len = body.loop_length as usize;
+        if loop_len <= 2 {
+            continue;
+        }
+        let pos = ch.funk_pos as usize % loop_len;
+        let target = body.loop_start as usize + pos;
+        if let Some(byte) = body.pcm.get_mut(target) {
+            // ^= 0xFF on the signed PCM byte == logical NOT.
+            *byte = !*byte;
+        }
+        ch.funk_pos = ((pos + 1) % loop_len) as u32;
     }
 }
 
@@ -4445,5 +4555,179 @@ pub mod tests {
         let cell = &patterns[0].rows[1][0];
         assert_eq!(cell.effect, 0x2);
         assert_eq!(cell.effect_param, 0x03);
+    }
+
+    #[test]
+    fn funk_table_matches_protracker_increments() {
+        // `multimedia-cx-protracker.html` §EFx: the increment table from
+        // the ProTracker v1.2 source is
+        //   0,5,6,7,8,10,11,13,16,19,22,26,32,43,64,128
+        assert_eq!(
+            FUNK_TABLE,
+            [0, 5, 6, 7, 8, 10, 11, 13, 16, 19, 22, 26, 32, 43, 64, 128]
+        );
+    }
+
+    #[test]
+    fn efx_tick0_sets_speed_from_table_and_ef0_resets() {
+        // EF8 sets funk_speed to FUNK_TABLE[8] = 16. EF0 clears the
+        // counter and position back to 0 (and speed to FUNK_TABLE[0] = 0).
+        let mut channels = vec![Channel::default()];
+        let mut jump = None;
+        let mut loop_rows = [0u8; 1];
+        let mut loop_counts = [0u8; 1];
+        let mut pattern_delay = 0u8;
+
+        apply_extended_tick0(
+            0,
+            0xF,
+            0x8,
+            &mut channels,
+            &mut jump,
+            &mut loop_rows,
+            &mut loop_counts,
+            &mut pattern_delay,
+            0,
+            0,
+        );
+        assert_eq!(channels[0].funk_speed, 16, "EF8 → FUNK_TABLE[8] = 16");
+
+        // Dirty the counter/position, then EF0 should clear them.
+        channels[0].funk_counter = 99;
+        channels[0].funk_pos = 7;
+        apply_extended_tick0(
+            0,
+            0xF,
+            0x0,
+            &mut channels,
+            &mut jump,
+            &mut loop_rows,
+            &mut loop_counts,
+            &mut pattern_delay,
+            0,
+            0,
+        );
+        assert_eq!(channels[0].funk_speed, 0, "EF0 → FUNK_TABLE[0] = 0 (off)");
+        assert_eq!(channels[0].funk_counter, 0, "EF0 resets counter");
+        assert_eq!(channels[0].funk_pos, 0, "EF0 resets position");
+    }
+
+    #[test]
+    fn funkrepeat_inverts_loop_bytes_at_expected_cadence() {
+        // `multimedia-cx-protracker.html` §EFx: counter accumulates by
+        // funk_speed each tick; when it reaches 128 a single loop byte is
+        // inverted (`^= 0xFF`, i.e. logical NOT) and the position advances
+        // mod loop length. With speed 128 (EFF) exactly one byte inverts
+        // per tick; with speed 64 (EFE) one byte inverts every 2 ticks.
+        let pcm: Vec<i8> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let mut samples = vec![SampleBody {
+            pcm: pcm.clone(),
+            loop_start: 2,
+            loop_length: 4, // loop region = indices 2..6
+            volume: 64,
+            finetune: 0,
+        }];
+        let mut channels = vec![Channel {
+            sample_index: 1,
+            funk_speed: FUNK_TABLE[0xF], // 128 → one invert per tick
+            ..Channel::default()
+        }];
+
+        // Tick 1: counter 0 + 128 = 128 → invert loop byte 0 (pcm index 2).
+        funkrepeat_step(&mut channels, &mut samples);
+        assert_eq!(samples[0].pcm[2], !30i8, "first invert hits loop_start");
+        assert_eq!(channels[0].funk_counter, 0, "counter resets after invert");
+        assert_eq!(channels[0].funk_pos, 1, "position advanced to 1");
+
+        // Tick 2: invert loop byte 1 (pcm index 3).
+        funkrepeat_step(&mut channels, &mut samples);
+        assert_eq!(samples[0].pcm[3], !40i8);
+        assert_eq!(channels[0].funk_pos, 2);
+
+        // Bytes OUTSIDE the loop region (indices 0,1,6,7) untouched.
+        assert_eq!(samples[0].pcm[0], 10);
+        assert_eq!(samples[0].pcm[1], 20);
+        assert_eq!(samples[0].pcm[6], 70);
+        assert_eq!(samples[0].pcm[7], 80);
+
+        // Slower cadence: speed 64 needs two ticks per invert.
+        channels[0].funk_speed = FUNK_TABLE[0xE]; // 64
+        channels[0].funk_counter = 0;
+        let before = samples[0].pcm[4];
+        funkrepeat_step(&mut channels, &mut samples); // counter 64 < 128, no invert
+        assert_eq!(samples[0].pcm[4], before, "no invert on first half-step");
+        assert_eq!(channels[0].funk_counter, 64);
+        funkrepeat_step(&mut channels, &mut samples); // counter 128, invert index 4
+        assert_eq!(samples[0].pcm[4], !before, "invert on second half-step");
+    }
+
+    #[test]
+    fn funkrepeat_position_wraps_and_skips_loopless_samples() {
+        // Loop length 2 → "no loop" sentinel: funkrepeat must do nothing.
+        let mut samples = vec![SampleBody {
+            pcm: vec![1, 2, 3, 4],
+            loop_start: 0,
+            loop_length: 2,
+            volume: 64,
+            finetune: 0,
+        }];
+        let mut channels = vec![Channel {
+            sample_index: 1,
+            funk_speed: 128,
+            funk_counter: 0,
+            ..Channel::default()
+        }];
+        funkrepeat_step(&mut channels, &mut samples);
+        assert_eq!(
+            samples[0].pcm,
+            vec![1, 2, 3, 4],
+            "loopless sample is never inverted"
+        );
+
+        // Position wrap: a 2-byte loop region inverts the same two bytes
+        // alternately, so funk_pos cycles 0,1,0,1 and inverting twice
+        // restores the original value.
+        let mut samples = vec![SampleBody {
+            pcm: vec![7, 9, 11, 13],
+            loop_start: 0,
+            loop_length: 4,
+            volume: 64,
+            finetune: 0,
+        }];
+        let mut channels = vec![Channel {
+            sample_index: 1,
+            funk_speed: 128,
+            funk_counter: 0,
+            ..Channel::default()
+        }];
+        for _ in 0..4 {
+            funkrepeat_step(&mut channels, &mut samples);
+        }
+        // Four inverts over a 4-byte loop = each byte flipped exactly once;
+        // position has wrapped back to 0.
+        assert_eq!(channels[0].funk_pos, 0, "position wrapped mod loop_length");
+        assert_eq!(samples[0].pcm, vec![!7i8, !9i8, !11i8, !13i8]);
+    }
+
+    #[test]
+    fn efx_off_disables_per_tick_inversion() {
+        // After EF0 the channel must not invert any further bytes even as
+        // ticks advance (funk_speed == 0 short-circuits funkrepeat_step).
+        let mut samples = vec![SampleBody {
+            pcm: vec![5, 6, 7, 8],
+            loop_start: 0,
+            loop_length: 4,
+            volume: 64,
+            finetune: 0,
+        }];
+        let mut channels = vec![Channel {
+            sample_index: 1,
+            funk_speed: 0,
+            funk_counter: 120,
+            ..Channel::default()
+        }];
+        funkrepeat_step(&mut channels, &mut samples);
+        assert_eq!(samples[0].pcm, vec![5, 6, 7, 8], "no invert while off");
+        assert_eq!(channels[0].funk_counter, 120, "counter frozen while off");
     }
 }

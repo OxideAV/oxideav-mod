@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EFx invert-loop ("funkrepeat") effect** (`src/player.rs`). Previously
+  the only unimplemented MOD effect. Added the 16-entry `FUNK_TABLE`
+  per-tick counter-increment table (`0,5,6,7,8,10,11,13,16,19,22,26,32,
+  43,64,128` from `multimedia-cx-protracker.html` §EFx), per-channel
+  `funk_speed` / `funk_counter` / `funk_pos` state, and `funkrepeat_step`
+  which runs on every tick: it accumulates the counter, and on reaching
+  128 inverts a single loop byte (`pcm[loop_start + funk_pos] ^= 0xFF`),
+  advances the position mod loop length, and resets the counter. `EF0`
+  resets the channel's counter and position (speed → 0); a fresh sample
+  on the channel resets the position to 0. Loopless samples (loop length
+  ≤ 2) are left untouched. Five unit tests cover the table, EFx tick-0
+  set/reset, the invert cadence at two speeds, position wrap, and the
+  off state. This completes the full 16-base + 16-Exy effect matrix.
 - **15-sample Ultimate SoundTracker (UST) layout** (`src/header.rs`,
   `src/player.rs`). Added `header::parse_ust_header` for the original
   Karsten-Obarski layout — 15 sample slots (vs 31), no `M.K.`

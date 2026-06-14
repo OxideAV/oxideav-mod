@@ -96,7 +96,7 @@ Spec-level effect coverage per
 | ECx | Note cut | implemented |
 | EDx | Note delay | implemented |
 | EEx | Pattern delay | implemented |
-| EFx | Invert loop | deliberately not implemented per spec ("don't bother") |
+| EFx | Invert loop ("funkrepeat") | implemented (per-tick counter from the 16-entry speed table; XORs one loop byte at a time, position wraps mod loop length, resets on new sample) |
 | 8xx | Set FINE Panning (FT extension) | implemented (raw 0..=255: $00 LEFT, $FF RIGHT; per-channel) |
 | E8x | Set ROUGH Panning (FT extension) | implemented (nibble replicated: $0 LEFT, $F RIGHT; per-channel) |
 
