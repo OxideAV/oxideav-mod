@@ -42,6 +42,39 @@ pub const DEFAULT_SPEED: u8 = 6;
 pub const DEFAULT_BPM: u8 = 125;
 pub const CHANNELS_PER_MOD: usize = 4;
 
+/// Ultimate SoundTracker (15-sample) timer constants.
+///
+/// UST has no `Fxx` tempo command — the song speed comes solely from the
+/// `+471` BPM byte (surfaced on `ModHeader::restart` by
+/// `header::parse_ust_header`). The Amiga custom chips ran at 716 kHz, one
+/// tenth of the 7.16 MHz processor clock, and the playback tick (the
+/// "Timer-IRQ") fires at `freq = 716 kHz / ((240 - bpm) * 122)`, per
+/// `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt` §"Song speed in
+/// beats per minute":
+///
+/// ```text
+///   AMIGA Timer-IRQ value = (240 - bpm) * 122
+///   freq = 716 kHz / ((240 - bpm) * 122)
+/// ```
+///
+/// The doc gives two readings of "716 kHz": `716 * 1024` (→ freq(120) ≈
+/// 50.08 Hz) and `716 * 1000` (→ freq(120) ≈ 48.9 Hz). We take the
+/// `716 * 1000` reading because the doc states "AMIGA custom chips only
+/// ran at 716 kHz" with kHz spelled out as the plain decimal unit, and the
+/// default `0x78 = 120` BPM is described as the nominal "120 BPM = 48 Hz"
+/// point — the `716 * 1000` reading lands at ~48.9 Hz (the doc's own
+/// closest match to that nominal 48 Hz), whereas `716 * 1024` lands at the
+/// ~50 Hz the author was reportedly *aiming* for but did not achieve.
+pub const UST_TIMER_BASE_HZ: f32 = 716_000.0;
+/// Per-IRQ divisor multiplier from the UST timer formula
+/// `(240 - bpm) * UST_TIMER_DIVISOR`.
+pub const UST_TIMER_DIVISOR: f32 = 122.0;
+/// Subtrahend in the UST timer formula `(240 - bpm) * 122`.
+pub const UST_TIMER_BPM_BASE: u16 = 240;
+/// Default UST song-speed byte (`0x78 = 120` BPM) used when the `+471`
+/// byte is absent or out of the valid `1..=239` range.
+pub const UST_DEFAULT_BPM_BYTE: u8 = 0x78;
+
 /// Protracker porta-up floor: B-3 at finetune 0 is 113. Effects `1xx`
 /// (porta up) and `E1x` (fine porta up) must not slide below this value
 /// per `Protracker-v1.1B-mod.txt` ("You can NOT slide higher than B-3!
@@ -809,6 +842,18 @@ pub struct PlayerState {
     /// [`PlayerState::set_pan_separation`] if a strict hard-pan
     /// render (1.0) is required.
     pan_separation: f32,
+
+    /// Ultimate SoundTracker tick rate in Hz, derived from the `+471`
+    /// song-speed byte via the UST timer formula
+    /// `716 kHz / ((240 - bpm) * 122)` (see [`UST_TIMER_BASE_HZ`]).
+    ///
+    /// `Some(hz)` only for UST (15-sample) modules; `None` for the
+    /// standard 31-sample path, which uses the classic
+    /// `sample_rate * 2.5 / BPM` formula keyed on the `Fxx`-settable
+    /// `bpm` field. UST has no `Fxx` tempo command, so the rate is fixed
+    /// for the whole song at construction time. `samples_per_tick`
+    /// consults this first.
+    ust_tick_hz: Option<f32>,
 }
 
 impl PlayerState {
@@ -869,7 +914,33 @@ impl PlayerState {
             led_filter_alpha: f32::NAN,
             led_filter_alpha2: f32::NAN,
             pan_separation: Self::DEFAULT_PAN_SEPARATION,
+            // UST drives its tick rate from the +471 song-speed byte
+            // (surfaced on `restart`), not from a BPM the `Fxx` command
+            // could change. Pre-compute it once for the whole song.
+            ust_tick_hz: if header.is_ust() {
+                Some(Self::ust_tick_hz_from_byte(header.restart))
+            } else {
+                None
+            },
         }
+    }
+
+    /// Convert a UST `+471` song-speed byte to the tick (Timer-IRQ) rate in
+    /// Hz via `716 kHz / ((240 - bpm) * 122)`, per
+    /// `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt` §"Song speed
+    /// in beats per minute".
+    ///
+    /// A byte outside `1..=239` would make `240 - bpm` zero or negative
+    /// (division by zero / a nonsensical negative period), so it falls back
+    /// to the documented UST default of `0x78 = 120` BPM.
+    pub fn ust_tick_hz_from_byte(bpm_byte: u8) -> f32 {
+        let bpm = if (1..UST_TIMER_BPM_BASE).contains(&(bpm_byte as u16)) {
+            bpm_byte
+        } else {
+            UST_DEFAULT_BPM_BYTE
+        };
+        let divisor = (UST_TIMER_BPM_BASE - bpm as u16) as f32 * UST_TIMER_DIVISOR;
+        UST_TIMER_BASE_HZ / divisor
     }
 
     /// Default stereo pan separation (`0.5` = 50 %).
@@ -1015,10 +1086,24 @@ impl PlayerState {
         y2
     }
 
-    /// Samples-per-tick rounded down. Classic formula is
-    /// `sample_rate * 2.5 / BPM`.
+    /// Samples-per-tick rounded down.
+    ///
+    /// Standard 31-sample MODs use the classic `sample_rate * 2.5 / BPM`
+    /// (882 at 44.1 kHz / 125 BPM), keyed on the `Fxx`-settable `bpm`.
+    ///
+    /// Ultimate SoundTracker (15-sample) modules instead derive their tick
+    /// rate from the `+471` song-speed byte via the UST Timer-IRQ formula
+    /// (`ust_tick_hz`); samples-per-tick is then `sample_rate / tick_hz`.
+    /// At the UST default `0x78 = 120` BPM the IRQ is ~48.9 Hz, so a
+    /// 44.1 kHz render emits ~902 samples per tick — slower than the
+    /// standard MOD's 882-at-125-BPM, which is why honouring the byte
+    /// matters for correct UST playback speed.
     pub fn samples_per_tick(&self) -> u32 {
-        ((self.sample_rate as f32) * 2.5 / self.bpm as f32) as u32
+        if let Some(hz) = self.ust_tick_hz {
+            (self.sample_rate as f32 / hz) as u32
+        } else {
+            ((self.sample_rate as f32) * 2.5 / self.bpm as f32) as u32
+        }
     }
 
     /// Process the row at the current position (called at tick 0).
@@ -4555,6 +4640,78 @@ pub mod tests {
         let cell = &patterns[0].rows[1][0];
         assert_eq!(cell.effect, 0x2);
         assert_eq!(cell.effect_param, 0x03);
+    }
+
+    #[test]
+    fn ust_tick_hz_default_is_about_49hz() {
+        // `Ultimate-Soundtracker-mod.txt` §"Song speed in beats per
+        // minute": the default `0x78 = 120` BPM gives
+        //   freq = 716000 / ((240-120)*122) = 716000 / 14640 ≈ 48.9 Hz
+        let hz = PlayerState::ust_tick_hz_from_byte(0x78);
+        assert!((hz - 48.907).abs() < 0.01, "got {hz} Hz");
+    }
+
+    #[test]
+    fn ust_tick_hz_formula_matches_doc() {
+        // Spot-check the (240-bpm)*122 divisor for a few BPM values.
+        // bpm=100 → (240-100)*122 = 17080 → 716000/17080 ≈ 41.92 Hz
+        let hz = PlayerState::ust_tick_hz_from_byte(100);
+        assert!((hz - 41.920).abs() < 0.01, "got {hz} Hz");
+        // bpm=200 → (240-200)*122 = 4880 → 716000/4880 ≈ 146.72 Hz
+        let hz = PlayerState::ust_tick_hz_from_byte(200);
+        assert!((hz - 146.721).abs() < 0.01, "got {hz} Hz");
+    }
+
+    #[test]
+    fn ust_tick_hz_clamps_out_of_range_byte_to_default() {
+        // bpm=0 would divide by (240-0)*122 — valid arithmetic but a
+        // nonsensical tempo (240 BPM); bpm>=240 makes (240-bpm) zero or
+        // negative. Both fall back to the documented `0x78 = 120` default.
+        let def = PlayerState::ust_tick_hz_from_byte(0x78);
+        assert_eq!(PlayerState::ust_tick_hz_from_byte(0), def);
+        assert_eq!(PlayerState::ust_tick_hz_from_byte(240), def);
+        assert_eq!(PlayerState::ust_tick_hz_from_byte(255), def);
+        // A valid in-range byte is NOT clamped.
+        assert_ne!(PlayerState::ust_tick_hz_from_byte(100), def);
+    }
+
+    #[test]
+    fn ust_samples_per_tick_uses_timer_byte() {
+        use crate::header::parse_ust_header;
+        // synth_ust_mod writes 0x78 (=120 BPM) to the +471 byte.
+        let bytes = synth_ust_mod(&[]);
+        let header = parse_ust_header(&bytes).unwrap();
+        assert_eq!(header.restart, 0x78);
+        let patterns = parse_patterns(&header, &bytes);
+        let samples = extract_samples(&header, &bytes);
+        let player = PlayerState::new(&header, samples, patterns, 44_100);
+        // 44100 / 48.907 ≈ 901.7 → floor 901. Crucially NOT the standard
+        // MOD's 882 (which would be the bug the follow-up flagged).
+        assert_eq!(player.samples_per_tick(), 901);
+        assert_ne!(player.samples_per_tick(), 882);
+    }
+
+    #[test]
+    fn ust_samples_per_tick_tracks_nondefault_byte() {
+        use crate::header::{parse_ust_header, UST_BPM_OFFSET};
+        let mut bytes = synth_ust_mod(&[]);
+        // Faster tempo: 0xC8 = 200 BPM → ~146.72 Hz → 44100/146.72 ≈ 300.
+        bytes[UST_BPM_OFFSET] = 0xC8;
+        let header = parse_ust_header(&bytes).unwrap();
+        assert_eq!(header.restart, 0xC8);
+        let patterns = parse_patterns(&header, &bytes);
+        let samples = extract_samples(&header, &bytes);
+        let player = PlayerState::new(&header, samples, patterns, 44_100);
+        assert_eq!(player.samples_per_tick(), 300);
+    }
+
+    #[test]
+    fn standard_mod_ignores_ust_timer_path() {
+        // A standard 31-sample MOD must keep the classic 882-at-125-BPM
+        // formula — the UST timer path is gated on `is_ust()`.
+        let bytes = synth_square_mod();
+        let player = make_player(&bytes);
+        assert_eq!(player.samples_per_tick(), 882);
     }
 
     #[test]

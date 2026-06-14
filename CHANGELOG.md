@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ultimate SoundTracker (15-sample) tick-rate from the +471 song-speed
+  byte** (`src/player.rs`). Previously a documented follow-up: UST modules
+  played at the standard MOD default tempo while the +471 byte was merely
+  surfaced on `ModHeader::restart`. UST has no `Fxx` tempo command — the
+  whole-song tick rate comes solely from that byte via the Amiga Timer-IRQ
+  formula `freq = 716 kHz / ((240-bpm)*122)` per
+  `docs/audio/trackers/mod/Ultimate-Soundtracker-mod.txt` §"Song speed in
+  beats per minute". Added `UST_TIMER_BASE_HZ` / `UST_TIMER_DIVISOR` /
+  `UST_TIMER_BPM_BASE` / `UST_DEFAULT_BPM_BYTE` constants and a
+  `PlayerState::ust_tick_hz_from_byte` helper; `PlayerState::new` now
+  pre-computes the per-song tick rate for UST-variant headers into a new
+  `ust_tick_hz` field, and `samples_per_tick` uses `sample_rate / tick_hz`
+  for UST instead of the standard `sample_rate * 2.5 / BPM`. At the
+  documented UST default `0x78 = 120` BPM the IRQ is ~48.9 Hz, yielding 901
+  samples per tick at 44.1 kHz — distinct from the standard MOD's 882. The
+  716 kHz base is read as `716 * 1000` (the doc's closest match to its
+  nominal "120 BPM = 48 Hz" point); an out-of-`1..=239`-range byte falls
+  back to the `0x78` default. The standard 31-sample path is gated on
+  `is_ust()` and is unchanged. Six unit tests cover the formula at default
+  / non-default BPM, out-of-range clamping, the UST samples-per-tick
+  derivation, and that standard MODs keep the 882 value.
 - **EFx invert-loop ("funkrepeat") effect** (`src/player.rs`). Previously
   the only unimplemented MOD effect. Added the 16-entry `FUNK_TABLE`
   per-tick counter-increment table (`0,5,6,7,8,10,11,13,16,19,22,26,32,

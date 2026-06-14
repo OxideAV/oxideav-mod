@@ -194,10 +194,22 @@ machinery runs unchanged:
   ("Conversion of UST effects to PT").
 
 The UST song-speed byte (+471) follows a different timer convention from
-the 31-sample BPM (`AMIGA Timer-IRQ = (240-bpm)*122`); the player runs at
-its default tempo and the byte is surfaced through `restart` for callers
-that want to derive the UST tick rate themselves. Honouring the UST
-timer math end-to-end in the tick scheduler is a follow-up.
+the 31-sample BPM. UST has no `Fxx` tempo command — the whole-song tick
+rate comes solely from the +471 byte via the Amiga Timer-IRQ formula
+`freq = 716 kHz / ((240-bpm)*122)` (`Ultimate-Soundtracker-mod.txt`
+§"Song speed in beats per minute"). `PlayerState::new` reads the byte off
+`ModHeader::restart` for any UST-variant header and pre-computes the tick
+rate (`PlayerState::ust_tick_hz_from_byte`), which `samples_per_tick`
+then uses as `sample_rate / tick_hz` instead of the standard MOD's
+`sample_rate * 2.5 / BPM`. At the documented UST default `0x78 = 120` BPM
+the IRQ is ~48.9 Hz, so a 44.1 kHz render emits 901 samples per tick —
+distinct from the standard MOD's 882-at-125-BPM, which is the playback-
+speed bug that treating UST like a standard MOD produced. A byte outside
+the valid `1..=239` range (which would divide by zero or a negative
+period) falls back to the documented `0x78` default. The 31-sample path
+is gated on `is_ust()`, so standard MODs are unaffected. The `716 kHz`
+constant is read as `716 * 1000` per the doc's two readings (the closest
+match to its nominal "120 BPM = 48 Hz" point).
 
 ## Real-world MOD fidelity
 
