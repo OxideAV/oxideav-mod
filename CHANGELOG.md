@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Complete offset-1080 format-tag channel map** (`src/header.rs`,
+  `src/container.rs`). The channel-count classifier previously handled
+  only `M.K.` / `M!K!` / `FLT4` / `FLT8` / `OCTA` / `CD81` / `4CHN` /
+  `6CHN` / `8CHN` and the two-digit `xxCH` form. It now resolves every tag
+  documented in `docs/audio/trackers/mod/multimedia-cx-protracker.html`
+  (corroborated by `archiveteam-amiga-module.html`): `M&K!` (4-channel
+  one-off variant), `OKTA` (8-channel Oktalyzer), the single-digit `dCHN`
+  forms `2CHN` plus the TakeTracker `5CHN` / `7CHN` / `9CHN`, the
+  TakeTracker `xxCN` spelling of `xxCH` (10..32), and `TDZ1` / `TDZ2` /
+  `TDZ3` (TakeTracker 1/2/3-channel). Out-of-range tags (`0CHN`, `99CH`,
+  `TDZ4`) are rejected. The container probe now delegates to a new public
+  `header::is_known_signature` classifier instead of a hardcoded tag list,
+  so probe acceptance and parse acceptance can no longer drift apart — the
+  prior probe list claimed `M&K!` / `OKTA` / `16CN` / `32CN`, none of
+  which the parser could decode (a positive-probe-then-parse-error
+  mismatch), and omitted `2CHN` / `5CHN` / `7CHN` / `9CHN` / `TDZx` /
+  most `xxCH`. Eight new unit tests pin the catalogue and the
+  probe-vs-parse lockstep.
 - **Ultimate SoundTracker (15-sample) tick-rate from the +471 song-speed
   byte** (`src/player.rs`). Previously a documented follow-up: UST modules
   played at the standard MOD default tempo while the +471 byte was merely

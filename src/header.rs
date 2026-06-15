@@ -15,8 +15,12 @@
 //! Offset 950      1 byte        Song length (1..128)
 //! Offset 951      1 byte        Restart byte (0x7F typical)
 //! Offset 952    128 bytes       Pattern-order table
-//! Offset 1080     4 bytes       Signature: "M.K.", "M!K!", "4CHN",
-//!                                "6CHN", "8CHN", "xxCH" (xx 10..32)
+//! Offset 1080     4 bytes       Signature / format tag (see
+//!                                `channels_from_signature`): "M.K." /
+//!                                "M!K!" / "M&K!" / "FLT4" / "FLT8" /
+//!                                "OCTA" / "OKTA" / "CD81" / "dCHN"
+//!                                (d=1..9) / "xxCH" / "xxCN" (10..32) /
+//!                                "TDZx" (x=1..3)
 //! Offset 1084      …            Pattern data: 64 rows × channels × 4 bytes
 //! After patterns               Raw sample bodies (signed 8-bit)
 //! ```
@@ -357,16 +361,45 @@ pub fn parse_ust_header(bytes: &[u8]) -> Result<ModHeader> {
     })
 }
 
+/// Map the offset-1080 format tag to a channel count.
+///
+/// The full tag catalogue is documented in
+/// `docs/audio/trackers/mod/multimedia-cx-protracker.html` (the "File
+/// Format" tag list) and corroborated by
+/// `docs/audio/trackers/mod/archiveteam-amiga-module.html`
+/// ("File format tags"):
+///
+/// | Tag    | Channels | Origin                          |
+/// | ------ | -------- | ------------------------------- |
+/// | `M.K.` / `M!K!` / `M&K!` | 4 | ProTracker (`M!K!` = >64 patterns; `M&K!` a one-off variant tag) |
+/// | `FLT4` / `FLT8` | 4 / 8 | Startrekker (`FLT8` paired)  |
+/// | `OCTA` / `OKTA` / `CD81` | 8 | OctaMED / Oktalyzer / Falcon |
+/// | `dCHN` | d | FastTracker (2/6/8) / TakeTracker (5/7/9) |
+/// | `xxCH` / `xxCN` | xx (10..=32) | FastTracker (`CH`) / TakeTracker (`CN`) |
+/// | `TDZx` | x (1/2/3) | TakeTracker                     |
+///
+/// `4CHN` is accepted as the explicit 4-channel spelling alongside the
+/// canonical `M.K.`. The doc notes `xxCN` is the TakeTracker spelling of
+/// the same 10+-channel layout `xxCH` carries; both decode identically.
 fn channels_from_signature(sig: &[u8; 4]) -> Result<u8> {
     match sig {
-        b"M.K." | b"M!K!" | b"FLT4" | b"4CHN" => Ok(4),
-        b"6CHN" => Ok(6),
-        b"8CHN" | b"OCTA" | b"CD81" | b"FLT8" => Ok(8),
-        // "xxCH" with xx in 10..=32 (Fast Tracker / TakeTracker).
-        other if other[2] == b'C' && other[3] == b'H' => {
-            let tens = (other[0] as char).to_digit(10);
-            let ones = (other[1] as char).to_digit(10);
-            match (tens, ones) {
+        // `M&K!` is documented as "just a standard MOD, but with a weird
+        // tag" — 4 channels, same layout as `M.K.`.
+        b"M.K." | b"M!K!" | b"M&K!" | b"FLT4" => Ok(4),
+        b"OCTA" | b"OKTA" | b"CD81" | b"FLT8" => Ok(8),
+        // "dCHN" — a single ASCII digit followed by "CHN". FastTracker
+        // emits 2/6/8; TakeTracker emits 5/7/9. We accept any 1..=9 the
+        // doc's two producers can write (4CHN is the explicit 4-channel
+        // spelling, also valid here).
+        [d, b'C', b'H', b'N'] => match (*d as char).to_digit(10) {
+            Some(n @ 1..=9) => Ok(n as u8),
+            _ => unknown_signature(sig),
+        },
+        // "xxCH" / "xxCN" — two ASCII digits followed by "CH" (FastTracker)
+        // or "CN" (TakeTracker), count in 10..=32. The two spellings name
+        // the same layout, so they decode identically.
+        [t, o, b'C', b'H'] | [t, o, b'C', b'N'] => {
+            match ((*t as char).to_digit(10), (*o as char).to_digit(10)) {
                 (Some(t), Some(o)) => {
                     let n = (t * 10 + o) as u8;
                     if (10..=32).contains(&n) {
@@ -377,17 +410,34 @@ fn channels_from_signature(sig: &[u8; 4]) -> Result<u8> {
                         )))
                     }
                 }
-                _ => Err(Error::invalid(format!(
-                    "MOD: unknown signature {:?}",
-                    std::str::from_utf8(other).unwrap_or("????")
-                ))),
+                _ => unknown_signature(sig),
             }
         }
-        _ => Err(Error::invalid(format!(
-            "MOD: unknown signature {:?}",
-            std::str::from_utf8(sig).unwrap_or("????")
-        ))),
+        // "TDZx" — TakeTracker 1/2/3-channel module (x is the channel
+        // count as an ASCII digit).
+        [b'T', b'D', b'Z', x] => match (*x as char).to_digit(10) {
+            Some(n @ 1..=3) => Ok(n as u8),
+            _ => unknown_signature(sig),
+        },
+        _ => unknown_signature(sig),
     }
+}
+
+/// True when `sig` is a recognised offset-1080 MOD format tag, i.e.
+/// when [`channels_from_signature`] would resolve it to a channel count.
+/// The container probe uses this so probe acceptance and parser
+/// acceptance stay in lockstep — the tag catalogue lives in exactly one
+/// place. Tags whose digits fall outside the documented 10..=32 range
+/// (e.g. `99CH`) are rejected here too, matching the parser.
+pub fn is_known_signature(sig: &[u8; 4]) -> bool {
+    channels_from_signature(sig).is_ok()
+}
+
+fn unknown_signature(sig: &[u8; 4]) -> Result<u8> {
+    Err(Error::invalid(format!(
+        "MOD: unknown signature {:?}",
+        std::str::from_utf8(sig).unwrap_or("????")
+    )))
 }
 
 fn read_padded_ascii(bytes: &[u8]) -> String {
@@ -437,9 +487,101 @@ mod tests {
     }
 
     #[test]
+    fn signature_2chn_fasttracker() {
+        // multimedia-cx-protracker.html: "2CHN — a 2 channel MOD.
+        // This is handled by FastTracker."
+        let h = parse_header(&make_fake_mod(b"2CHN", 1)).unwrap();
+        assert_eq!(h.channels, 2);
+    }
+
+    #[test]
+    fn signature_4chn_explicit_four_channel() {
+        // The explicit 4-channel spelling resolves the same as M.K.
+        let h = parse_header(&make_fake_mod(b"4CHN", 1)).unwrap();
+        assert_eq!(h.channels, 4);
+    }
+
+    #[test]
+    fn signature_taketracker_odd_chn() {
+        // multimedia-cx-protracker.html: "5CHN, 7CHN, 9CHN — allegedly
+        // this is a TakeTracker extension for 5, 7, and 9 channels."
+        for (tag, n) in [(b"5CHN", 5u8), (b"7CHN", 7), (b"9CHN", 9)] {
+            let h = parse_header(&make_fake_mod(tag, 1)).unwrap();
+            assert_eq!(h.channels, n, "tag {:?}", std::str::from_utf8(tag));
+        }
+    }
+
+    #[test]
+    fn signature_taketracker_tdz() {
+        // multimedia-cx-protracker.html: "TDZ1, TDZ2, TDZ3 — allegedly
+        // this is a TakeTracker extension for 1, 2, and 3 channels."
+        for (tag, n) in [(b"TDZ1", 1u8), (b"TDZ2", 2), (b"TDZ3", 3)] {
+            let h = parse_header(&make_fake_mod(tag, 1)).unwrap();
+            assert_eq!(h.channels, n, "tag {:?}", std::str::from_utf8(tag));
+        }
+    }
+
+    #[test]
+    fn signature_taketracker_xxcn_equals_xxch() {
+        // multimedia-cx-protracker.html: "xxCN — another 10+ channel MOD
+        // … Allegedly TakeTracker writes these." Same layout as xxCH.
+        let h = parse_header(&make_fake_mod(b"16CN", 1)).unwrap();
+        assert_eq!(h.channels, 16);
+        let h = parse_header(&make_fake_mod(b"32CN", 1)).unwrap();
+        assert_eq!(h.channels, 32);
+    }
+
+    #[test]
+    fn signature_okta_and_mandk_variants() {
+        // OKTA = 8-channel (Oktalyzer); M&K! = 4-channel ("just a
+        // standard MOD, but with a weird tag") — both per
+        // multimedia-cx-protracker.html.
+        assert_eq!(
+            parse_header(&make_fake_mod(b"OKTA", 1)).unwrap().channels,
+            8
+        );
+        assert_eq!(
+            parse_header(&make_fake_mod(b"M&K!", 1)).unwrap().channels,
+            4
+        );
+    }
+
+    #[test]
     fn rejects_unknown_signature() {
         let bytes = make_fake_mod(b"XXXX", 1);
         assert!(parse_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_channel_counts() {
+        // Single-digit 0CHN and the documented upper bound +1 must both
+        // be rejected: 0 channels is degenerate, 33+ exceeds the 32-cap.
+        assert!(parse_header(&make_fake_mod(b"0CHN", 1)).is_err());
+        assert!(parse_header(&make_fake_mod(b"99CH", 1)).is_err());
+        assert!(parse_header(&make_fake_mod(b"TDZ4", 1)).is_err());
+    }
+
+    #[test]
+    fn is_known_signature_matches_parser() {
+        // The probe helper must accept exactly the tags the parser
+        // resolves — no drift between probe and parse.
+        for ok in [
+            b"M.K.", b"M!K!", b"M&K!", b"FLT4", b"FLT8", b"OCTA", b"OKTA", b"CD81", b"4CHN",
+            b"2CHN", b"6CHN", b"8CHN", b"5CHN", b"7CHN", b"9CHN", b"16CH", b"32CN", b"TDZ1",
+        ] {
+            assert!(
+                is_known_signature(ok),
+                "expected known: {:?}",
+                std::str::from_utf8(ok)
+            );
+        }
+        for bad in [b"XXXX", b"0CHN", b"99CH", b"TDZ4", b"M.K!"] {
+            assert!(
+                !is_known_signature(bad),
+                "expected unknown: {:?}",
+                std::str::from_utf8(bad)
+            );
+        }
     }
 
     #[test]

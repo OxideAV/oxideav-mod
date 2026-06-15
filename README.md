@@ -7,9 +7,11 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 ## What it does
 
 - **Container**: reads the whole `.mod` file (ProTracker / SoundTracker) into a
-  single packet. Probes the 4-byte signature at offset 1080 (`M.K.`, `M!K!`,
-  `4CHN`/`6CHN`/`8CHN`, `FLT4`/`FLT8`, `OCTA`, `CD81`, `xxCH` for 10..=32
-  channels). Populates stream metadata (title, sample names, pattern /
+  single packet. Probes the 4-byte format tag at offset 1080 and maps it to a
+  channel count — see the full catalogue under *Format-tag channel map* below.
+  The container probe delegates to the parser's tag classifier
+  (`header::is_known_signature`), so probe acceptance and parse acceptance can
+  never drift apart. Populates stream metadata (title, sample names, pattern /
   channel counts) and an upper-bound duration.
 - **Decoder**: parses the header, patterns, and raw signed-8-bit sample
   bodies; drives a `PlayerState` (rows → ticks, Paula periods, Protracker
@@ -99,6 +101,27 @@ Spec-level effect coverage per
 | EFx | Invert loop ("funkrepeat") | implemented (per-tick counter from the 16-entry speed table; XORs one loop byte at a time, position wraps mod loop length, resets on new sample) |
 | 8xx | Set FINE Panning (FT extension) | implemented (raw 0..=255: $00 LEFT, $FF RIGHT; per-channel) |
 | E8x | Set ROUGH Panning (FT extension) | implemented (nibble replicated: $0 LEFT, $F RIGHT; per-channel) |
+
+### Format-tag channel map
+
+The offset-1080 format tag selects the channel count. The full catalogue
+is documented in
+[`multimedia-cx-protracker.html`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/mod)
+("File Format" tag list) and corroborated by `archiveteam-amiga-module.html`:
+
+| Tag(s) | Channels | Producer |
+| ------ | -------- | -------- |
+| `M.K.` / `M!K!` / `M&K!` | 4 | ProTracker (`M!K!` = >64 patterns; `M&K!` a one-off variant tag, "just a standard MOD") |
+| `FLT4` / `FLT8` | 4 / 8 | Startrekker (`FLT8` paired patterns) |
+| `OCTA` / `OKTA` / `CD81` | 8 | OctaMED / Oktalyzer / Falcon |
+| `dCHN` (d = 1..9) | d | FastTracker (2/6/8) / TakeTracker (5/7/9); `4CHN` = explicit 4-channel |
+| `xxCH` / `xxCN` (xx = 10..32) | xx | FastTracker (`CH`) / TakeTracker (`CN`) — identical layout |
+| `TDZx` (x = 1..3) | x | TakeTracker 1/2/3-channel |
+
+`xxCN` is the TakeTracker spelling of the same 10+-channel layout `xxCH`
+carries, so both decode identically. Tags whose digits fall outside the
+documented ranges (e.g. `0CHN`, `99CH`, `TDZ4`) are rejected by both the
+probe and the parser.
 
 Loop handling is forward-only per MOD spec — ping-pong / bidi loops are an
 XM/IT/S3M-era extension and are deliberately not used here.

@@ -54,12 +54,12 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
         }
         return 0;
     }
-    let magic = &p.buf[1080..1084];
-    let known: &[&[u8; 4]] = &[
-        b"M.K.", b"M!K!", b"M&K!", b"FLT4", b"FLT8", b"4CHN", b"6CHN", b"8CHN", b"OCTA", b"CD81",
-        b"OKTA", b"16CN", b"32CN",
-    ];
-    if known.iter().any(|m| (*m).as_slice() == magic) {
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(&p.buf[1080..1084]);
+    // Single source of truth for the tag catalogue: a tag the parser can
+    // resolve to a channel count is a tag we probe positively. This keeps
+    // probe and parse acceptance from ever drifting apart.
+    if crate::header::is_known_signature(&magic) {
         100
     } else {
         0
