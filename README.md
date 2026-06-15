@@ -289,7 +289,7 @@ a unit test in `src/player.rs`):
   `pan_separation` knob: each channel carries a `pan: u8` (0 = LEFT,
   128 = centre, 255 = RIGHT) initialised to the classic Amiga LRRL
   layout (channels 0 & 3 → 0, 1 & 2 → 255, repeating every 4) so a
-  MOD with no pan commands renders identically to the pre-r75 build.
+  MOD with no pan commands renders with the hard-LRRL panning.
   `8xx` overwrites the full byte; `E8x` replicates the nibble across
   both halves (`E80` → 0x00, `E8F` → 0xFF) — matching the endpoint
   semantics in `Protracker-effects-MODFIL12.txt` lines 1201-1207
@@ -313,8 +313,8 @@ stereo PCM at 44.1 kHz — the same output shape as the `"mod"` and
 XM without reshaping its audio pipeline. The engine drives audio for
 every FT2 standard effect listed in
 [`docs/audio/trackers/xm/FT2-effects-list.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/xm)
-plus the eleven volume-column kinds. Recent rounds closed the surviving
-"captured but not honoured" items:
+plus the eleven volume-column kinds. The "captured but not honoured"
+items are all closed:
 
 - **E4x / E7x vibrato + tremolo waveform shapes** — the LFO shape set by
   E4x (vibrato) / E7x (tremolo) is now honoured, not just the bit-2
@@ -469,11 +469,10 @@ aborting / OOMing.
 Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`.
 Each target has a minimal valid-header seed under
 `fuzz/corpus/<target>/minimal.{mod,stm,xm}` so libfuzzer's coverage
-hill-climb starts from a parser-accepting input. The bootstrap
-session of round 171 caught one `xm::parse_patterns` slice-index
-panic (a hostile `header_length` pushing the packed-data slice's
-start past EOF) which is now fixed and pinned by a regression test
-in `src/xm.rs`.
+hill-climb starts from a parser-accepting input. A previously-found
+`xm::parse_patterns` slice-index panic (a hostile `header_length`
+pushing the packed-data slice's start past EOF) is fixed and pinned by
+a regression test in `src/xm.rs`.
 
 ## License
 
