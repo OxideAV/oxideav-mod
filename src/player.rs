@@ -1999,8 +1999,19 @@ fn apply_extended_tick0(
             ch.volume = ch.volume.saturating_sub(y);
         }
         0xC => {
-            // ECx: note cut — the *cut* actually happens at tick x.
+            // ECx: note cut — the *cut* (volume → 0) happens at tick y.
+            // `Protracker-effects-MODFIL12.txt` EC:Cut-sample is explicit
+            // that "if yyyy is 0, nothing will be heard" — i.e. EC0 cuts on
+            // tick 0 so the note is silenced for the whole row rather than
+            // playing at full volume. The per-tick handler only fires for
+            // `tick == y && y != 0`, so the y == 0 case has to be cut here
+            // at row-start; otherwise EC0 would be a no-op and the note
+            // would sound at full volume (the opposite of the documented
+            // "nothing will be heard").
             ch.cut_tick = y;
+            if y == 0 {
+                ch.volume = 0;
+            }
         }
         0xD => { /* EDx: note delay — handled in enter_row (ch.delay). */ }
         0xE => {
@@ -3155,6 +3166,38 @@ pub mod tests {
         step_one_tick(&mut player); // tick 2
         step_one_tick(&mut player); // tick 3: EC3 fires.
         assert_eq!(player.channels[0].volume, 0, "EC3 must cut volume at t=3");
+    }
+
+    #[test]
+    fn note_cut_ec0_silences_on_tick0() {
+        // EC0: per `Protracker-effects-MODFIL12.txt` EC:Cut-sample,
+        // "if yyyy is 0, nothing will be heard" — the cut happens on tick 0
+        // so the freshly-triggered note is silenced for the whole row.
+        let bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0xE,
+                effect_param: 0xC0,
+            },
+        )]);
+        let mut player = make_player(&bytes);
+        // Tick 0: the sample's default volume (64) is loaded, then EC0 cuts
+        // it to 0 in the same tick-0 effect dispatch — net result is silence.
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].volume, 0,
+            "EC0 must cut volume to 0 on tick 0 so nothing is heard"
+        );
+        // The cut persists across the remaining ticks of the row.
+        step_one_tick(&mut player);
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].volume, 0,
+            "EC0 volume stays 0 for the rest of the row"
+        );
     }
 
     #[test]

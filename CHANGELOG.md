@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`EC0` note-cut now silences on tick 0** (`src/player.rs`). The note-cut
+  effect (`ECx`) cuts the channel volume to 0 at tick `y`, but the per-tick
+  handler only fired for `tick == y && y != 0`, so `EC0` was a silent no-op
+  and the freshly-triggered note sounded at full volume for the whole row —
+  the exact opposite of the documented behaviour. `Protracker-effects-
+  MODFIL12.txt` EC:Cut-sample is explicit: "if yyyy is 0, nothing will be
+  heard." `EC0` now zeroes the channel volume at row-start (tick 0), right
+  after the note-on volume load, so the row is silent. A new unit test
+  (`note_cut_ec0_silences_on_tick0`) pins the tick-0 cut and that the cut
+  persists across the remaining ticks of the row; the existing
+  `note_cut_ec_zeros_volume_at_tick` continues to cover the `y != 0`
+  mid-row cut.
+
 ### Added
 
 - **`F00` halts playback** (`src/player.rs`). A `Set speed` command with

@@ -95,7 +95,7 @@ Spec-level effect coverage per
 | E6x | Pattern loop (per-channel start + count) | implemented |
 | E9x | Retrigger note every *x* ticks | implemented |
 | EAx / EBx | Fine volume slide up / down | implemented |
-| ECx | Note cut | implemented |
+| ECx | Note cut | implemented (`ECx` cuts at tick x; `EC0` cuts on tick 0 so "nothing will be heard") |
 | EDx | Note delay | implemented |
 | EEx | Pattern delay | implemented |
 | EFx | Invert loop ("funkrepeat") | implemented (per-tick counter from the 16-entry speed table; XORs one loop byte at a time, position wraps mod loop length, resets on new sample) |
