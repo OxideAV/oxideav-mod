@@ -86,7 +86,7 @@ Spec-level effect coverage per
 | Bxx | Position jump | implemented |
 | Cxx | Set volume | implemented |
 | Dxy | Pattern break (decimal `x*10 + y`) | implemented |
-| Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM) | implemented |
+| Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM; $00 = halt) | implemented (F00 raises the song-over `ended` flag) |
 | E0x | Filter on/off | implemented (1-pole IIR lowpass at 11.5 kHz; LED defaults ON) |
 | E1x / E2x | Fine portamento up / down (tick-0 one-shot) | implemented |
 | E3x | Glissando control | implemented |
@@ -287,7 +287,23 @@ a unit test in `src/player.rs`):
   `>= 0x20` sets BPM, matching `Protracker-v1.1B-mod.txt` Cmd F and
   the convention noted in `Pro-Noise-Soundtracker-rev4.txt:362-365`.
   `0x1F` is the largest speed value, `0x20` (= 32) is the smallest
-  BPM value.
+  BPM value. A speed-range `Fxx` and a BPM-range `Fxx` on different
+  channels of the same row **both** stick (the doc: "a SET SPEED
+  command does NOT override a SET BPM command, even if these effects
+  use the same effect nr ($F)").
+- **`F00` halts playback** — a `Set speed` with parameter `0x00` stops
+  the song. `Protracker-effects-MODFIL12.txt` F:Set-speed states "A
+  value of xxxxyyyy=0 should technically cause playback to stop" and
+  the in-doc annotation pins the replayer reality: "++ F00 stops the
+  playback on ProTracker too. ++". The row carrying `F00` is still
+  entered (its notes and tick-0 effects apply) and then the player's
+  song-over `ended` flag is raised so both `render` and
+  `render_per_channel` break out — the same termination path used when
+  the order list runs off its end. `F00` is a halt, not a tempo value,
+  so it leaves `speed` / `bpm` untouched and never collides with a
+  live speed/BPM dual-set on the same row. Previously `F00` was
+  silently ignored, so a module that ended on `F00` ran past its
+  intended stop into trailing pattern data.
 - **Startrekker `FLT8` paired patterns** — `FLT8` files keep the plain
   4-channel 0x400-byte pattern layout on disk and pair two consecutive
   stored patterns into one logical 8-channel pattern: stored `2k`

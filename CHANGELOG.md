@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`F00` halts playback** (`src/player.rs`). A `Set speed` command with
+  parameter `0x00` now stops the song instead of being silently ignored.
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` F:Set-speed
+  is explicit ("A value of xxxxyyyy=0 should technically cause playback
+  to stop … ++ F00 stops the playback on ProTracker too. ++"). `F00`
+  raises the existing song-over `ended` flag, so both `render` and
+  `render_per_channel` terminate at the end of the current tick batch —
+  the same path taken when the order list runs off its end. The row
+  carrying `F00` is still entered (its notes / tick-0 effects apply) and
+  `speed` / `bpm` are left untouched, so `F00` never collides with a
+  live speed/BPM dual-set on the same row. Two new unit tests in
+  `player.rs` pin the halt and the speed-vs-BPM independence
+  (`f00_halts_playback`, `fxx_speed_and_bpm_both_apply_across_channels`).
+
 - **Complete offset-1080 format-tag channel map** (`src/header.rs`,
   `src/container.rs`). The channel-count classifier previously handled
   only `M.K.` / `M!K!` / `FLT4` / `FLT8` / `OCTA` / `CD81` / `4CHN` /

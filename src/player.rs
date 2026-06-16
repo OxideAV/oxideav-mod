@@ -1355,12 +1355,32 @@ impl PlayerState {
         // convention (z < 0x20 → speed, else BPM), so 0x20 (= 32) is
         // the smallest BPM value, matching `Protracker-v1.1B-mod.txt`
         // and the FireLight tutorial. 0x1F is the largest speed value.
+        // A SET SPEED (z < 0x20) and a SET BPM (z >= 0x20) on different
+        // channels of the same row both stick — the doc is explicit that
+        // "a SET SPEED command does NOT override a SET BPM command, even
+        // if these effects use the same effect nr ($F)". So the speed and
+        // BPM branches are applied independently per channel rather than
+        // resolved to a single winner; within each category the last
+        // channel still wins because the assignment is overwritten.
         for ch in &self.channels {
             if ch.effect == 0xF {
                 let p = ch.effect_param;
                 if p == 0 {
-                    // Fxx 00 — ProTracker treats this as "halt" (set
-                    // order_index past the end). Safer default: ignore.
+                    // F00 — ProTracker halts playback. The spec is
+                    // explicit (`Protracker-effects-MODFIL12.txt`
+                    // F:Set-speed: "A value of xxxxyyyy=0 should
+                    // technically cause playback to stop … ++ F00 stops
+                    // the playback on ProTracker too. ++"). The reusable
+                    // `ended` flag is exactly the song-over signal the
+                    // render loops break on, so route F00 through it
+                    // instead of mangling the order position. The row
+                    // carrying F00 has already entered and its notes /
+                    // tick-0 effects are applied; the song terminates at
+                    // the end of the current tick batch. F00 sits in
+                    // neither the speed nor the BPM value range, so it
+                    // never collides with a live speed/BPM dual-set on
+                    // the same row.
+                    self.ended = true;
                 } else if p < 0x20 {
                     self.speed = p;
                 } else {
@@ -3901,6 +3921,86 @@ pub mod tests {
         step_one_tick(&mut player);
         assert_eq!(player.bpm, 0x20, "F20 must set BPM to 32");
         assert_eq!(player.speed, DEFAULT_SPEED, "F20 must NOT touch speed");
+    }
+
+    #[test]
+    fn f00_halts_playback() {
+        // F00 stops the song per `Protracker-effects-MODFIL12.txt`
+        // F:Set-speed ("++ F00 stops the playback on ProTracker too.
+        // ++"). The row carrying F00 is entered (its tick-0 effects
+        // apply) and then the `ended` flag is raised so the render loop
+        // breaks. Speed/BPM must be untouched — F00 is a halt, not a
+        // tempo value.
+        let bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0xF,
+                effect_param: 0x00,
+            },
+        )]);
+        let mut player = make_player(&bytes);
+        assert!(!player.ended, "fresh player must not start ended");
+        let prev_speed = player.speed;
+        let prev_bpm = player.bpm;
+        step_one_tick(&mut player);
+        assert!(player.ended, "F00 must raise the song-over `ended` flag");
+        assert_eq!(player.speed, prev_speed, "F00 must NOT touch speed");
+        assert_eq!(player.bpm, prev_bpm, "F00 must NOT touch BPM");
+
+        // The render loop must terminate: a fresh player on the same
+        // module renders nothing past the halt point. Ask for a large
+        // buffer; the F00 row halts after at most the first tick batch,
+        // so production is far short of the request and then zero on a
+        // second call.
+        let mut p2 = make_player(&bytes);
+        let mut buf = vec![0i16; 44_100 * 2]; // 1 s stereo
+        let produced = p2.render(&mut buf);
+        assert!(
+            produced < 44_100,
+            "F00 must halt well within 1 s (got {produced} frames)"
+        );
+        assert!(p2.ended, "render must leave the player ended after F00");
+        let again = p2.render(&mut buf);
+        assert_eq!(again, 0, "an ended player renders no further frames");
+    }
+
+    #[test]
+    fn fxx_speed_and_bpm_both_apply_across_channels() {
+        // Per `Protracker-effects-MODFIL12.txt` F:Set-speed: "a SET
+        // SPEED command does NOT override a SET BPM command, even if
+        // these effects use the same effect nr ($F)". A speed-range Fxx
+        // on one channel and a BPM-range Fxx on another channel of the
+        // same row must BOTH stick.
+        let bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xF,
+                    effect_param: 0x0A, // speed = 10
+                },
+            ),
+            (
+                0,
+                2,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xF,
+                    effect_param: 0x40, // BPM = 64
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        step_one_tick(&mut player);
+        assert_eq!(player.speed, 0x0A, "speed-range Fxx must set speed");
+        assert_eq!(player.bpm, 0x40, "BPM-range Fxx must set BPM");
+        assert!(!player.ended, "neither Fxx is F00, so no halt");
     }
 
     #[test]
