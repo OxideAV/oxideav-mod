@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MOD vibrato / tremolo `E4x` / `E7x` downward-saw waveform** is now a
+  true falling sawtooth over the full 64-step cycle (`src/player.rs`).
+  Shape 1 ("downwards saw" per `multimedia-cx-protracker.html` §4xy and
+  `Protracker-2.3A-misc-info.txt` lines 387/390) previously generated a
+  `|pos|`-mirrored magnitude that *rose* then jumped, rather than the
+  documented monotonic descent from `+y` to `-y`. The square wave
+  (shape 2, "starting from +y") and sine (shape 0) keep their prior
+  numeric behaviour; random (shape 3, no documented PRNG) falls back to
+  the sine table. The vibrato/tremolo offset computation is refactored
+  onto a shared `lfo_waveform(shape, pos)` helper that returns the signed
+  ±255 value, so the saw carries its own monotonic sign across the cycle
+  instead of relying on the magnitude/`pos<0` split that cannot express a
+  saw. New unit tests: `lfo_sine_matches_mirrored_table`,
+  `lfo_downward_saw_descends_monotonically`,
+  `lfo_square_is_plus_then_minus_full`,
+  `vibrato_saw_offset_descends_over_cycle`, and
+  `tremolo_square_flips_full_amplitude`.
 - **`Bxx` out-of-range position jump wraps to order 0** (`src/player.rs`).
   A `Bxx` whose target order is at or past the song length previously fell
   into the same end-of-song path as a natural run-off the order list, so a

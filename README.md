@@ -90,7 +90,7 @@ Spec-level effect coverage per
 | E0x | Filter on/off | implemented (1-pole IIR lowpass at 11.5 kHz; LED defaults ON) |
 | E1x / E2x | Fine portamento up / down (tick-0 one-shot) | implemented |
 | E3x | Glissando control | implemented |
-| E4x / E7x | Vibrato / tremolo waveform (sine / ramp-down / square / retrig bit) | implemented |
+| E4x / E7x | Vibrato / tremolo waveform (sine / downward-saw / square / retrig bit) | implemented (64-step full cycle; saw is a true monotonic descent +y→-y, square starts from +y, random falls back to sine) |
 | E5x | Set finetune (also re-derives period on same-row note trigger) | implemented |
 | E6x | Pattern loop (per-channel start + count) | implemented |
 | E9x | Retrigger note every *x* ticks | implemented |
@@ -277,6 +277,18 @@ a unit test in `src/player.rs`):
   range `[108, 907]` so that finetune ±8 extremes (`PERIOD_TABLE[7][35]
   = 108`, `PERIOD_TABLE[8][0] = 907`) play at the right pitch instead
   of being snapped back to the standard limits.
+- **Vibrato / tremolo waveform LFO** — the `E4x` / `E7x` waveform select
+  drives a **64-step full-cycle** LFO via the shared `lfo_waveform` helper.
+  Shape 1 is a *downwards saw* — a monotonic descent from `+y` at the
+  cycle start (just after a retrigger) to `-y` at the end — matching
+  `multimedia-cx-protracker.html` §4xy ("Waveform 1 is a downwards saw
+  wave … a full cycle of 64 steps") and the shape numbering in
+  `Protracker-2.3A-misc-info.txt` lines 387/390. Shape 2 is a square
+  "starting from +y" (`+y` first half-cycle, `-y` second). Shape 3
+  (random) has no documented PT PRNG and reuses the sine table. An earlier
+  implementation generated the saw from a `|pos|`-mirrored magnitude that
+  *rose* then jumped rather than descending, which mis-shaped the audible
+  pitch/volume sweep of every saw-waveform vibrato/tremolo.
 - **Vibrato sign convention** — we follow `FireLight §5.5` pseudocode:
   the sine-table value is *added* to the period (== "AMIGA frequency"
   in the doc) for `vibrato_pos >= 0` and subtracted for `< 0`. Adding

@@ -436,13 +436,16 @@ pub fn parse_patterns(header: &ModHeader, bytes: &[u8]) -> Vec<Pattern> {
 
 /// Vibrato / tremolo waveform selector for E4x / E7x.
 ///
-/// Per Protracker-v1.1B-mod.txt:
-/// - low bits 0..=2 pick the shape (0 sine, 1 ramp-down, 2 square, 3 random —
-///   random is ignored in PT).
+/// Per `Protracker-2.3A-misc-info.txt` lines 387/390 and
+/// `multimedia-cx-protracker.html` §4xy:
+/// - low bits 0..=1 pick the shape (0 sine, 1 downwards-saw, 2 square,
+///   3 random — random has no documented PRNG so it reuses the sine
+///   table). The shape is realised by [`lfo_waveform`] over the full
+///   64-step cycle.
 /// - bit 2 (value 4/5/6/7) disables retrigger on new notes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Waveform {
-    /// 0 = sine, 1 = ramp-down, 2 = square, 3 = random (treated as sine).
+    /// 0 = sine, 1 = downwards saw, 2 = square, 3 = random (sine fallback).
     pub shape: u8,
     /// If false, position is reset to 0 on every new note (default).
     pub no_retrigger: bool,
@@ -1493,25 +1496,18 @@ impl PlayerState {
             let _ = rate; // keep rate referenced even in this path
             return 0;
         }
-        let idx = (ch.vib_pos.unsigned_abs() & 31) as usize;
-        let base = match ch.vib_wave.shape {
-            0 | 3 => PROTRACKER_SINE_TABLE[idx] as i32,
-            1 => {
-                // Ramp down: |pos|<<3 with 255-x on the negative half.
-                let raw = (idx << 3) as i32;
-                if ch.vib_pos < 0 {
-                    255 - raw
-                } else {
-                    raw
-                }
-            }
-            _ => 255, // square
-        };
-        let delta = (base * depth as i32) >> 7;
-        if ch.vib_pos < 0 {
-            -(delta as i16)
+        // Canonical PT 64-step waveform value (signed, ±255 scale). The
+        // magnitude is scaled by depth and shifted by 7 (the historical
+        // vibrato denominator), then the waveform's own sign is reapplied
+        // — splitting magnitude from sign keeps the sine path bit-for-bit
+        // identical to the prior implementation while letting the
+        // downward saw carry its own monotonic sign across the cycle.
+        let value = lfo_waveform(ch.vib_wave.shape, ch.vib_pos);
+        let delta = ((value.unsigned_abs() * depth as u32) >> 7) as i16;
+        if value < 0 {
+            -delta
         } else {
-            delta as i16
+            delta
         }
     }
 
@@ -1521,26 +1517,15 @@ impl PlayerState {
         if depth == 0 || ch.effect != 0x7 {
             return 0;
         }
-        let idx = (ch.trem_pos.unsigned_abs() & 31) as usize;
-        let base = match ch.trem_wave.shape {
-            0 | 3 => PROTRACKER_SINE_TABLE[idx] as i32,
-            1 => {
-                let raw = (idx << 3) as i32;
-                if ch.trem_pos < 0 {
-                    255 - raw
-                } else {
-                    raw
-                }
-            }
-            _ => 255,
-        };
-        // Tremolo divides by 64 (half the vibrato denominator) so the
-        // peak delta maps to volume units.
-        let delta = (base * depth as i32) >> 6;
-        if ch.trem_pos < 0 {
-            -(delta as i16)
+        // Same canonical 64-step waveform as vibrato, but tremolo divides
+        // by 64 (half the vibrato denominator) so the peak delta maps to
+        // volume units. Sign is carried by the waveform value.
+        let value = lfo_waveform(ch.trem_wave.shape, ch.trem_pos);
+        let delta = ((value.unsigned_abs() * depth as u32) >> 6) as i16;
+        if value < 0 {
+            -delta
         } else {
-            delta as i16
+            delta
         }
     }
 
@@ -2330,6 +2315,62 @@ fn advance_lfo(pos: &mut i8, rate: u8) {
     }
 }
 
+/// Signed value of a Protracker vibrato/tremolo LFO waveform at position
+/// `pos` (`-32..=31`, the 64-step full cycle advanced by [`advance_lfo`]),
+/// on the same `±255` magnitude scale as [`PROTRACKER_SINE_TABLE`].
+///
+/// Per `multimedia-cx-protracker.html` §4xy ("Each waveform … has a full
+/// cycle of 64 steps … Waveform 0 is a sine wave … Waveform 1 is a
+/// downwards saw wave … Waveform 2 is a square wave, starting from +y …
+/// Waveform 3 is random") and the shape numbering in
+/// `Protracker-2.3A-misc-info.txt` lines 387/390:
+///
+/// - **0 (sine)** — the 32-entry sine table mirrored into the second
+///   half-cycle by the sign of `pos`. Positive `pos` is the first
+///   half-cycle (added to the period per FireLight §5.5), negative is the
+///   second; this preserves the historical sign convention exactly.
+/// - **1 (downwards saw)** — a clean monotonic descent across the full
+///   64-step cycle: `+255` at the cycle start (`pos == 0`, just after a
+///   retrigger), stepping down by 8 each position to `-249` at the cycle
+///   end. The previous code generated `|pos|`-mirrored magnitudes, which
+///   produced a rising-then-jumping shape rather than the documented
+///   *downward* saw.
+/// - **2 (square)** — `+255` for the first half-cycle (`pos >= 0`,
+///   "starting from +y") and `-255` for the second half.
+/// - **3 (random)** — no PRNG is documented for the PT replayer, so this
+///   falls back to the sine table (matching the XM helper's choice).
+fn lfo_waveform(shape: u8, pos: i8) -> i32 {
+    match shape {
+        // Downwards saw over the full 64-step cycle.
+        1 => {
+            let ph = if pos >= 0 {
+                pos as i32
+            } else {
+                pos as i32 + 64
+            };
+            255 - ph * 8
+        }
+        // Square wave, starting from +y.
+        2 => {
+            if pos >= 0 {
+                255
+            } else {
+                -255
+            }
+        }
+        // Sine (0) and random (3) both read the mirrored sine table.
+        _ => {
+            let idx = (pos.unsigned_abs() & 31) as usize;
+            let mag = PROTRACKER_SINE_TABLE[idx] as i32;
+            if pos < 0 {
+                -mag
+            } else {
+                mag
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -2829,6 +2870,123 @@ pub mod tests {
             min_delta <= -8,
             "expected negative tremolo swing, got {min_delta}"
         );
+    }
+
+    #[test]
+    fn lfo_sine_matches_mirrored_table() {
+        // Shape 0 reproduces the 32-entry table mirrored across the
+        // negative half-cycle, sign following `pos` (the historical
+        // convention the rest of the engine depends on).
+        for pos in 0i8..32 {
+            let idx = (pos as usize) & 31;
+            assert_eq!(lfo_waveform(0, pos), PROTRACKER_SINE_TABLE[idx] as i32);
+        }
+        for pos in -32i8..0 {
+            let idx = (pos.unsigned_abs() as usize) & 31;
+            assert_eq!(
+                lfo_waveform(0, pos),
+                -(PROTRACKER_SINE_TABLE[idx] as i32),
+                "negative half must mirror with a flipped sign at pos={pos}"
+            );
+        }
+        // Random (3) has no PRNG documented for PT — falls back to sine.
+        for pos in -32i8..32 {
+            assert_eq!(lfo_waveform(3, pos), lfo_waveform(0, pos));
+        }
+    }
+
+    #[test]
+    fn lfo_downward_saw_descends_monotonically() {
+        // Waveform 1 is a *downwards* saw: starts at +255 just after a
+        // retrigger (pos 0) and steps down by 8 across the full 64-step
+        // cycle. The old implementation produced a |pos|-mirrored shape
+        // that rose then jumped, never descending monotonically.
+        let mut prev = lfo_waveform(1, 0);
+        assert_eq!(prev, 255, "downward saw must start at +255 (pos 0)");
+        // Walk the cycle in advance order: pos 1..=31 then -32..=-1.
+        let order: Vec<i8> = (1i8..32).chain(-32i8..0).collect();
+        for &pos in &order {
+            let v = lfo_waveform(1, pos);
+            assert!(
+                v < prev,
+                "saw must strictly descend across the cycle: pos={pos} \
+                 value={v} prev={prev}"
+            );
+            prev = v;
+        }
+        // Last position (pos -1) is the cycle bottom.
+        assert_eq!(lfo_waveform(1, -1), 255 - 63 * 8);
+    }
+
+    #[test]
+    fn lfo_square_is_plus_then_minus_full() {
+        // Waveform 2 is a square "starting from +y": +255 for the first
+        // half-cycle (pos >= 0), -255 for the second.
+        for pos in 0i8..32 {
+            assert_eq!(lfo_waveform(2, pos), 255, "first half must be +255");
+        }
+        for pos in -32i8..0 {
+            assert_eq!(lfo_waveform(2, pos), -255, "second half must be -255");
+        }
+    }
+
+    #[test]
+    fn vibrato_saw_offset_descends_over_cycle() {
+        // A depth-15 4xy downward-saw vibrato must produce a period offset
+        // that descends monotonically across the cycle, confirming the
+        // waveform reaches `vibrato_offset` (not just the bare helper).
+        let mut ch = Channel {
+            period: 428,
+            sample_index: 1,
+            volume: 64,
+            active: true,
+            effect: 0x4,
+            mem_vibrato: 0x8F, // rate 8, depth 15
+            vib_pos: 0,
+            ..Channel::default()
+        };
+        ch.vib_wave.shape = 1; // downwards saw
+        let order: Vec<i8> = (0i8..32).chain(-32i8..0).collect();
+        let mut prev = i16::MAX;
+        for &pos in &order {
+            ch.vib_pos = pos;
+            let off = PlayerState::vibrato_offset(&ch);
+            assert!(
+                off <= prev,
+                "saw vibrato offset must not rise across the cycle: \
+                 pos={pos} off={off} prev={prev}"
+            );
+            prev = off;
+        }
+        // Start of cycle is the positive peak, end is the negative trough.
+        ch.vib_pos = 0;
+        assert!(PlayerState::vibrato_offset(&ch) > 0);
+        ch.vib_pos = -1;
+        assert!(PlayerState::vibrato_offset(&ch) < 0);
+    }
+
+    #[test]
+    fn tremolo_square_flips_full_amplitude() {
+        // A square-wave tremolo (E72) swings the volume offset between a
+        // single positive and a single negative magnitude.
+        let mut ch = Channel {
+            period: 428,
+            sample_index: 1,
+            volume: 32,
+            active: true,
+            effect: 0x7,
+            mem_tremolo: 0x84, // rate 8, depth 4
+            trem_pos: 4,
+            ..Channel::default()
+        };
+        ch.trem_wave.shape = 2; // square
+        let hi = PlayerState::tremolo_offset(&ch);
+        ch.trem_pos = -4;
+        let lo = PlayerState::tremolo_offset(&ch);
+        assert!(hi > 0 && lo < 0, "square tremolo must flip sign: {hi}/{lo}");
+        assert_eq!(hi, -lo, "square halves must be equal-and-opposite");
+        // Depth 4, square peak 255: 255*4/64 = 15.
+        assert_eq!(hi, 15);
     }
 
     #[test]
