@@ -304,6 +304,18 @@ a unit test in `src/player.rs`):
   live speed/BPM dual-set on the same row. Previously `F00` was
   silently ignored, so a module that ended on `F00` ran past its
   intended stop into trailing pattern data.
+- **`Bxx` out-of-range wraps to order 0** — a position-jump `Bxx` whose
+  target order is at or past the song length does **not** end the song;
+  ProTracker wraps it back to order 0 and keeps playing. Previously an
+  out-of-range `Bxx` fell into the same end-of-song path as a natural
+  run-off the order list, so a module that used a high `Bxx` as its
+  loop-back stopped instead of restarting. The natural run-off the end of
+  the order list (and a `Dxy` pattern-break that overflows past the last
+  order) still raise the song-over `ended` flag — only the explicit
+  out-of-range `Bxx` target wraps. Cited in
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` B:Position-Jump
+  ("If you do Bxx where xx is order_num or more, then it simply jumps to
+  order 0. And yes, I have tested this in ProTracker.").
 - **Startrekker `FLT8` paired patterns** — `FLT8` files keep the plain
   4-channel 0x400-byte pattern layout on disk and pair two consecutive
   stored patterns into one logical 8-channel pattern: stored `2k`

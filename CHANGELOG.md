@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Bxx` out-of-range position jump wraps to order 0** (`src/player.rs`).
+  A `Bxx` whose target order is at or past the song length previously fell
+  into the same end-of-song path as a natural run-off the order list, so a
+  module using a high `Bxx` as its loop-back point stopped instead of
+  restarting. ProTracker wraps an out-of-range target back to order 0 and
+  keeps playing. `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+  B:Position-Jump pins the replayer reality ("If you do Bxx where xx is
+  order_num or more, then it simply jumps to order 0. And yes, I have
+  tested this in ProTracker."). The natural run-off the end (and a `Dxy`
+  pattern break overflowing past the last order) still raise the song-over
+  `ended` flag — only an explicit out-of-range `Bxx` target wraps. New unit
+  test `bxx_out_of_range_wraps_to_order_zero_not_ended` pins the wrap and
+  that `ended` stays false.
 - **`EC0` note-cut now silences on tick 0** (`src/player.rs`). The note-cut
   effect (`ECx`) cuts the channel volume to 0 at tick `y`, but the per-tick
   handler only fired for `tick == y && y != 0`, so `EC0` was a silent no-op

@@ -1446,9 +1446,21 @@ impl PlayerState {
         self.in_pattern_delay_repeat = false;
         if let Some(jump) = self.pending_jump.take() {
             if let Some(order) = jump.order {
-                self.order_index = order;
+                // Bxx position jump. An explicit target order at or past the
+                // song length does NOT end the song — ProTracker wraps it back
+                // to order 0 (the song restarts from the top). Cited in
+                // `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+                // B:Position-Jump ("If you do Bxx where xx is order_num or
+                // more, then it simply jumps to order 0. And yes, I have
+                // tested this in ProTracker."). Only the *natural* run-off the
+                // end of the order list (the `else` branch below) raises the
+                // song-over flag.
+                self.order_index = if order >= self.song_length { 0 } else { order };
             } else {
                 self.order_index = self.order_index.saturating_add(1);
+                if self.order_index >= self.song_length {
+                    self.ended = true;
+                }
             }
             self.row = jump.row;
         } else {
@@ -1456,10 +1468,10 @@ impl PlayerState {
             if self.row as usize >= PATTERN_ROWS {
                 self.row = 0;
                 self.order_index = self.order_index.saturating_add(1);
+                if self.order_index >= self.song_length {
+                    self.ended = true;
+                }
             }
-        }
-        if self.order_index >= self.song_length {
-            self.ended = true;
         }
     }
 
@@ -4008,6 +4020,44 @@ pub mod tests {
         assert!(p2.ended, "render must leave the player ended after F00");
         let again = p2.render(&mut buf);
         assert_eq!(again, 0, "an ended player renders no further frames");
+    }
+
+    #[test]
+    fn bxx_out_of_range_wraps_to_order_zero_not_ended() {
+        // A Bxx position jump whose target order is at or past the song
+        // length does NOT end the song — ProTracker wraps it back to order 0
+        // and keeps playing. Cited in
+        // `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+        // B:Position-Jump ("If you do Bxx where xx is order_num or more, then
+        // it simply jumps to order 0. And yes, I have tested this in
+        // ProTracker."). `synth_mod_with_pattern` builds a one-order module
+        // (song_length = 1), so any non-zero Bxx target is out of range.
+        let bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0xB,
+                effect_param: 0x05, // jump to order 5 — out of range
+            },
+        )]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.song_length, 1, "fixture must be a one-order song");
+        // Step a full row plus a tick so `next_row` consumes the pending jump.
+        let ticks = player.speed as usize + 1;
+        for _ in 0..ticks {
+            step_one_tick(&mut player);
+        }
+        assert!(
+            !player.ended,
+            "an out-of-range Bxx must NOT raise the song-over flag"
+        );
+        assert_eq!(
+            player.order_index, 0,
+            "an out-of-range Bxx must wrap back to order 0, not jump to the \
+             literal (out-of-range) target"
+        );
     }
 
     #[test]
