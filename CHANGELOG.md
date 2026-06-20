@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **XM fine-slide last-non-zero parameter memory** for `E1x` / `E2x`
+  (fine porta up/down), `EAx` / `EBx` (fine volume slide up/down), and
+  `X1x` / `X2x` (extra-fine porta up/down) in `src/xm_player.rs`. The FT2
+  format description (`FastTracker-2-v2.04-xm.txt`) marks all six with
+  `(*)` — "If the command byte is zero, the last nonzero byte for the
+  command should be used" (line 233) — but the player previously treated
+  a zero parameter as a no-op for each. Each of the six now carries its
+  own independent memory slot (up and down do **not** share a pool, since
+  the spec effect table lists them as separate commands), latched on the
+  last non-zero amount and reused when the cell's nibble is zero. Ten new
+  unit tests in `xm_player::tests` pin the reuse and the up/down slot
+  independence (`e1x_zero_reuses_last_nonzero_fine_porta_up`,
+  `e2x_zero_reuses_last_nonzero_fine_porta_down`,
+  `e1x_and_e2x_keep_independent_memory`,
+  `eax_zero_reuses_last_nonzero_fine_vol_up`,
+  `ebx_zero_reuses_last_nonzero_fine_vol_down`,
+  `eax_and_ebx_keep_independent_memory`,
+  `x1x_zero_reuses_last_nonzero_extra_fine_porta_up`,
+  `x2x_zero_reuses_last_nonzero_extra_fine_porta_down`).
+
 - **MOD vibrato / tremolo `E4x` / `E7x` downward-saw waveform** is now a
   true falling sawtooth over the full 64-step cycle (`src/player.rs`).
   Shape 1 ("downwards saw" per `multimedia-cx-protracker.html` §4xy and

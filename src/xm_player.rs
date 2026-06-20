@@ -309,6 +309,39 @@ pub struct XmChannel {
     /// glissando control"); the snap-on-non-zero semantics match the
     /// canonical PT/FT2 reading where E30 = off, E3n (n>0) = on.
     pub glissando: bool,
+
+    /// E1x fine-porta-up parameter memory (last non-zero `y` nibble).
+    ///
+    /// Per `FastTracker-2-v2.04-xm.txt` line 209 + the `(*)` legend at
+    /// line 233 ("If the command byte is zero, the last nonzero byte for
+    /// the command should be used"), E1x is one of the memory-carrying
+    /// effects: an `E10` reuses the channel's last non-zero E1x amount.
+    /// E1x / E2x keep independent slots — they are listed as separate
+    /// commands in the effect table, so an `E10` reuses the last E1x and
+    /// an `E20` reuses the last E2x rather than a shared up/down pool.
+    pub fine_porta_up_mem: u8,
+    /// E2x fine-porta-down parameter memory (last non-zero `y` nibble).
+    /// See [`Self::fine_porta_up_mem`] for the spec citation.
+    pub fine_porta_down_mem: u8,
+    /// EAx fine-volume-slide-up parameter memory (last non-zero `y`).
+    ///
+    /// EAx / EBx are marked `(*)` in `FastTracker-2-v2.04-xm.txt`
+    /// (lines 217/218 + the line-233 legend), so an `EA0` reuses the
+    /// channel's last non-zero EAx amount. Independent slot from EBx for
+    /// the same reason E1x / E2x are independent.
+    pub fine_vol_up_mem: u8,
+    /// EBx fine-volume-slide-down parameter memory (last non-zero `y`).
+    /// See [`Self::fine_vol_up_mem`] for the spec citation.
+    pub fine_vol_down_mem: u8,
+    /// X1x extra-fine-porta-up parameter memory (last non-zero `y`).
+    ///
+    /// X1x / X2x are marked `(*)` in `FastTracker-2-v2.04-xm.txt`
+    /// (lines 230/231 + the line-233 legend), so an `X10` reuses the
+    /// channel's last non-zero X1x amount. Independent slot from X2x.
+    pub extra_fine_porta_up_mem: u8,
+    /// X2x extra-fine-porta-down parameter memory (last non-zero `y`).
+    /// See [`Self::extra_fine_porta_up_mem`] for the spec citation.
+    pub extra_fine_porta_down_mem: u8,
 }
 
 /// Top-level XM player state.
@@ -1357,24 +1390,47 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
         0x0E => {
             // Exy subcommands.
             match x {
-                0x01
-                    // E1x: Fine porta up, by y period units * 4.
-                    if y != 0 => {
-                        ch.period = (ch.period - (y as f32) * 4.0).max(1.0);
+                0x01 => {
+                    // E1x: Fine porta up, by y period units * 4. The
+                    // amount carries last-non-zero memory per the `(*)`
+                    // legend in `FastTracker-2-v2.04-xm.txt` (line 209 +
+                    // line 233): an `E10` reuses the channel's last
+                    // non-zero E1x amount.
+                    if y != 0 {
+                        ch.fine_porta_up_mem = y;
                     }
-                0x02
-                    // E2x: Fine porta down.
-                    if y != 0 => {
-                        ch.period += (y as f32) * 4.0;
+                    let amt = if y != 0 { y } else { ch.fine_porta_up_mem };
+                    if amt != 0 {
+                        ch.period = (ch.period - (amt as f32) * 4.0).max(1.0);
                     }
+                }
+                0x02 => {
+                    // E2x: Fine porta down (independent memory slot).
+                    if y != 0 {
+                        ch.fine_porta_down_mem = y;
+                    }
+                    let amt = if y != 0 { y } else { ch.fine_porta_down_mem };
+                    if amt != 0 {
+                        ch.period += (amt as f32) * 4.0;
+                    }
+                }
                 0x0A => {
-                    // EAx: Fine volume slide up.
-                    ch.volume = (ch.volume as u16 + y as u16).min(64) as u8;
+                    // EAx: Fine volume slide up. Carries last-non-zero
+                    // memory per the `(*)` legend (line 217 + line 233).
+                    if y != 0 {
+                        ch.fine_vol_up_mem = y;
+                    }
+                    let amt = if y != 0 { y } else { ch.fine_vol_up_mem };
+                    ch.volume = (ch.volume as u16 + amt as u16).min(64) as u8;
                     ch.base_volume = ch.volume;
                 }
                 0x0B => {
-                    // EBx: Fine volume slide down.
-                    ch.volume = ch.volume.saturating_sub(y);
+                    // EBx: Fine volume slide down (independent memory).
+                    if y != 0 {
+                        ch.fine_vol_down_mem = y;
+                    }
+                    let amt = if y != 0 { y } else { ch.fine_vol_down_mem };
+                    ch.volume = ch.volume.saturating_sub(amt);
                     ch.base_volume = ch.volume;
                 }
                 0x0C => {
@@ -1446,20 +1502,41 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
             // monotonically forward within a (loop-free) segment chain.
         }
         0x21 => {
-            // X1x/X2x encoded as effect 0x21 by some XM files. We don't
-            // reach this branch from the standard FT2 mapping (which
-            // uses 0x21 for "extra-fine porta"); it's handled by the
-            // caller-specific mapping if the file uses it.
+            // X1x / X2x — Extra-fine porta. The XM effect column stores
+            // X as effect byte 0x21 (G=0x10, H=0x11, K=0x14, L=0x15,
+            // P=0x19, R=0x1B, T=0x1D, X=0x21 per the
+            // `FastTracker-2-v2.04-xm.txt` effect table); the param's
+            // high nibble selects up (1) / down (2) and the low nibble
+            // is the amount in single period units (1/4 of an E1x/E2x
+            // step). Both carry last-non-zero memory per the `(*)`
+            // legend at line 233, with independent up / down slots.
             match x {
-                0x01
-                    // X1x: Extra-fine porta up by y (1 unit = 1/4 semitone).
-                    if y != 0 => {
-                        ch.period = (ch.period - y as f32).max(1.0);
+                0x01 => {
+                    if y != 0 {
+                        ch.extra_fine_porta_up_mem = y;
                     }
-                0x02
-                    if y != 0 => {
-                        ch.period += y as f32;
+                    let amt = if y != 0 {
+                        y
+                    } else {
+                        ch.extra_fine_porta_up_mem
+                    };
+                    if amt != 0 {
+                        ch.period = (ch.period - amt as f32).max(1.0);
                     }
+                }
+                0x02 => {
+                    if y != 0 {
+                        ch.extra_fine_porta_down_mem = y;
+                    }
+                    let amt = if y != 0 {
+                        y
+                    } else {
+                        ch.extra_fine_porta_down_mem
+                    };
+                    if amt != 0 {
+                        ch.period += amt as f32;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2030,6 +2107,154 @@ pub mod tests {
         };
         apply_tick0_effect(&mut ch);
         assert!(!ch.glissando);
+    }
+
+    // ---------- fine-slide last-non-zero parameter memory ----------
+    //
+    // The FT2 spec (`FastTracker-2-v2.04-xm.txt`) marks E1x / E2x /
+    // EAx / EBx / X1x / X2x with `(*)` ("If the command byte is zero,
+    // the last nonzero byte for the command should be used"). These
+    // tests pin that a zero-param invocation reuses the channel's last
+    // non-zero amount and that the up / down variants keep independent
+    // memory slots.
+
+    #[test]
+    fn e1x_zero_reuses_last_nonzero_fine_porta_up() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            effect: 0x0E,
+            effect_param: 0x14, // E14 — fine porta up by 4 (*4 units)
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.fine_porta_up_mem, 4);
+        assert!((ch.period - (4608.0 - 16.0)).abs() < 0.01);
+        // E10 — reuse the latched amount (4), sliding another 16 units.
+        ch.effect_param = 0x10;
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (4608.0 - 32.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn e2x_zero_reuses_last_nonzero_fine_porta_down() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            effect: 0x0E,
+            effect_param: 0x23, // E23 — fine porta down by 3 (*4 units)
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (4608.0 + 12.0)).abs() < 0.01);
+        ch.effect_param = 0x20; // E20 — reuse 3
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (4608.0 + 24.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn e1x_and_e2x_keep_independent_memory() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            effect: 0x0E,
+            effect_param: 0x15, // E15 — fine porta up by 5
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        ch.effect_param = 0x22; // E22 — fine porta down by 2
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.fine_porta_up_mem, 5);
+        assert_eq!(ch.fine_porta_down_mem, 2);
+        // E20 must reuse the down slot (2), not the up slot (5).
+        let before = ch.period;
+        ch.effect_param = 0x20;
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (before + 8.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn eax_zero_reuses_last_nonzero_fine_vol_up() {
+        let mut ch = XmChannel {
+            volume: 10,
+            base_volume: 10,
+            effect: 0x0E,
+            effect_param: 0xA3, // EA3 — fine vol up by 3
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.volume, 13);
+        assert_eq!(ch.fine_vol_up_mem, 3);
+        ch.effect_param = 0xA0; // EA0 — reuse 3
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.volume, 16);
+    }
+
+    #[test]
+    fn ebx_zero_reuses_last_nonzero_fine_vol_down() {
+        let mut ch = XmChannel {
+            volume: 40,
+            base_volume: 40,
+            effect: 0x0E,
+            effect_param: 0xB5, // EB5 — fine vol down by 5
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.volume, 35);
+        ch.effect_param = 0xB0; // EB0 — reuse 5
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.volume, 30);
+    }
+
+    #[test]
+    fn eax_and_ebx_keep_independent_memory() {
+        let mut ch = XmChannel {
+            volume: 32,
+            base_volume: 32,
+            effect: 0x0E,
+            effect_param: 0xA4, // EA4 — fine vol up by 4
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        ch.effect_param = 0xB2; // EB2 — fine vol down by 2
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.fine_vol_up_mem, 4);
+        assert_eq!(ch.fine_vol_down_mem, 2);
+        // EB0 reuses the down slot (2), not the up slot (4).
+        let before = ch.volume;
+        ch.effect_param = 0xB0;
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.volume, before - 2);
+    }
+
+    #[test]
+    fn x1x_zero_reuses_last_nonzero_extra_fine_porta_up() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            effect: 0x21,
+            effect_param: 0x16, // X16 — extra-fine porta up by 6 units
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert_eq!(ch.extra_fine_porta_up_mem, 6);
+        assert!((ch.period - (4608.0 - 6.0)).abs() < 0.01);
+        ch.effect_param = 0x10; // X10 — reuse 6
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (4608.0 - 12.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn x2x_zero_reuses_last_nonzero_extra_fine_porta_down() {
+        let mut ch = XmChannel {
+            period: 4608.0,
+            effect: 0x21,
+            effect_param: 0x27, // X27 — extra-fine porta down by 7 units
+            ..Default::default()
+        };
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (4608.0 + 7.0)).abs() < 0.01);
+        // X1 slot is independent and unseeded — must not leak into X20.
+        ch.effect_param = 0x20; // X20 — reuse 7
+        apply_tick0_effect(&mut ch);
+        assert!((ch.period - (4608.0 + 14.0)).abs() < 0.01);
+        assert_eq!(ch.extra_fine_porta_up_mem, 0);
     }
 
     // ---------- E4x / E7x vibrato + tremolo waveform shapes ----------
