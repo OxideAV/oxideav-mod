@@ -971,11 +971,16 @@ impl XmPlayerState {
                 ch.base_volume = 0;
             }
 
-            // Note delay (ED x): trigger the voice at tick x.
+            // Note delay (ED x): trigger the voice at tick x. The delayed
+            // trigger must mirror the tick-0 note-on (`enter_row`) exactly
+            // — a deferred note is still a note-on, so the same envelope /
+            // fadeout reset, the same waveform no-retrigger gating, and
+            // the same retrig / tremor counter resets apply.
             if ch.note_delay_tick > 0 && cur_tick == ch.note_delay_tick {
                 let v = ch.volume as f32 / 64.0;
                 let freq = period_to_freq(table, ch.period);
                 ch.voice.trigger(freq, v);
+
                 ch.key_on = true;
                 ch.vol_env_tick = 0;
                 ch.vol_env_seg = 0;
@@ -984,9 +989,24 @@ impl XmPlayerState {
                 ch.pan_env_seg = 0;
                 ch.pan_env_value = 32;
                 ch.fadeout = FADEOUT_MAX;
-                ch.vib_pos = 0;
-                ch.auto_vib_pos = 0;
+
+                // Vibrato / tremolo / autovibrato phase resets honour the
+                // waveform "don't retrigger" flag (bit 2), identical to
+                // the tick-0 trigger. Without this gate a note-delayed
+                // cell would reset an LFO that an E4x/E7x +4 (or an
+                // instrument vibrato-type +4) explicitly asked to persist.
+                if (ch.vib_waveform & 0x04) == 0 {
+                    ch.vib_pos = 0;
+                }
+                if (ch.trem_waveform & 0x04) == 0 {
+                    ch.trem_pos = 0;
+                }
+                if (inst_vib_type & 0x04) == 0 {
+                    ch.auto_vib_pos = 0;
+                }
                 ch.auto_vib_sweep_cnt = 0;
+                ch.multi_retrig_counter = 0;
+                ch.tremor_counter = 0;
                 ch.note_delay_tick = 0;
             }
 
@@ -2840,6 +2860,71 @@ pub mod tests {
         assert_eq!(
             st.channels[0].auto_vib_pos, 0,
             "rate=0 must skip the autovib block (no phase advance)"
+        );
+    }
+
+    // ------------- Note delay (EDx) trigger consistency -------------
+    //
+    // A note-delayed (EDx) trigger is still a note-on: when it finally
+    // fires at tick x it must reset / preserve the same per-channel LFO
+    // and counter state as a tick-0 trigger. In particular the vibrato /
+    // tremolo waveform "don't retrigger" flag (bit 2, set by E4x / E7x
+    // +4) must gate the phase reset on the delayed fire exactly as it
+    // does on an immediate note-on.
+
+    #[test]
+    fn note_delay_resets_vibrato_phase_when_retrigger_flag_clear() {
+        // Row 0: C-4 + ED2 (delay 2 ticks). vib_waveform left at 0
+        // (retrigger enabled), with a pre-seeded vib_pos. On the delayed
+        // fire (tick 2) the phase must reset to 0.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x0E, 0xD2), // row 0: C-4, note delay 2 ticks
+            (0, 0x00, 0x00),  // row 1: settle
+        ]);
+        st.speed = 6;
+        // Tick 0: enter_row schedules the delay; the voice has NOT
+        // triggered yet. Seed a non-zero vib phase to observe the reset.
+        st.advance_tick();
+        st.channels[0].vib_pos = 25;
+        assert_eq!(st.channels[0].note_delay_tick, 2);
+        // Tick 1: no trigger yet.
+        st.tick = 1;
+        st.advance_tick();
+        assert_eq!(st.channels[0].note_delay_tick, 2);
+        // Tick 2: delayed trigger fires; vib_pos resets to 0.
+        st.tick = 2;
+        st.advance_tick();
+        assert_eq!(
+            st.channels[0].note_delay_tick, 0,
+            "delayed trigger should have fired and cleared the schedule"
+        );
+        assert_eq!(
+            st.channels[0].vib_pos, 0,
+            "note-delay fire with waveform bit 2 clear must reset vib_pos"
+        );
+    }
+
+    #[test]
+    fn note_delay_preserves_vibrato_phase_when_retrigger_flag_set() {
+        // Same delayed note, but with vib_waveform bit 2 set (E4x +4 =
+        // "do not retrigger the waveform on a new note"). The delayed
+        // fire must leave vib_pos untouched.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x0E, 0xD2), // row 0: C-4, note delay 2 ticks
+            (0, 0x00, 0x00),  // row 1: settle
+        ]);
+        st.speed = 6;
+        st.advance_tick(); // tick 0 — schedule delay
+        st.channels[0].vib_waveform = 0x04; // +4 no-retrigger
+        st.channels[0].vib_pos = 25;
+        st.tick = 1;
+        st.advance_tick();
+        st.tick = 2;
+        st.advance_tick(); // delayed trigger fires
+        assert_eq!(st.channels[0].note_delay_tick, 0);
+        assert_eq!(
+            st.channels[0].vib_pos, 25,
+            "waveform bit 2 (+4) must preserve vib_pos across a note-delay fire"
         );
     }
 

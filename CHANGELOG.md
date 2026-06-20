@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **XM note-delay (`EDx`) trigger now mirrors the tick-0 note-on**
+  (`src/xm_player.rs`). A deferred note is still a note-on, but the
+  delayed-fire path unconditionally reset the vibrato / tremolo /
+  autovibrato LFO phase, ignoring the waveform "don't retrigger" flag
+  (bit 2, set by `E4x` / `E7x` +4 and by the instrument vibrato-type
+  +4). It also failed to reset the multi-retrig (`Rxy`) and tremor
+  (`Txy`) counters that a tick-0 trigger clears. The delayed fire now
+  gates `vib_pos` / `trem_pos` / `auto_vib_pos` resets on the same
+  bit-2 flags as `enter_row`, and zeroes the retrig / tremor counters
+  and the autovibrato sweep counter. New tests
+  `note_delay_resets_vibrato_phase_when_retrigger_flag_clear` and
+  `note_delay_preserves_vibrato_phase_when_retrigger_flag_set` pin the
+  gating across a 2-tick note delay.
+
 - **XM fine-slide last-non-zero parameter memory** for `E1x` / `E2x`
   (fine porta up/down), `EAx` / `EBx` (fine volume slide up/down), and
   `X1x` / `X2x` (extra-fine porta up/down) in `src/xm_player.rs`. The FT2
