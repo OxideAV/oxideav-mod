@@ -423,6 +423,25 @@ items are all closed:
   prior nonzero `x` leaves the volume at its trigger value, `y = 0`
   with no prior nonzero `y` does not retrig, and the two memories
   evolve independently across rows.
+- **Fine-slide last-non-zero memory** — `E1x` / `E2x` (fine porta up /
+  down), `EAx` / `EBx` (fine volume slide up / down), and `X1x` / `X2x`
+  (extra-fine porta up / down) are all marked `(*)` in
+  `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` (line 233: "If the
+  command byte is zero, the last nonzero byte for the command should be
+  used"). Each of the six now carries an independent per-channel memory
+  slot (up and down do not share a pool), latched on the last non-zero
+  amount and reused when the cell's nibble is zero. Ten unit tests pin
+  the reuse and up/down slot independence.
+- **Note-delay (`EDx`) trigger consistency** — a deferred note is still a
+  note-on, so the delayed fire now applies the same vibrato / tremolo /
+  autovibrato phase resets as a tick-0 trigger, gated on the waveform
+  "don't retrigger" flag (bit 2), and resets the `Rxy` / `Txy` counters
+  and autovibrato sweep counter. Previously the delayed fire reset the
+  LFO phases unconditionally and skipped the counter resets.
+- **`Kxy` key-off equivalence to note 97** — `Kxy` ("Key off. Same as
+  note number 97" per `multimedia-cx-fasttracker-2.html`) now silences a
+  voice on an envelope-less instrument immediately, exactly like a
+  note-97 cell, instead of only releasing the key.
 
 The instrument-level autovibrato (`vibrato_type` byte) now honours the
 type byte's waveform shape and the +4 "don't retrigger" flag, sharing
