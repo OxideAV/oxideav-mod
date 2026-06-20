@@ -789,6 +789,25 @@ impl XmPlayerState {
             }
 
             apply_tick0_effect(ch);
+
+            // Kxy (effect 0x14) — Key off, "Same as note number 97"
+            // (`multimedia-cx-fasttracker-2.html` Kxy). `apply_tick0_effect`
+            // released the key (`key_on = false`) but cannot reach the
+            // instrument table to apply the note-97 "no volume envelope →
+            // silence immediately" rule. Mirror that rule here so a Kxy on
+            // a single-sample (envelope-less) instrument cuts the voice
+            // exactly like a note-97 cell does.
+            if self.channels[ch_idx].effect == 0x14 {
+                let inst_idx = self.channels[ch_idx].instrument.saturating_sub(1) as usize;
+                let has_vol_env = self
+                    .instruments
+                    .get(inst_idx)
+                    .map(|i| i.volume_envelope.is_on() && !i.volume_envelope.points.is_empty())
+                    .unwrap_or(false);
+                if !has_vol_env {
+                    self.channels[ch_idx].voice.active = false;
+                }
+            }
         }
 
         // Apply row-level song-state effects collected while walking
@@ -2925,6 +2944,41 @@ pub mod tests {
         assert_eq!(
             st.channels[0].vib_pos, 25,
             "waveform bit 2 (+4) must preserve vib_pos across a note-delay fire"
+        );
+    }
+
+    // ------------- Kxy key-off-as-effect equivalence to note 97 -------------
+    //
+    // `multimedia-cx-fasttracker-2.html` Kxy: "Key off. Same as note
+    // number 97." The note-97 path silences a voice immediately when the
+    // instrument has no volume envelope (otherwise fadeout takes over);
+    // Kxy must do the same so the two spellings of key-off behave
+    // identically on an envelope-less (single-sample) instrument.
+
+    #[test]
+    fn kxy_silences_envelopeless_voice_like_note_97() {
+        // Instrument 1 from make_multi_row_xm_state has NO volume
+        // envelope, so a key-off must cut the voice immediately.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x00, 0x00), // row 0: C-4 triggers the voice
+            (0, 0x14, 0x00),  // row 1: K00 — key off as effect
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        st.speed = 3;
+        walk_row(&mut st); // row 0 — voice triggers
+        assert!(
+            st.channels[0].voice.active,
+            "note-on should have started the voice"
+        );
+        walk_row(&mut st); // row 1 — K00 keys off
+        assert!(
+            !st.channels[0].key_on,
+            "Kxy must release the key like note 97"
+        );
+        assert!(
+            !st.channels[0].voice.active,
+            "Kxy on an envelope-less instrument must silence the voice \
+             immediately, exactly like note 97"
         );
     }
 

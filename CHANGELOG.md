@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **XM `Kxy` key-off-as-effect now matches note-97 exactly**
+  (`src/xm_player.rs`). `multimedia-cx-fasttracker-2.html` documents
+  `Kxy` as "Key off. Same as note number 97", but the effect only
+  released the key (`key_on = false`) and never applied the note-97
+  rule that silences the voice immediately when the instrument has no
+  volume envelope (with an envelope the fadeout takes over instead).
+  The handler now mirrors that rule, so a `Kxy` on a single-sample
+  (envelope-less) instrument cuts the voice exactly like a note-97
+  cell. New test `kxy_silences_envelopeless_voice_like_note_97`.
+
 - **XM note-delay (`EDx`) trigger now mirrors the tick-0 note-on**
   (`src/xm_player.rs`). A deferred note is still a note-on, but the
   delayed-fire path unconditionally reset the vibrato / tremolo /
