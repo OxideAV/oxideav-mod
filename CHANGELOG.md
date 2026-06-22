@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MOD `E6x` pattern-loop point now resets on a pattern transition**
+  (`src/player.rs`). `multimedia-cx-protracker.html` §E6x: "The
+  loopback point is reset to -1 for every Bxx or Dxx or pattern
+  transition." The per-channel loop-start row and loop counter were
+  persistent state that survived across order changes, so a dangling
+  `E60` (or a half-consumed `E6x` counter) from one pattern could
+  anchor a loop in the next pattern. `next_row` now clears the
+  per-channel `loop_rows` / `loop_counts` whenever the order index
+  actually changes — via a `Bxx`/`Dxy` jump that lands in a new order
+  or a natural run-off into the next pattern — so a later pattern's
+  `E6x` establishes its own fresh loop point (defaulting to the top of
+  the pattern) instead of reusing leftover state. An `E6x` loop that
+  stays inside one pattern is untouched (its order index does not
+  change between the looped rows). New test
+  `pattern_loop_e6_start_resets_across_pattern_transition`.
+
 - **XM `Kxy` key-off-as-effect now matches note-97 exactly**
   (`src/xm_player.rs`). `multimedia-cx-fasttracker-2.html` documents
   `Kxy` as "Key off. Same as note number 97", but the effect only

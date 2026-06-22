@@ -1447,6 +1447,7 @@ impl PlayerState {
         // Real row advance — clear the repeat flag so the next row's
         // tick-0 processing runs normally.
         self.in_pattern_delay_repeat = false;
+        let prev_order = self.order_index;
         if let Some(jump) = self.pending_jump.take() {
             if let Some(order) = jump.order {
                 // Bxx position jump. An explicit target order at or past the
@@ -1474,6 +1475,27 @@ impl PlayerState {
                 if self.order_index >= self.song_length {
                     self.ended = true;
                 }
+            }
+        }
+
+        // E6x loopback-point reset on a pattern transition.
+        // `multimedia-cx-protracker.html` §E6x: "The loopback point is reset
+        // to -1 for every Bxx or Dxx or pattern transition." Whenever the
+        // order position actually changes — a Bxx/Dxx jump that lands in a
+        // new order, or a natural run-off into the next pattern — the
+        // per-channel pattern-loop start row and counter are cleared so a
+        // dangling E60 from the previous pattern cannot anchor a loop in the
+        // new one (and a half-consumed loop counter does not bleed across the
+        // boundary). An E6x loop that stays inside the same pattern is
+        // untouched: its order index doesn't change between the looped rows,
+        // so the saved start row and counter survive as required for the
+        // documented "play row 0 twice" semantics.
+        if self.order_index != prev_order {
+            for r in self.loop_rows.iter_mut() {
+                *r = 0;
+            }
+            for c in self.loop_counts.iter_mut() {
+                *c = 0;
             }
         }
     }
@@ -3275,6 +3297,129 @@ pub mod tests {
             prefix,
             &[0, 1, 2, 1, 2, 1, 2, 3][..prefix.len()],
             "E62 should loop rows 1..=2 twice before advancing; got {visited:?}"
+        );
+    }
+
+    /// Build a synthetic 4-channel `M.K.` MOD with two distinct patterns and
+    /// a two-entry order table (order 0 → pattern 0, order 1 → pattern 1).
+    /// `cells0` / `cells1` populate pattern 0 / pattern 1 respectively as
+    /// slices of `(row, channel, Note)`.
+    fn synth_two_pattern_mod(
+        cells0: &[(usize, usize, Note)],
+        cells1: &[(usize, usize, Note)],
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        out[0..4].copy_from_slice(b"test");
+        out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        out[20 + 24] = 0;
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
+        out[950] = 2; // song length: two orders
+        out[951] = 0x7F;
+        out[952] = 0; // order 0 → pattern 0
+        out[953] = 1; // order 1 → pattern 1
+        out[1080..1084].copy_from_slice(b"M.K.");
+
+        let build_pat = |cells: &[(usize, usize, Note)]| {
+            let mut pat = vec![0u8; 64 * 4 * 4];
+            for &(row, channel, ref note) in cells {
+                let off = row * 4 * 4 + channel * 4;
+                let p_hi = ((note.period >> 8) & 0x0F) as u8;
+                let p_lo = (note.period & 0xFF) as u8;
+                let sample_hi = (note.sample & 0xF0) >> 4;
+                let sample_lo = note.sample & 0x0F;
+                pat[off] = (sample_hi << 4) | p_hi;
+                pat[off + 1] = p_lo;
+                pat[off + 2] = (sample_lo << 4) | note.effect;
+                pat[off + 3] = note.effect_param;
+            }
+            pat
+        };
+        out.extend(build_pat(cells0));
+        out.extend(build_pat(cells1));
+
+        for i in 0..32 {
+            let v: i8 = if i < 16 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
+    /// `multimedia-cx-protracker.html` §E6x: "The loopback point is reset to
+    /// -1 for every Bxx or Dxx or pattern transition." A dangling E60
+    /// (loop-start marker) left over from pattern 0 must NOT survive into
+    /// pattern 1. Here pattern 0 sets an E60 loop-start on row 5 (a non-zero
+    /// row) and then naturally runs into pattern 1, which carries an E61 on
+    /// row 2 with no preceding E60. Without the reset, the stale row-5 start
+    /// would make the E61 loop *back* to row 5 — i.e. FORWARD-then-back to a
+    /// later row, an obvious artefact; with the reset, the loop-start defaults
+    /// to row 0 (the documented "-1" sentinel, i.e. top of the pattern), so
+    /// the E61 loops to row 0 of pattern 1, never to pattern 0's row 5.
+    #[test]
+    fn pattern_loop_e6_start_resets_across_pattern_transition() {
+        // Pattern 0: row 5 carries E60 (loop-start). The pattern then runs to
+        // the end and transitions into pattern 1.
+        let cells0 = vec![(
+            5,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0xE,
+                effect_param: 0x60,
+            },
+        )];
+        // Pattern 1: row 2 carries E61 (loop once) with NO preceding E60.
+        let cells1 = vec![(
+            2,
+            0,
+            Note {
+                period: 0,
+                sample: 0,
+                effect: 0xE,
+                effect_param: 0x61,
+            },
+        )];
+        let bytes = synth_two_pattern_mod(&cells0, &cells1);
+        let mut player = make_player(&bytes);
+
+        // Drive the player until it reaches pattern 1, then observe the row it
+        // loops back to when the E61 on row 2 fires. Record the first
+        // backward transition (row decreases) seen while in pattern 1.
+        let mut reached_e61 = false;
+        let mut loop_target: Option<u8> = None;
+        let mut prev_row = 0u8;
+        for _ in 0..6000 {
+            step_one_tick(&mut player);
+            if player.ended {
+                break;
+            }
+            if player.order_index == 1 {
+                if player.row >= 2 {
+                    reached_e61 = true;
+                }
+                if reached_e61 && player.row < prev_row && loop_target.is_none() {
+                    loop_target = Some(player.row);
+                    break;
+                }
+            }
+            prev_row = player.row;
+            if player.order_index == 1 && player.row >= 12 {
+                break;
+            }
+        }
+
+        assert!(
+            reached_e61,
+            "player should reach pattern 1 row 2 (the E61 cell)"
+        );
+        assert_eq!(
+            loop_target,
+            Some(0),
+            "with the loop-start reset on the pattern transition, the E61 in \
+             pattern 1 must loop back to row 0 (the default top), NOT to \
+             pattern 0's leftover row-5 start"
         );
     }
 
