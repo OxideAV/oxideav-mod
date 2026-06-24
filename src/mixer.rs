@@ -563,6 +563,56 @@ mod tests {
     }
 
     #[test]
+    fn ping_pong_loop_bounces_and_stays_active() {
+        // 8-frame ping-pong loop over the whole buffer. After a long run
+        // the voice is still active and the cursor stays inside
+        // [loop_start, loop_end].
+        let src = TestSource {
+            pcm: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            loop_start: 0,
+            loop_end: 8,
+            kind: LoopKind::PingPong,
+        };
+        let mut v = MixerVoice::default();
+        v.trigger(44100.0, 1.0);
+        let mut saw_reverse = false;
+        for _ in 0..2000 {
+            v.render_one(&src, 44100.0);
+            if v.direction == -1 {
+                saw_reverse = true;
+            }
+        }
+        assert!(v.active, "ping-pong voice must stay active");
+        assert!(saw_reverse, "ping-pong voice must reverse at the loop end");
+    }
+
+    #[test]
+    fn ping_pong_loop_never_reads_past_loop_end() {
+        // Loop region 0..4; frames 4..8 are a poisoned tail. A ping-pong
+        // loop reflects at `loop_end` and must never step into the tail.
+        let src = TestSource {
+            pcm: vec![0.1, 0.2, 0.3, 0.4, -1.0, -1.0, -1.0, -1.0],
+            loop_start: 0,
+            loop_end: 4,
+            kind: LoopKind::PingPong,
+        };
+        let mut v = MixerVoice::default();
+        // A fractional step exercises the reflection at many sub-frame
+        // phases.
+        v.trigger(29400.0, 1.0); // 2/3 frame per render
+        let mut min_seen = f32::INFINITY;
+        for _ in 0..2000 {
+            let s = v.render_one(&src, 44100.0);
+            min_seen = min_seen.min(s);
+        }
+        assert!(v.active);
+        assert!(
+            min_seen >= -0.001,
+            "ping-pong loop read into the poisoned tail (min {min_seen})"
+        );
+    }
+
+    #[test]
     fn forward_loop_position_wraps_at_loop_end_not_buffer_end() {
         // Same shape: loop 0..4, tail 4..8 poisoned. The wrap is applied
         // lazily on entry to each render (the MOD player uses the same

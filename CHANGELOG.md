@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Ping-pong loop coverage in the shared mixer** (`src/mixer.rs`). The
+  `MixerVoice` ping-pong path previously had no unit tests at all. Two
+  new `mixer::tests` pin it: one asserts a whole-buffer ping-pong loop
+  bounces (direction reverses) and stays active over a long run, and one
+  poisons the PCM past `loop_end` with a sentinel and asserts the
+  reflecting cursor never reads a tail frame (confirming the same
+  `loop_end`-anchored boundary the forward-loop fix introduced also
+  holds for ping-pong reflection).
+
 ### Fixed
 
 - **Shared mixer forward-loop never reads the discarded one-shot tail**
