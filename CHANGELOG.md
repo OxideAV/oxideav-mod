@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Shared mixer forward-loop never reads the discarded one-shot tail**
+  (`src/mixer.rs`). The generic `MixerVoice` (used by the STM and XM
+  players) wrapped both the playback cursor and the linear-interpolation
+  partner index at the *buffer* end (`len`) instead of at `loop_end`.
+  When a forward-looping sample declares a loop region shorter than its
+  PCM body (`loop_end < len` — the canonical case where the bytes past
+  `loop_end` are a one-shot tail the loop must discard, per
+  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` §2.2 + §2.8),
+  the voice played through that tail before wrapping and the interpolation
+  partner at the loop boundary sampled a tail frame, producing audible
+  glitches on STM/XM samples. The MOD player's own mixing loop already
+  wrapped at `loop_end`; this brings the shared core in line. The cursor
+  now wraps on `loop_end` for a forward loop, and the interpolation
+  partner folds back to `loop_start` when `i + 1 >= loop_end`. Two new
+  `mixer::tests` poison the tail with a sentinel and assert no tail frame
+  is ever emitted.
 - **MOD `E6x` pattern-loop point now resets on a pattern transition**
   (`src/player.rs`). `multimedia-cx-protracker.html` §E6x: "The
   loopback point is reset to -1 for every Bxx or Dxx or pattern

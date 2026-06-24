@@ -148,7 +148,20 @@ impl MixerVoice {
             }
         }
 
-        if self.pos >= len as f32 {
+        // A forward loop wraps at `loop_end`, NOT at the buffer end:
+        // when `loop_end < len`, the PCM past `loop_end` is the one-shot
+        // tail that the loop must never read (per
+        // `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
+        // §2.2 + §2.8 — the data past loop_end is discarded once the
+        // sample enters its loop). Trigger the wrap on `loop_end` for a
+        // forward loop, falling back to `len` only for the one-shot tail
+        // of an unlooped voice.
+        let forward_wrap_at = if matches!(kind, LoopKind::Forward) && loop_end > loop_start {
+            loop_end as f32
+        } else {
+            len as f32
+        };
+        if self.pos >= forward_wrap_at {
             match kind {
                 LoopKind::Forward if loop_end > loop_start => {
                     let span = (loop_end - loop_start) as f32;
@@ -170,10 +183,19 @@ impl MixerVoice {
         let i = (self.pos as usize).min(len - 1);
         let frac = self.pos - (i as f32);
         let s0 = source.at(i);
-        let s1_idx = if i + 1 < len {
+        // The interpolation partner respects the loop boundary too: if
+        // `i + 1` lands on or past `loop_end`, wrap to `loop_start`
+        // rather than read the discarded tail. For a non-looping voice
+        // the partner clamps to the buffer end.
+        let looping = !matches!(kind, LoopKind::None) && loop_end > loop_start;
+        let s1_idx = if looping {
+            if i + 1 < loop_end {
+                i + 1
+            } else {
+                loop_start
+            }
+        } else if i + 1 < len {
             i + 1
-        } else if !matches!(kind, LoopKind::None) && loop_end > loop_start {
-            loop_start
         } else {
             i
         };
@@ -508,6 +530,71 @@ mod tests {
             assert!(s.abs() <= 1.0);
         }
         assert!(v.active, "looped voice must stay active");
+    }
+
+    #[test]
+    fn forward_loop_never_reads_past_loop_end() {
+        // Sample of 8 frames; loop region is frames 0..4. Frames 4..8
+        // are the one-shot tail that must NEVER be read once the voice
+        // is looping. We poison the tail with a sentinel the loop
+        // region never produces (-1.0); if the mixer ever reads it the
+        // emitted sample dips negative.
+        let src = TestSource {
+            pcm: vec![0.5, 0.5, 0.5, 0.5, -1.0, -1.0, -1.0, -1.0],
+            loop_start: 0,
+            loop_end: 4,
+            kind: LoopKind::Forward,
+        };
+        let mut v = MixerVoice::default();
+        // Step ~0.5 frames per render so the cursor crosses the loop
+        // boundary fractionally — this is precisely where a bad
+        // interpolation partner would sample the poisoned tail.
+        v.trigger(22050.0, 1.0);
+        let mut min_seen = f32::INFINITY;
+        for _ in 0..200 {
+            let s = v.render_one(&src, 44100.0);
+            min_seen = min_seen.min(s);
+        }
+        assert!(v.active, "forward-looped voice must stay active");
+        assert!(
+            min_seen >= -0.001,
+            "loop read into the discarded tail (min sample {min_seen})"
+        );
+    }
+
+    #[test]
+    fn forward_loop_position_wraps_at_loop_end_not_buffer_end() {
+        // Same shape: loop 0..4, tail 4..8 poisoned. The wrap is applied
+        // lazily on entry to each render (the MOD player uses the same
+        // design), so the cursor can momentarily overshoot `loop_end`
+        // after a step — but it is folded back BEFORE the next render
+        // samples any index, and crucially it never wanders all the way
+        // out to the buffer end (8). With a forward loop of length 4,
+        // a wrapped cursor must always sit below `loop_end + step`; if
+        // the wrap mistakenly keyed on `len` instead of `loop_end` the
+        // cursor would climb past 4 toward 8 and the index would land in
+        // the tail. We sample the actual read index each render and
+        // assert it stays inside the loop region.
+        let src = TestSource {
+            pcm: vec![0.1, 0.2, 0.3, 0.4, -1.0, -1.0, -1.0, -1.0],
+            loop_start: 0,
+            loop_end: 4,
+            kind: LoopKind::Forward,
+        };
+        let mut v = MixerVoice::default();
+        v.trigger(33075.0, 1.0); // 0.75 frame per render
+        for _ in 0..400 {
+            let s = v.render_one(&src, 44100.0);
+            // Every emitted sample is the interpolation of two frames
+            // drawn from the loop region [0,4) whose values are 0.1..0.4
+            // — strictly positive. A tail read (value -1.0) would drag
+            // the result below 0.
+            assert!(
+                s > 0.0,
+                "emitted sample non-positive ({s}) — a tail frame was read"
+            );
+        }
+        assert!(v.active);
     }
 
     #[test]
