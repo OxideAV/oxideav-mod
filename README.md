@@ -457,6 +457,22 @@ sourced from the in-tree clean-room note
 (which cites `FastTracker-2.08-manual.doc` §3.15.4 / §4.2.1 / §4.2.6
 and the `FastTracker-2-v2.04-xm.txt` field table at +235..+238).
 
+### Shared-mixer loop boundary (STM + XM)
+
+STM and XM samples drive the shared `mixer::MixerVoice` core rather than
+MOD's bespoke mix loop, but they observe the **same** loop-boundary rule:
+a forward (or ping-pong) loop wraps at `loop_end`, never at the PCM
+buffer end. XM samples in particular very commonly declare a loop region
+shorter than the sample body (`loop_end < len`) — the bytes past
+`loop_end` are a one-shot tail the loop must discard, exactly as PT
+discards a MOD sample's tail (`Protracker-effects-MODFIL12.txt` §2.2 +
+§2.8). The voice's playback cursor wraps on `loop_end`, and the
+linear-interpolation partner folds back to `loop_start` when `i + 1`
+reaches `loop_end`, so the boundary frame never interpolates against a
+discarded tail sample. Ping-pong loops reflect at the same `loop_end`
+edge. Unit tests in `mixer::tests` poison the tail with an out-of-band
+sentinel and assert no tail frame is ever emitted for either loop mode.
+
 ## Scream Tracker v1 (.stm) playback coverage
 
 `oxideav-mod` also drives a Scream Tracker v1 (`.stm`) playback engine
