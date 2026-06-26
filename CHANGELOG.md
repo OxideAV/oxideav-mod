@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Rendered-PCM checkpoint regression net for the MOD mix/render driver**
+  (`src/player.rs`). Five new `player::tests` assert the interleaved S16
+  output at named frame offsets bit-for-bit, locking the multi-channel
+  mixing driver against silent refactor drift — previously every effect
+  test asserted only channel *state* (period / volume / LFO position),
+  never the rendered audio. Coverage: a plain hard-left note (anti-click
+  ramp from silence, full-scale `(±6399, ±2133)` LRRL frame with the
+  default `0.5`-separation quarter-bleed, left-magnitude == 3× right),
+  `Cxx` set-volume linear amplitude scaling (`20/64` → `(±1999, ±666)`),
+  a two-channel left+right sum (centred `8533` when both voices are in
+  their positive half-wave, diverging once the faster right voice flips),
+  a `3xy` tone-portamento that bends the rendered waveform phase on row 1
+  (asserted unequal to the held-note reference render), and an `EAx`
+  fine-volume-slide that raises the amplitude mid-song
+  (`20`→`25`/64 → `(±2499, ±833)`).
 - **Ping-pong loop coverage in the shared mixer** (`src/mixer.rs`). The
   `MixerVoice` ping-pong path previously had no unit tests at all. Two
   new `mixer::tests` pin it: one asserts a whole-buffer ping-pong loop

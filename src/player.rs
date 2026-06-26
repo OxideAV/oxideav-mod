@@ -2638,6 +2638,149 @@ pub mod tests {
         assert_eq!(player.samples_per_tick(), 882);
     }
 
+    /// Build a player from a row-list and render `frames` stereo frames,
+    /// returning the interleaved S16 buffer. Shared by the rendered-PCM
+    /// checkpoint regression tests below.
+    fn render_rows(rows: &[(usize, usize, Note)], frames: usize) -> Vec<i16> {
+        let bytes = synth_mod_with_pattern(rows);
+        let mut p = make_player(&bytes);
+        let mut buf = vec![0i16; frames * 2];
+        let produced = p.render(&mut buf);
+        assert_eq!(produced, frames, "render must fill the whole buffer");
+        buf
+    }
+
+    /// Build a `Note` cell with explicit fields (test-local sugar).
+    fn cell(period: u16, sample: u8, effect: u8, param: u8) -> Note {
+        Note {
+            period,
+            sample,
+            effect,
+            effect_param: param,
+        }
+    }
+
+    // The `synth_mod_with_pattern` sample is a 32-frame square wave
+    // (+100 for 16 frames, then -100). At C-2 (period 428) and 44.1 kHz
+    // the Paula step is `PAULA_CLOCK / 428 / 44100 ≈ 0.1875` frames per
+    // output frame, so the square's half-period (~85 output frames) is
+    // wide enough that contiguous output frames sit firmly inside one
+    // half-wave — every checkpoint below is bit-exact and stable.
+    //
+    // Channel 0 is a hard-LEFT voice under the Amiga LRRL default, and
+    // the default `pan_separation = 0.5` bleeds the far speaker to a
+    // quarter, so a full-volume ch0 frame is (±6399, ±2133): the right
+    // magnitude is exactly the left's third (6399 / 2133 ≈ 3.0).
+
+    #[test]
+    fn render_checkpoint_plain_note_left_panned_with_bleed() {
+        // Single C-2 note on channel 0, full volume.
+        let buf = render_rows(&[(0, 0, cell(428, 1, 0, 0))], 3500);
+        // Frame 0 is the first output of the per-trigger anti-click ramp,
+        // which crossfades up from silence.
+        assert_eq!((buf[0], buf[1]), (0, 0), "ramp starts from silence");
+        // Once the ramp completes, the square wave plays at full level on
+        // the hard-left channel with quarter-bleed to the right.
+        assert_eq!(
+            (buf[50 * 2], buf[50 * 2 + 1]),
+            (6399, 2133),
+            "positive half-wave"
+        );
+        assert_eq!(
+            (buf[882 * 2], buf[882 * 2 + 1]),
+            (6399, 2133),
+            "still positive one tick in"
+        );
+        assert_eq!(
+            (buf[3000 * 2], buf[3000 * 2 + 1]),
+            (-6399, -2133),
+            "negative half-wave, sign flipped, ratio preserved"
+        );
+        // Left magnitude is exactly 3x the right (the LRRL + 0.5-separation
+        // bleed ratio).
+        assert_eq!(buf[50 * 2], buf[50 * 2 + 1] * 3);
+    }
+
+    #[test]
+    fn render_checkpoint_set_volume_scales_amplitude_linearly() {
+        // Cxx with volume 20 (vs the full-scale 64) on the same note.
+        let buf = render_rows(&[(0, 0, cell(428, 1, 0xC, 20))], 3500);
+        // 6399 * 20 / 64 = 1999 (truncating toward zero in the i16 cast).
+        assert_eq!(
+            (buf[50 * 2], buf[50 * 2 + 1]),
+            (1999, 666),
+            "volume 20/64 scales the full-scale (6399,2133) frame"
+        );
+        assert_eq!((buf[3000 * 2], buf[3000 * 2 + 1]), (-1999, -666));
+    }
+
+    #[test]
+    fn render_checkpoint_two_channels_left_and_right_sum() {
+        // ch0 (LEFT) at C-2, ch1 (RIGHT) at a higher pitch (period 320).
+        let buf = render_rows(
+            &[(0, 0, cell(428, 1, 0, 0)), (0, 1, cell(320, 1, 0, 0))],
+            3500,
+        );
+        // Both voices are in their positive half-wave at frame 50: ch0
+        // pushes (6399,2133), ch1 (hard RIGHT) pushes (2133,6399), and the
+        // ramp/headroom mix lands them at the measured sum.
+        assert_eq!(
+            (buf[50 * 2], buf[50 * 2 + 1]),
+            (8533, 8533),
+            "left+right voices sum to a centred frame"
+        );
+        // By frame 200 the faster ch1 has crossed into its negative
+        // half-wave while ch0 is still positive, so L and R diverge.
+        assert_eq!((buf[200 * 2], buf[200 * 2 + 1]), (4266, -4266));
+        assert_eq!((buf[3000 * 2], buf[3000 * 2 + 1]), (-8533, -8533));
+    }
+
+    #[test]
+    fn render_checkpoint_tone_porta_bends_waveform_on_row_one() {
+        // Row 0 triggers C-2; row 1 starts a tone-porta (3xy, speed 8)
+        // toward period 320. Row 1 begins at frame 6*882 = 5292 (speed 6,
+        // 882 frames/tick).
+        let bent = render_rows(
+            &[(0, 0, cell(428, 1, 0, 0)), (1, 0, cell(320, 1, 0x3, 0x08))],
+            7000,
+        );
+        // The reference is the SAME song with no porta on row 1 — the note
+        // simply holds at period 428.
+        let held = render_rows(
+            &[(0, 0, cell(428, 1, 0, 0)), (1, 0, cell(0, 0, 0, 0))],
+            7000,
+        );
+        // Deep inside row 1 the porta has shifted the pitch, so the
+        // square-wave phase (and therefore the rendered amplitude) diverges
+        // from the un-bent reference.
+        assert_eq!(
+            (bent[6800 * 2], bent[6800 * 2 + 1]),
+            (5804, 1934),
+            "tone-porta has bent the pitch, shifting the waveform phase"
+        );
+        assert_ne!(
+            (bent[6800 * 2], bent[6800 * 2 + 1]),
+            (held[6800 * 2], held[6800 * 2 + 1]),
+            "porta render must differ from the held-note render"
+        );
+    }
+
+    #[test]
+    fn render_checkpoint_fine_volume_slide_raises_amplitude_on_row_one() {
+        // Row 0 sets volume 20; row 1 fine-volume-slides up by 5 (EAx5),
+        // taking the volume to 25 for the rest of the song.
+        let buf = render_rows(
+            &[(0, 0, cell(428, 1, 0xC, 20)), (1, 0, cell(0, 0, 0xE, 0xA5))],
+            7000,
+        );
+        // Inside row 1: 6399 * 25 / 64 = 2499 (was 1999 at volume 20).
+        assert_eq!(
+            (buf[6000 * 2], buf[6000 * 2 + 1]),
+            (2499, 833),
+            "EAx5 raised the volume from 20 to 25 → louder frame"
+        );
+    }
+
     #[test]
     fn render_per_channel_isolates_channels() {
         // The synth MOD triggers notes exclusively on channel 0, so any
