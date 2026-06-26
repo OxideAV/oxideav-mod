@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (asserted unequal to the held-note reference render), and an `EAx`
   fine-volume-slide that raises the amplitude mid-song
   (`20`→`25`/64 → `(±2499, ±833)`).
+- **Rendered-PCM checkpoints for the planar output mode + loop sustain**
+  (`src/player.rs`). Two more `player::tests` extend the regression net to
+  the second render driver and the loop path: the `mod_planar`
+  `render_per_channel` driver is asserted to emit each tracker channel's
+  *un-panned* signal at full S16 scale (`±25599` for a full-volume
+  `±100/128` square plateau, anti-click ramp opening from silence, an
+  untouched channel's plane bit-for-bit silent); and a looped sample is
+  asserted to still be sounding ~17 raw-length passes into the render
+  (`>1000` non-zero left frames in `[1000, 3500)`, amplitude preserved at
+  `±6399`), pinning the loop-wrap through the real render loop rather than
+  only the unit-level `mix_one`.
 - **Ping-pong loop coverage in the shared mixer** (`src/mixer.rs`). The
   `MixerVoice` ping-pong path previously had no unit tests at all. Two
   new `mixer::tests` pin it: one asserts a whole-buffer ping-pong loop

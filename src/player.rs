@@ -2702,6 +2702,63 @@ pub mod tests {
     }
 
     #[test]
+    fn render_checkpoint_planar_emits_unpanned_full_scale_per_channel() {
+        // The `mod_planar` output mode emits one S16 plane per tracker
+        // channel, each carrying the channel's *un-panned* signal at full
+        // S16 scale (pan is a mix-down concern, irrelevant per-plane).
+        // ch0 plays a full-volume C-2 square wave; ch1 is untouched.
+        let bytes = synth_mod_with_pattern(&[(0, 0, cell(428, 1, 0, 0))]);
+        let mut p = make_player(&bytes);
+        let nf = 3500;
+        let mut planes: Vec<Vec<i16>> = (0..p.channels.len()).map(|_| vec![0i16; nf]).collect();
+        let produced = {
+            let mut views: Vec<&mut [i16]> = planes.iter_mut().map(|x| x.as_mut_slice()).collect();
+            p.render_per_channel(&mut views, nf)
+        };
+        assert_eq!(produced, nf);
+        // The 32-frame square is ±100/128 of full scale; at full volume that
+        // maps to ±round(100/128 * 32767) = ±25599. The Amiga LED filter is
+        // ON by default but a square wave's flat half-cycle is far below the
+        // ~11.5 kHz cutoff, so the steady-state plateau passes unattenuated.
+        assert_eq!(planes[0][0], 0, "per-trigger ramp opens from silence");
+        assert_eq!(
+            planes[0][50], 25599,
+            "positive plateau, un-panned, full scale"
+        );
+        assert_eq!(planes[0][100], -25599, "negative plateau");
+        assert_eq!(planes[0][3000], -25599);
+        // No note ever triggered on channel 1 → its plane is pure silence.
+        assert!(
+            planes[1].iter().all(|&s| s == 0),
+            "untouched channel plane must be silent"
+        );
+    }
+
+    #[test]
+    fn render_checkpoint_looped_sample_sustains_past_raw_length() {
+        // The synth sample is 32 frames with a full-length loop, played at
+        // C-2 (~0.1875 Paula frames advanced per output frame). The raw
+        // sample is therefore exhausted after ~170 output frames, but the
+        // loop must keep it sounding indefinitely. Frame 3000 is ~17 raw
+        // passes in — if the loop wrap were broken the channel would have
+        // gone silent long ago.
+        let buf = render_rows(&[(0, 0, cell(428, 1, 0, 0))], 3500);
+        let tail_nonzero = (1000..3500).filter(|&f| buf[f * 2] != 0).count();
+        assert!(
+            tail_nonzero > 1000,
+            "looped sample must still be sounding deep into the render, \
+             got {tail_nonzero} non-zero left frames in [1000,3500)"
+        );
+        // The waveform is still a clean ±6399 square plateau (the loop
+        // reproduces the original sample verbatim).
+        assert_eq!(
+            buf[3000 * 2].unsigned_abs(),
+            6399,
+            "loop preserves amplitude"
+        );
+    }
+
+    #[test]
     fn render_checkpoint_set_volume_scales_amplitude_linearly() {
         // Cxx with volume 20 (vs the full-scale 64) on the same note.
         let buf = render_rows(&[(0, 0, cell(428, 1, 0xC, 20))], 3500);
