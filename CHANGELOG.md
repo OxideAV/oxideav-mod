@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`>1000` non-zero left frames in `[1000, 3500)`, amplitude preserved at
   `±6399`), pinning the loop-wrap through the real render loop rather than
   only the unit-level `mix_one`.
+- **End-to-end decode-pipeline PCM checkpoint** (`tests/mixing_smoke.rs`).
+  A bit-exact assertion on the *public* decode path — container packet →
+  registry decoder → S16 frames — locks the decoded output of a
+  full-volume C-2 channel-0 note (`±5119`/`±1706` LRRL frame for the
+  `±80/128` square sample, anti-click ramp from silence, loop-preserved
+  plateau at frame 3000). Complements the in-`player` render checkpoints
+  by covering the registry/decoder wrapper that consumers actually call,
+  upgrading the prior "audible-vs-silent" smoke coverage to exact values.
 - **Ping-pong loop coverage in the shared mixer** (`src/mixer.rs`). The
   `MixerVoice` ping-pong path previously had no unit tests at all. Two
   new `mixer::tests` pin it: one asserts a whole-buffer ping-pong loop

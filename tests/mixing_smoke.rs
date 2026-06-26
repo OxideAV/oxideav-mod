@@ -131,6 +131,29 @@ fn mod_with_note_produces_audible_output() {
 }
 
 #[test]
+fn mod_decode_pipeline_emits_exact_pcm_checkpoints() {
+    // End-to-end bit-exact lock on the PUBLIC decode path
+    // (container packet → registry decoder → S16 frames), complementing
+    // the in-`player` render checkpoints. `build_mod(true)` triggers a
+    // full-volume C-2 (period 428) on channel 0 (hard-left under the
+    // Amiga LRRL default) with a ±80/128 square-wave sample.
+    let pcm = decode_full(build_mod(true), 3500);
+    assert!(pcm.len() >= 3500 * 2, "need at least 3500 stereo frames");
+
+    let frame = |f: usize| (pcm[f * 2], pcm[f * 2 + 1]);
+    // The per-trigger anti-click ramp opens the channel from silence.
+    assert_eq!(frame(0), (0, 0), "decode opens from silence");
+    // ±80/128 of full scale, scaled by the hard-left LRRL pan with the
+    // default 0.5-separation quarter-bleed: left = round, right = left/3.
+    assert_eq!(frame(50), (5119, 1706), "positive square plateau");
+    assert_eq!(frame(100), (-5119, -1706), "negative plateau");
+    assert_eq!(frame(3000), (-5119, -1706), "loop preserves the waveform");
+    // The hard-left LRRL ratio: left magnitude is ~3x the right (the two
+    // channels round independently, so allow a 1-LSB slack).
+    assert!((pcm[50 * 2] - pcm[50 * 2 + 1] * 3).abs() <= 1);
+}
+
+#[test]
 fn mod_with_no_notes_is_silent() {
     let pcm = decode_full(build_mod(false), 4410);
     assert!(!pcm.is_empty(), "decoder produced zero samples");
