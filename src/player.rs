@@ -3084,6 +3084,59 @@ pub mod tests {
     }
 
     #[test]
+    fn volume_slide_both_nibbles_nonzero_slides_up() {
+        // Axy with BOTH nibbles non-zero is documented as "illegal", but the
+        // ProTracker replayer still does something deterministic.
+        // `Pro-Noise-Soundtracker-rev4.txt` line 227 + `aes-modformat.html`
+        // line 240 pin it: "If both x and y are non-zero, then the y value is
+        // ignored (assumed to be 0)" — i.e. the volume slides UP by x. (The
+        // `multimedia-cx-protracker.html` minority reading is "do nothing";
+        // we follow the two clean-room docs that agree, and lock the choice
+        // so a future refactor can't silently flip to the down nibble.)
+        //   Row 0: C-2 note + C20 (set volume to 32).
+        //   Row 1: A21 (volume slide x=2 up, y=1 down → x wins → +2 per tick).
+        // At default speed 6 a row has 5 tick-N updates, so 32 + 2*5 = 42.
+        let bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0xC,
+                    effect_param: 0x20,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0xA,
+                    effect_param: 0x21,
+                },
+            ),
+        ]);
+        let mut player = make_player(&bytes);
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].volume, 32,
+            "C20 must set volume to 32 before the slide row"
+        );
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].volume, 42,
+            "A21 (both nibbles set) must slide UP by x (the down nibble is \
+             ignored): 32 + 2*5 = 42"
+        );
+    }
+
+    #[test]
     fn vibrato_modulates_period_symmetrically() {
         // Trigger a note, then apply 4xy with depth 4 and rate 8. The LFO
         // should visit both positive and negative sides of the base period

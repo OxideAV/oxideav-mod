@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Axy` both-nibbles-set volume-slide direction is locked to a regression
+  test** (`src/player.rs`). When a `Axy` (or `5xy` / `6xy`) volume slide
+  has BOTH nibbles non-zero — documented as "illegal" — the ProTracker
+  replayer still resolves it deterministically: `Pro-Noise-Soundtracker-rev4.txt`
+  (line 227) and `aes-modformat.html` (line 240) both state "If both x and
+  y are non-zero, then the y value is ignored (assumed to be 0)", i.e. the
+  volume slides UP by x. (The `multimedia-cx-protracker.html` minority
+  reading is "do nothing"; the two clean-room docs that agree win.) The
+  crate already implemented x-wins; the new
+  `volume_slide_both_nibbles_nonzero_slides_up` test pins the choice so a
+  future refactor can't silently flip to the down nibble.
 - **Rendered-PCM checkpoint regression net for the MOD mix/render driver**
   (`src/player.rs`). Five new `player::tests` assert the interleaved S16
   output at named frame offsets bit-for-bit, locking the multi-channel
