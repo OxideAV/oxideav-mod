@@ -264,6 +264,14 @@ a unit test in `src/player.rs`):
   `aes-modformat.html`. The seek latches the `9xx` memory, re-arms the
   anti-click ramp for the discontinuous jump, and carries the same
   out-of-range "NO NOTE" silencing quirk as the with-note path.
+- **Sample-header finetune retunes every note** — a sample whose header
+  finetune nibble (byte 44, signed -8..+7) is non-zero retunes *every* note
+  played with that instrument, not only notes carrying an `E5x`. The period
+  that fixes playback frequency is looked up "in a table based on the
+  finetune setting" (`Protracker-effects-MODFIL12.txt` §3.3), so a C-2 on a
+  finetune-+1 sample plays at period 425, not the cell's finetune-0 value
+  428. The `EDx` note-delay fire path resolves the same way (a delayed note
+  is still a note-on).
 - **Tone-porta target is finetune-aware** — a `3xy` / `5xy` slide toward a
   note on a finetuned instrument glides to that note's period in the
   channel's *current* finetune row, not the finetune-0 period printed in

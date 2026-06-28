@@ -1251,22 +1251,30 @@ impl PlayerState {
                 });
                 ch.arp_base_period = ch.period;
             } else if note.has_period() {
-                // Normal note trigger — apply E5 finetune if it lands on this row.
-                let mut note_period = note.period;
+                // Normal note trigger. The cell carries the finetune-0 period;
+                // the actual playback period is that note looked up in the
+                // channel's current finetune row (set from the sample header's
+                // finetune nibble at trigger, or by an E5x). Per
+                // `Protracker-effects-MODFIL12.txt` §3.3 "what frequency to
+                // play a sample at" resolves the period "in a table based on
+                // the finetune setting", so a finetuned instrument retunes
+                // EVERY note, not only notes carrying an E5x.
                 if effect == 0xE && x == 0x5 {
-                    // E5x: set finetune and re-derive the period from the
-                    // note index.
+                    // E5x: set finetune first; the shared re-derivation below
+                    // then picks up the new finetune row.
                     let new_ft = y as i8;
-                    let signed_ft = if new_ft & 0x8 != 0 {
+                    ch.finetune = if new_ft & 0x8 != 0 {
                         new_ft - 16
                     } else {
                         new_ft
                     };
-                    ch.finetune = signed_ft;
-                    if let Some(note_idx) = note_index_for_period(note.period) {
-                        note_period = PERIOD_TABLE[finetune_row(signed_ft)][note_idx];
-                    }
                 }
+                let note_period = match note_index_for_period(note.period) {
+                    Some(note_idx) => PERIOD_TABLE[finetune_row(ch.finetune)][note_idx],
+                    // Out-of-table cell period (hostile rip): keep the raw
+                    // value, since there's no note index to re-look-up.
+                    None => note.period,
+                };
                 ch.period = note_period;
 
                 // Consume any deferred sample swap from a previous row
@@ -2130,10 +2138,18 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
                 ch.sample_index = ch.pending_sample;
             }
             ch.pending_sample = 0;
-            ch.period = delayed.period;
+            // Resolve the delayed note's period through the channel's current
+            // finetune (loaded above from the sample header), exactly like a
+            // tick-0 trigger — a delayed note is still a note-on and must
+            // honour the instrument's finetune (`Protracker-effects-MODFIL12.txt`
+            // §3.3). The stored `delayed.period` is the finetune-0 cell value.
+            ch.period = match note_index_for_period(delayed.period) {
+                Some(note_idx) => PERIOD_TABLE[finetune_row(ch.finetune)][note_idx],
+                None => delayed.period,
+            };
             ch.sample_pos = 0.0;
             ch.active = true;
-            ch.arp_base_period = delayed.period;
+            ch.arp_base_period = ch.period;
             // Per-trigger ramp on the EDx delayed retrigger.
             ch.ramp_prev_sample = ch.last_mixed_sample;
             ch.ramp_remaining_frames = PlayerState::RAMP_FRAMES;
@@ -4145,6 +4161,83 @@ pub mod tests {
         assert_eq!(
             player.channels[0].period, 425,
             "finetune +1 should retune C-2 to 425"
+        );
+    }
+
+    #[test]
+    fn sample_header_finetune_retunes_a_plain_note() {
+        // A sample whose *header* finetune is non-zero must retune every note
+        // played with it, not just notes carrying an E5x. The period that
+        // fixes playback frequency is looked up in the finetune-specific
+        // table (`Protracker-effects-MODFIL12.txt` §3.3 + the §3.2 sample
+        // header finetune field at byte 44). C-2 at finetune 0 = period 428;
+        // at finetune +1 = 425. A plain C-2 note on a finetune-+1 sample must
+        // therefore land at period 425, the same as if E51 were present.
+        let mut bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0,
+                effect_param: 0,
+            },
+        )]);
+        // Sample 1 header finetune nibble (absolute offset 44) = +1.
+        bytes[44] = 0x01;
+
+        let mut player = make_player(&bytes);
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].finetune, 1,
+            "sample header finetune must load onto the channel"
+        );
+        assert_eq!(
+            PERIOD_TABLE[1][12], 425,
+            "table sanity: C-2 at FT +1 is 425"
+        );
+        assert_eq!(
+            player.channels[0].period, 425,
+            "a plain note on a finetune-+1 sample must play at the finetuned \
+             period 425, not the cell's FT-0 period 428"
+        );
+    }
+
+    #[test]
+    fn delayed_note_honours_sample_header_finetune() {
+        // A note-delayed (EDx) trigger is still a note-on, so it must also
+        // resolve its period through the instrument finetune. C-2 + ED2 on a
+        // finetune-+1 sample must fire at period 425 (not 428) when the delay
+        // tick arrives.
+        let mut bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0xE,
+                effect_param: 0xD2,
+            },
+        )]);
+        bytes[44] = 0x01; // sample 1 header finetune = +1
+
+        let mut player = make_player(&bytes);
+        step_one_tick(&mut player); // tick 0: not yet triggered
+        assert!(
+            !player.channels[0].active,
+            "ED2 must not trigger before tick 2"
+        );
+        step_one_tick(&mut player); // tick 1
+        step_one_tick(&mut player); // tick 2: fires
+        assert!(player.channels[0].active, "ED2 must trigger at tick 2");
+        assert_eq!(
+            player.channels[0].finetune, 1,
+            "delayed trigger must load the sample header finetune"
+        );
+        assert_eq!(
+            player.channels[0].period, 425,
+            "delayed note on a finetune-+1 sample must fire at the finetuned \
+             period 425, not the cell's FT-0 period 428"
         );
     }
 

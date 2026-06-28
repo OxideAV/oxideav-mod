@@ -65,6 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MOD sample-header finetune now retunes every note, not only E5x notes**
+  (`src/player.rs`). A sample whose header finetune nibble (byte 44, signed
+  -8..+7) is non-zero must retune *every* note played with that instrument —
+  the period that fixes playback frequency is looked up "in a table based on
+  the finetune setting" (`Protracker-effects-MODFIL12.txt` §3.3 + §3.2). The
+  normal-note trigger path only re-derived the period through the finetune
+  table when an `E5x` set-finetune appeared on the same row; a plain note on
+  a finetuned sample stored the cell's *finetune-0* period verbatim, so the
+  instrument played a few cents/one period-unit off pitch on every note
+  (e.g. a C-2 on a finetune-+1 sample sounded at period 428 instead of the
+  correct 425). The trigger path now always resolves the note index through
+  the channel's current finetune row, and the `EDx` note-delay fire path
+  does the same (a delayed note is still a note-on and must honour the
+  instrument finetune). Out-of-table cell periods (hostile rips) keep their
+  raw value. Two new `player::tests` pin the plain-note retune and the
+  delayed-note retune; the existing E5x test is unchanged because the shared
+  re-derivation subsumes its old special-case.
 - **MOD `9xx` sample-offset now retriggers a playing sample on a row with no
   note** (`src/player.rs`). `Protracker-effects-MODFIL12.txt`
   9:Set-sample-offset (lines 1226-1228) + `aes-modformat.html` (220-223):
