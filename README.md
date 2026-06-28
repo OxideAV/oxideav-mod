@@ -255,6 +255,27 @@ a unit test in `src/player.rs`):
   `Protracker-effects-MODFIL12.txt` 9:Set-sample-offset ("if the effect is
   out of range … NO NOTE WILL BE PLAYED!"). The `9xx` memory still latches
   so a later `900` continuation reuses the requested offset.
+- **9xx without a note retriggers the playing sample** — a bare `9xx`
+  (offset, no note cell) seeks the *currently-playing* sample's cursor to
+  the requested offset rather than doing nothing, per
+  `Protracker-effects-MODFIL12.txt` 9:Set-sample-offset ("If no sample is
+  specified with the effect, but one is currently playing on the channel,
+  then the sample currently playing is retriggered to offset specified") +
+  `aes-modformat.html`. The seek latches the `9xx` memory, re-arms the
+  anti-click ramp for the discontinuous jump, and carries the same
+  out-of-range "NO NOTE" silencing quirk as the with-note path.
+- **Tone-porta target is finetune-aware** — a `3xy` / `5xy` slide toward a
+  note on a finetuned instrument glides to that note's period in the
+  channel's *current* finetune row, not the finetune-0 period printed in
+  the cell, because the period that fixes playback frequency is looked up
+  through the finetune table (`Protracker-effects-MODFIL12.txt` §3.3). An
+  A-2 cell (period 254) on a finetune-+1 voice reaches 253, one unit
+  sharper than the standard table value.
+- **`Axy` both-nibbles-set** — when an `Axy` (or `5xy` / `6xy`) volume
+  slide has both nibbles non-zero (documented "illegal"), the volume
+  slides UP by the x nibble (the y nibble is ignored), per
+  `Pro-Noise-Soundtracker-rev4.txt` + `aes-modformat.html` ("If both x and
+  y are non-zero, then the y value is ignored").
 - **Sample swap without note** — when a sample number appears on a row
   without a note, PT loads the new sample's default volume + finetune
   immediately but defers the actual sample-PCM swap until the next

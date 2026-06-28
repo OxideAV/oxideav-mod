@@ -1341,6 +1341,43 @@ impl PlayerState {
             } else {
                 // No note — keep arp base anchored to the current period.
                 ch.arp_base_period = ch.period;
+
+                // 9xx without a note: "If no sample is specified with the
+                // effect, but one is currently playing on the channel, then
+                // the sample currently playing is retriggered to offset
+                // specified" (`Protracker-effects-MODFIL12.txt`
+                // 9:Set-sample-offset lines 1226-1228 + `aes-modformat.html`
+                // 220-223). The offset still multiplies by 0x100, still
+                // latches into the 9xx memory (so a later 900 reuses it), and
+                // still honours the out-of-range "NO NOTE" quirk — an offset
+                // at or past the body end silences the channel rather than
+                // wrapping a looped cursor back into the loop region.
+                if effect == 0x9 && ch.active {
+                    let used = if param == 0 {
+                        ch.mem_sample_offset
+                    } else {
+                        param
+                    };
+                    ch.mem_sample_offset = used;
+                    let offset_frames = (used as u32) * 0x100;
+                    let sample_len = (ch.sample_index as usize)
+                        .checked_sub(1)
+                        .and_then(|i| self.samples.get(i))
+                        .map(|b| b.pcm.len())
+                        .unwrap_or(0);
+                    if offset_frames as usize >= sample_len {
+                        ch.active = false;
+                        ch.sample_pos = 0.0;
+                    } else {
+                        // Retrigger the playing sample to the new offset.
+                        // Re-arm the per-trigger anti-click ramp because the
+                        // cursor jumps discontinuously, exactly like a fresh
+                        // note-on at an offset.
+                        ch.sample_pos = offset_frames as f32;
+                        ch.ramp_prev_sample = ch.last_mixed_sample;
+                        ch.ramp_remaining_frames = PlayerState::RAMP_FRAMES;
+                    }
+                }
             }
 
             // Tick-0 effects.
@@ -3507,6 +3544,134 @@ pub mod tests {
             player.channels[0].sample_pos >= 256.0,
             "in-range 9xx should seek to >= 256, got {}",
             player.channels[0].sample_pos
+        );
+    }
+
+    #[test]
+    fn sample_offset_without_note_retriggers_playing_sample() {
+        // "If no sample is specified with the effect, but one is currently
+        // playing on the channel, then the sample currently playing is
+        // retriggered to offset specified" — `Protracker-effects-MODFIL12.txt`
+        // 9:Set-sample-offset lines 1226-1228 + `aes-modformat.html` 220-223.
+        //   Row 0: C-2 note + sample 1 (plays from offset 0).
+        //   Row 1: 901 (9xx offset 0x100 = 256 frames) with NO note.
+        // After row 1's tick 0 the cursor must jump back into the body to
+        // ~256, not keep streaming linearly from where row 0 left off.
+        let mut bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0x9,
+                    effect_param: 0x01,
+                },
+            ),
+        ]);
+        // Long one-shot sample (8192 frames) so the cursor never reaches the
+        // end during row 0; disable loop so the offset doesn't wrap.
+        let body_frames: usize = 8192;
+        bytes[20 + 22..20 + 24].copy_from_slice(&((body_frames / 2) as u16).to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&0u16.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(7u8, body_frames - 32));
+
+        let mut player = make_player(&bytes);
+        // Run the whole of row 0 (6 ticks). The cursor streams forward from
+        // 0 and lands somewhere past 256 (a C-2 advances faster than the seek
+        // target across a full row), so the 901 seek is an unambiguous jump
+        // *backward* to 256 — distinguishable from linear continuation.
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        let before = player.channels[0].sample_pos;
+        assert!(
+            before > 256.0,
+            "precondition: after a full row the cursor is past the 256 seek \
+             target (so the retrigger is a visible backward jump), got {before}"
+        );
+        // Tick 0 of row 1: the 901 retriggers the playing sample to 256.
+        // One mixer tick then advances it a little, so assert it landed in a
+        // tight window starting at 256 — far below where linear streaming
+        // (`before` + another row of advance) would have put it.
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].mem_sample_offset, 0x01,
+            "no-note 9xx must still latch its offset memory"
+        );
+        assert!(
+            player.channels[0].active,
+            "no-note 901 must keep the channel playing (in-range offset)"
+        );
+        let after = player.channels[0].sample_pos;
+        assert!(
+            (256.0..before).contains(&after),
+            "no-note 901 must retrigger to offset 256 (a backward jump from \
+             {before}), got {after}"
+        );
+    }
+
+    #[test]
+    fn sample_offset_without_note_out_of_range_silences() {
+        // The out-of-range "NO NOTE" quirk also applies to the no-note
+        // retrigger path: a 9xx whose offset lands at/past the body end
+        // silences the channel rather than wrapping the cursor.
+        //   Row 0: C-2 note + sample 1.
+        //   Row 1: 9FF (offset 0xFF*0x100 = 65280 frames) with no note —
+        //   far past a 512-frame body, so the voice goes silent.
+        let mut bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0x9,
+                    effect_param: 0xFF,
+                },
+            ),
+        ]);
+        let body_frames: usize = 8192;
+        bytes[20 + 22..20 + 24].copy_from_slice(&((body_frames / 2) as u16).to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&0u16.to_be_bytes());
+        bytes.extend(std::iter::repeat_n(7u8, body_frames - 32));
+
+        let mut player = make_player(&bytes);
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert!(
+            player.channels[0].active,
+            "precondition: the sample is playing after row 0"
+        );
+        step_one_tick(&mut player);
+        assert!(
+            !player.channels[0].active,
+            "out-of-range no-note 9FF must silence the channel (PT no-note quirk)"
+        );
+        assert_eq!(
+            player.channels[0].mem_sample_offset, 0xFF,
+            "out-of-range no-note 9xx still latches its offset memory"
         );
     }
 

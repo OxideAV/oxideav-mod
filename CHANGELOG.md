@@ -65,6 +65,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MOD `9xx` sample-offset now retriggers a playing sample on a row with no
+  note** (`src/player.rs`). `Protracker-effects-MODFIL12.txt`
+  9:Set-sample-offset (lines 1226-1228) + `aes-modformat.html` (220-223):
+  "If no sample is specified with the effect, but one is currently playing
+  on the channel, then the sample currently playing is retriggered to offset
+  specified." The `9xx` handling lived entirely inside the note-trigger
+  branch, so a bare `9xx` (offset, no note) was a no-op — the playing sample
+  kept streaming linearly instead of seeking. The no-note path now seeks the
+  live cursor to `param * 0x100`, latches the `9xx` memory (so a later `900`
+  reuses the offset), re-arms the per-trigger anti-click ramp for the
+  discontinuous jump, and honours the same out-of-range "NO NOTE" quirk an
+  offset-with-note does (an offset at/past the body end silences the channel
+  rather than wrapping a looped cursor). Two new `player::tests` pin both the
+  in-range backward seek and the out-of-range silence.
 - **MOD tone-portamento target now resolves through the channel finetune
   table** (`src/player.rs`). A `3xy` / `5xy` tone-porta to a note on a
   finetuned instrument was gliding toward the note's *finetune-0* period
