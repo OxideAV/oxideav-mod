@@ -54,6 +54,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MOD tone-portamento target now resolves through the channel finetune
+  table** (`src/player.rs`). A `3xy` / `5xy` tone-porta to a note on a
+  finetuned instrument was gliding toward the note's *finetune-0* period
+  (the value the pattern cell literally carries) instead of that note's
+  period in the channel's current finetune row. Per
+  `Protracker-effects-MODFIL12.txt` §3.3 (lines 757-762) the period that
+  decides "what frequency to play a sample at" is looked up "in a table
+  based on the finetune setting", so a finetuned voice must slide toward
+  its own finetuned period. Example: an A-2 cell (period 254) on a
+  finetune-+1 instrument must reach `PERIOD_TABLE[1][21] = 253`, one
+  period unit sharper than the cell's printed 254. The normal-note
+  trigger path already re-derived the period through the finetune row;
+  the tone-porta target path did not, so finetuned slides clamped one
+  unit short of pitch (audible as a slightly off-key landing note on
+  finetuned lead voices). A new `player::tests` regression
+  (`tone_porta_target_uses_channel_finetune_table`) pins the resolved
+  target to the finetuned period, with a table sanity assertion so the
+  fixture can't silently drift. Out-of-table cell periods (hostile rips)
+  fall back to the raw value, so the change is inert for non-table
+  periods.
 - **Shared mixer forward-loop never reads the discarded one-shot tail**
   (`src/mixer.rs`). The generic `MixerVoice` (used by the STM and XM
   players) wrapped both the playback cursor and the linear-interpolation

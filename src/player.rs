@@ -1223,7 +1223,20 @@ impl PlayerState {
 
             // Tone portamento: record target, but DO NOT retrigger.
             if note.has_period() && is_tone_porta {
-                ch.tone_porta_target = note.period;
+                // The cell stores the finetune-0 period; the actual target
+                // is the SAME note looked up in the channel's current
+                // finetune row, because "what frequency to play a sample at"
+                // resolves the period through the finetune table
+                // (`Protracker-effects-MODFIL12.txt` §3.3, lines 757-762: the
+                // period is looked up "in a table based on the finetune
+                // setting"). A finetuned instrument therefore glides toward
+                // its own finetuned period, not the standard-finetune period
+                // printed in the cell. When the cell period isn't a table
+                // note (out-of-range rip) fall back to the raw value.
+                ch.tone_porta_target = match note_index_for_period(note.period) {
+                    Some(note_idx) => PERIOD_TABLE[finetune_row(ch.finetune)][note_idx],
+                    None => note.period,
+                };
                 if effect == 0x3 && param != 0 {
                     ch.tone_porta_speed = param;
                 }
@@ -2986,6 +2999,87 @@ pub mod tests {
         assert_eq!(
             player.channels[0].period, 254,
             "tone porta must clamp at target"
+        );
+    }
+
+    #[test]
+    fn tone_porta_target_uses_channel_finetune_table() {
+        // A tone-porta to A-2 on a finetune-+1 instrument must glide toward
+        // that note's *finetuned* period, not the finetune-0 period the cell
+        // prints. PERIOD_TABLE[0][21] (A-2, FT 0) = 254;
+        // PERIOD_TABLE[1][21] (A-2, FT +1) = 253. The cell carries 254 (the
+        // standard table value), so before resolving through the channel's
+        // finetune the slide would clamp one period unit sharp.
+        //   Row 0: C-2 (period 428), sample 1 (its header finetune = +1).
+        //   Rows 1-3: A-2 cell (period 254) with 3xy tone-porta at speed $10.
+        let mut bytes = synth_mod_with_pattern(&[
+            (
+                0,
+                0,
+                Note {
+                    period: 428,
+                    sample: 1,
+                    effect: 0,
+                    effect_param: 0,
+                },
+            ),
+            (
+                1,
+                0,
+                Note {
+                    period: 254,
+                    sample: 0,
+                    effect: 0x3,
+                    effect_param: 0x10,
+                },
+            ),
+            (
+                2,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0x3,
+                    effect_param: 0x00,
+                },
+            ),
+            (
+                3,
+                0,
+                Note {
+                    period: 0,
+                    sample: 0,
+                    effect: 0x3,
+                    effect_param: 0x00,
+                },
+            ),
+        ]);
+        // Sample 1's header finetune nibble sits at absolute offset 44
+        // (header start 20 + field offset 24). Set it to +1.
+        bytes[44] = 0x01;
+
+        let mut player = make_player(&bytes);
+        // Row 0 triggers sample 1, which loads its +1 finetune onto the
+        // channel; step one row (6 ticks) so the finetune is live before the
+        // tone-porta rows arrive.
+        for _ in 0..6 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.channels[0].finetune, 1,
+            "sample 1 finetune must load as +1 after its trigger row"
+        );
+        for _ in 0..18 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            PERIOD_TABLE[1][21], 253,
+            "table sanity: A-2 at FT +1 is 253"
+        );
+        assert_eq!(
+            player.channels[0].period, 253,
+            "tone porta must resolve the target through the channel finetune row \
+             (253 = A-2 at FT +1), not stop at the cell's FT-0 period 254"
         );
     }
 
