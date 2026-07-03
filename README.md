@@ -1,5 +1,7 @@
 # oxideav-mod
 
+[![CI](https://github.com/OxideAV/oxideav-mod/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mod/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mod.svg)](https://crates.io/crates/oxideav-mod) [![docs.rs](https://docs.rs/oxideav-mod/badge.svg)](https://docs.rs/oxideav-mod) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Amiga ProTracker / SoundTracker module (MOD) codec for oxideav.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework — a pure-Rust media transcoding and streaming stack. Codec, container, and filter crates are implemented from the spec (no C codec libraries linked or wrapped, no `*-sys` crates). Optional hardware-engine crates (`oxideav-videotoolbox` / `-audiotoolbox` / `-vaapi` / `-vdpau` / `-nvidia` / `-vulkan-video`) bridge to OS APIs via runtime `libloading`; pass `--no-hwaccel` (or omit the `hwaccel` feature) to opt out.
