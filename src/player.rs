@@ -5296,6 +5296,58 @@ pub mod tests {
         );
     }
 
+    #[test]
+    fn arpeggio_walks_the_channel_finetune_row_not_finetune_zero() {
+        // Arpeggio's semitone steps are looked up in the channel's CURRENT
+        // finetune row of PERIOD_TABLE, not the finetune-0 row — the same
+        // "period is looked up in a table based on the finetune setting"
+        // rule (`Protracker-effects-MODFIL12.txt` §3.3) that governs plain
+        // notes and tone-porta targets. A C-2 (cell period 428) on a
+        // finetune-+1 sample plays at PERIOD_TABLE[1][12] = 425 (not 428),
+        // and its +3-semitone arpeggio step lands on PERIOD_TABLE[1][15]
+        // = 357 (not the finetune-0 360). This is the only arpeggio path
+        // exercised with a non-zero finetune, so it pins the table-row
+        // selection that every finetune-0 arpeggio test can't see.
+        let mut bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0,
+                effect_param: 0x30, // arpeggio x=3, y=0
+            },
+        )]);
+        // Sample 1 header finetune nibble (byte 44) → +1.
+        bytes[20 + 24] = 0x01;
+        let mut player = make_player(&bytes);
+
+        // Tick 0: the note plays at the finetune-+1 period, not 428.
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].period, PERIOD_TABLE[1][12],
+            "finetune-+1 C-2 must play at PERIOD_TABLE[1][12] = {}, not the \
+             finetune-0 value 428",
+            PERIOD_TABLE[1][12]
+        );
+        // Tick 1: arpeggio +3 semitones, resolved in the +1 finetune row.
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].period,
+            PERIOD_TABLE[1][12 + 3],
+            "arpeggio +3 semis on a finetune-+1 voice must land on \
+             PERIOD_TABLE[1][15] = {}, not the finetune-0 row value {}",
+            PERIOD_TABLE[1][12 + 3],
+            PERIOD_TABLE[0][12 + 3]
+        );
+        // Tick 2 (y=0): back to the base finetune-+1 period.
+        step_one_tick(&mut player);
+        assert_eq!(
+            player.channels[0].period, PERIOD_TABLE[1][12],
+            "arpeggio y=0 step returns to the finetune-+1 base period"
+        );
+    }
+
     /// Default per-channel pan in a freshly-built `PlayerState` follows
     /// the Amiga LRRL hard-pan convention (channels 0 & 3 → 0/LEFT,
     /// 1 & 2 → 255/RIGHT, repeating every 4) so that a MOD with no
