@@ -98,7 +98,7 @@ Spec-level effect coverage per
 | E9x | Retrigger note every *x* ticks | implemented |
 | EAx / EBx | Fine volume slide up / down | implemented |
 | ECx | Note cut | implemented (`ECx` cuts at tick x; `EC0` cuts on tick 0 so "nothing will be heard") |
-| EDx | Note delay | implemented |
+| EDx | Note delay | implemented (`ED0` = "play at tick 0" fires immediately like an ordinary note-on; only `ED1`+ defer the trigger) |
 | EEx | Pattern delay | implemented |
 | EFx | Invert loop ("funkrepeat") | implemented (per-tick counter from the 16-entry speed table; XORs one loop byte at a time, position wraps mod loop length, resets on new sample) |
 | 8xx | Set FINE Panning (FT extension) | implemented (raw 0..=255: $00 LEFT, $FF RIGHT; per-channel) |
@@ -601,7 +601,12 @@ Each target has a minimal valid-header seed under
 hill-climb starts from a parser-accepting input. A previously-found
 `xm::parse_patterns` slice-index panic (a hostile `header_length`
 pushing the packed-data slice's start past EOF) is fixed and pinned by
-a regression test in `src/xm.rs`.
+a regression test in `src/xm.rs`. A previously-found `header::parse_header`
+integer-overflow panic (an order table whose maximum entry is `0xFF`
+overflowing the `1 + max` "pattern count" derivation in the `u8` domain)
+is fixed by saturating the `+1` and pinned by a full-MOD-pipeline
+hostile-input regression in `src/player.rs`
+(`hostile_inputs_never_panic_the_decode_pipeline`).
 
 ## License
 
