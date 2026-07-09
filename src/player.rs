@@ -1219,7 +1219,15 @@ impl PlayerState {
             }
 
             let is_tone_porta = matches!(effect, 0x3 | 0x5);
-            let is_note_delay = effect == 0xE && x == 0xD;
+            // A note-delay only *defers* the trigger when the delay tick is
+            // non-zero. `ED0` is "play note at tick 0 out of N"
+            // (`mod-spec-eblong.txt` Cmd ED — "Play note at tick 3 out of 6";
+            // tick 0 is the row's first tick), i.e. an ordinary immediate
+            // note-on. The deferred fire path only runs on ticks > 0 (tick 0
+            // is `enter_row`), so an `ED0` routed through the delay branch
+            // would never fire and the note would be silently dropped — the
+            // same tick-0 boundary that `EC0` is already special-cased for.
+            let is_note_delay = effect == 0xE && x == 0xD && y != 0;
 
             // Tone portamento: record target, but DO NOT retrigger.
             if note.has_period() && is_tone_porta {
@@ -4070,6 +4078,41 @@ pub mod tests {
             player.channels[0]
         );
         assert_eq!(player.channels[0].period, 428);
+    }
+
+    #[test]
+    fn note_delay_ed0_triggers_immediately_on_tick0() {
+        // `ED0` = "play note at tick 0" (`mod-spec-eblong.txt` Cmd ED),
+        // i.e. a plain immediate note-on, NOT a deferred trigger. Routing
+        // it through the tick-N delay path (which never runs on tick 0)
+        // would drop the note entirely — the same tick-0 boundary EC0 is
+        // special-cased against. Assert the note is live from tick 0.
+        let bytes = synth_mod_with_pattern(&[(
+            0,
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0xE,
+                effect_param: 0xD0,
+            },
+        )]);
+        let mut player = make_player(&bytes);
+        step_one_tick(&mut player);
+        assert!(
+            player.channels[0].active,
+            "ED0 must trigger immediately on tick 0; state={:?}",
+            player.channels[0]
+        );
+        assert_eq!(player.channels[0].period, 428);
+        assert_eq!(player.channels[0].sample_index, 1);
+        // And it must actually render audio (not a silent, inactive voice).
+        let mut buf = vec![0i16; 2000 * 2];
+        player.render(&mut buf);
+        assert!(
+            buf.iter().any(|&s| s != 0),
+            "ED0 note must produce audible PCM"
+        );
     }
 
     #[test]
