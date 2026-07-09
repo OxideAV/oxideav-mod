@@ -2568,6 +2568,74 @@ pub mod tests {
         PlayerState::new(&header, samples, patterns, 44_100)
     }
 
+    /// Drive the full MOD decode pipeline (header → patterns → samples →
+    /// `PlayerState` → a short `render`) on adversarial byte layouts and
+    /// assert the call always returns rather than panicking / aborting.
+    /// This is the same pipeline the `mod_decode` fuzz target exercises,
+    /// pinned as a fast in-tree regression so a bounds regression fails CI
+    /// (the fuzz harness is not run in CI). Truncated pattern data,
+    /// over-declared sample lengths, and a saturated order table (every
+    /// entry 0xFF → 256 patterns) must all be clamped, never indexed
+    /// out of bounds.
+    fn drive_pipeline_no_panic(bytes: &[u8]) {
+        if let Ok(header) = parse_header(bytes) {
+            let samples = extract_samples(&header, bytes);
+            let patterns = parse_patterns(&header, bytes);
+            let mut player = PlayerState::new(&header, samples, patterns, 44_100);
+            let mut buf = vec![0i16; 4096 * 2];
+            let _ = player.render(&mut buf);
+        }
+    }
+
+    #[test]
+    fn hostile_inputs_never_panic_the_decode_pipeline() {
+        use crate::header::HEADER_FIXED_SIZE;
+
+        // 1. A bare M.K. header, no pattern/sample data appended at all —
+        //    every pattern/sample read must clamp to zero-fill.
+        let mut bare = vec![0u8; HEADER_FIXED_SIZE];
+        bare[0..4].copy_from_slice(b"test");
+        bare[950] = 1; // song length
+        bare[1080..1084].copy_from_slice(b"M.K.");
+        drive_pipeline_no_panic(&bare);
+
+        // 2. Saturated order table: every entry 0xFF → n_patterns = 256,
+        //    song_length 128, but no pattern bytes follow. Also declare
+        //    every sample's length as the maximum (0xFFFF words) so the
+        //    sample extractor faces a huge over-declaration on a truncated
+        //    file.
+        let mut saturated = vec![0u8; HEADER_FIXED_SIZE];
+        saturated[0..4].copy_from_slice(b"test");
+        for i in 0..31 {
+            let off = 20 + i * 30;
+            saturated[off + 22..off + 24].copy_from_slice(&0xFFFFu16.to_be_bytes());
+            saturated[off + 28..off + 30].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        }
+        saturated[950] = 128;
+        for b in saturated[952..952 + 128].iter_mut() {
+            *b = 0xFF;
+        }
+        saturated[1080..1084].copy_from_slice(b"M.K.");
+        drive_pipeline_no_panic(&saturated);
+
+        // 3. A 32-channel (32CH) header with a single order entry but only
+        //    a few bytes of pattern data — the 32-channel row stride is
+        //    large, so most cell reads fall off the end and must zero-fill.
+        let mut wide = vec![0u8; HEADER_FIXED_SIZE + 16];
+        wide[0..4].copy_from_slice(b"test");
+        wide[950] = 1;
+        wide[1080..1084].copy_from_slice(b"32CH");
+        drive_pipeline_no_panic(&wide);
+
+        // 4. Shorter-than-header blob — parse_header must reject with a
+        //    typed error (NeedMore), never index out of bounds.
+        drive_pipeline_no_panic(&[0u8; 100]);
+        assert!(matches!(
+            parse_header(&[0u8; 100]),
+            Err(oxideav_core::Error::NeedMore)
+        ));
+    }
+
     /// Build a synthetic Startrekker `FLT8` module: one logical
     /// 8-channel pattern stored as TWO consecutive 4-channel 0x400
     /// patterns (per `Startrekker-mod.txt` — "pattern 0 and 1 is one

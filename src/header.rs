@@ -261,7 +261,19 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
         }
     }
 
-    let n_patterns = 1 + *order.iter().take(song_length as usize).max().unwrap_or(&0);
+    // Highest referenced pattern index + 1. Order entries are raw `u8`, so
+    // a hostile / corrupt table whose max entry is 0xFF (255) would overflow
+    // `1 + 255` in the `u8` domain (panic in debug, wrap in release). Saturate
+    // instead: valid modules never reference pattern index 254+ in practice
+    // (M.K. tops out well below), and the degenerate 0xFF case clamps to 255
+    // patterns whose trailing cell reads zero-fill anyway rather than crashing.
+    let n_patterns = order
+        .iter()
+        .take(song_length as usize)
+        .max()
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
 
     Ok(ModHeader {
         title,
@@ -346,7 +358,19 @@ pub fn parse_ust_header(bytes: &[u8]) -> Result<ModHeader> {
     let signature = *b"M.K.";
     let channels = 4;
 
-    let n_patterns = 1 + *order.iter().take(song_length as usize).max().unwrap_or(&0);
+    // Highest referenced pattern index + 1. Order entries are raw `u8`, so
+    // a hostile / corrupt table whose max entry is 0xFF (255) would overflow
+    // `1 + 255` in the `u8` domain (panic in debug, wrap in release). Saturate
+    // instead: valid modules never reference pattern index 254+ in practice
+    // (M.K. tops out well below), and the degenerate 0xFF case clamps to 255
+    // patterns whose trailing cell reads zero-fill anyway rather than crashing.
+    let n_patterns = order
+        .iter()
+        .take(song_length as usize)
+        .max()
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
 
     Ok(ModHeader {
         title,
