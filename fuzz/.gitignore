@@ -2,3 +2,6 @@
 artifacts
 coverage
 fuzz-*.log
+corpus/**
+!corpus/*/
+!corpus/*/minimal.*
