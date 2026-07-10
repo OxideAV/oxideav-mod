@@ -65,6 +65,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MOD `Bxx` + `Dxy` on the same row now combine per the ProTracker
+  two-variable model** (`src/player.rs`). ProTracker keeps two independent
+  jump-destination variables — a target *order* and a target *row* —
+  processed channel-left-to-right on tick 0
+  (`docs/audio/trackers/mod/mod-position-jump-pattern-break.md`). A `Bxx`
+  left of a `Dxy` therefore lands on **row `x*10+y` of the pattern at order
+  `xx`**; previously the `Dxy` handler overwrote the whole pending jump, so
+  the `Bxx` order was discarded and playback broke to *next-order* row
+  `x*10+y` — the "restart the song at position N, row M" idiom jumped to
+  the wrong pattern. The asymmetric quirk is preserved and now pinned by
+  tests: a `Bxx` RIGHT of a `Dxy` re-sets the order and clears the pending
+  break row back to 0 (the `Dxy` row is lost), because a bare `Bxx` "also
+  performs a pattern-break" (`mod-spec-eblong.txt` Cmd B). `E6x` rewinds
+  keep their established last-channel-wins interaction with `Dxy` (a later
+  `Dxy` still replaces a pattern-loop jump outright). Six new
+  `player::tests` cover: B-left-of-D combine, D-left-of-B row loss,
+  D/B/D triple (last row right of the B wins), lone-`Dxy` decimal decode
+  (`D32` → row 32, not 50), out-of-range-`Bxx` + `Dxy` composition (order
+  wraps to 0, row survives), and the backward `B00`+`D05` song-loop idiom.
+- **MOD `Dxy` break row past the 64-row pattern starts at row 0, not
+  row 63** (`src/player.rs`). A pattern-break argument decoding to a row
+  `> 63` (`D64`..`D99`) is out of range for a 64-row pattern; ProTracker
+  starts the destination pattern at row 0 in practice
+  (`mod-position-jump-pattern-break.md`, argument edge cases). The old
+  `.min(63)` clamp landed on the *last* row of the destination — one
+  spurious row followed by an immediate pattern advance. Pinned at both
+  boundary values (`0x64` → 64 and `0x99` → 99).
 - **MOD sample-header finetune now retunes every note, not only E5x notes**
   (`src/player.rs`). A sample whose header finetune nibble (byte 44, signed
   -8..+7) is non-zero must retune *every* note played with that instrument —

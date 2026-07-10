@@ -85,9 +85,9 @@ Spec-level effect coverage per
 | 7xy | Tremolo | implemented |
 | 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk) |
 | Axy | Volume slide | implemented |
-| Bxx | Position jump | implemented |
+| Bxx | Position jump | implemented (out-of-range target wraps to order 0; also clears a pending break row — see the same-row `Bxx`/`Dxy` bullet below) |
 | Cxx | Set volume | implemented |
-| Dxy | Pattern break (decimal `x*10 + y`) | implemented |
+| Dxy | Pattern break (decimal `x*10 + y`) | implemented (row > 63 starts the destination at row 0; merges its row into a same-row earlier-channel `Bxx`) |
 | Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM; $00 = halt) | implemented (F00 raises the song-over `ended` flag) |
 | E0x | Filter on/off | implemented (1-pole IIR lowpass at 11.5 kHz; LED defaults ON) |
 | E1x / E2x | Fine portamento up / down (tick-0 one-shot) | implemented |
@@ -373,6 +373,21 @@ a unit test in `src/player.rs`):
   `docs/audio/trackers/mod/Startrekker-mod.txt` (format-author
   description: "just take two 4 channel patterns together! So pattern
   0 and 1 is one 8 channel pattern").
+- **`Bxx` + `Dxy` on the same row (two-variable jump model)** —
+  ProTracker keeps two independent jump-destination variables, a target
+  *order* and a target *row in the destination pattern*, and processes
+  channels left to right on tick 0
+  (`docs/audio/trackers/mod/mod-position-jump-pattern-break.md`). `Bxx`
+  writes the order (and clears the row to 0 — a bare `Bxx` "also performs
+  a pattern-break", `mod-spec-eblong.txt` Cmd B); `Dxy` writes the row.
+  So `Bxx` **left** of `Dxy` combines into "row `x*10+y` of the pattern
+  at order `xx`" (the song-restart-at-position-and-row idiom), while
+  `Bxx` **right** of `Dxy` discards the earlier channel's break row and
+  lands on row 0 of order `xx`. A break row decoding past the 64-row
+  pattern (`D64`..`D99`) starts the destination at row 0. Both
+  directions, the D/B/D triple, the out-of-range-`Bxx`-plus-`Dxy`
+  composition and the backward `B00`+`D05` loop idiom are pinned by
+  directed tests.
 - **`E6x` / `Dxy` same-row resolution** — both effects write to the
   same `pending_jump`; per the `Pro-Noise-Soundtracker-rev4.txt:375-377`
   channel-priority rule, the higher-numbered channel wins. The

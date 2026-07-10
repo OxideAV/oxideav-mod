@@ -741,12 +741,33 @@ impl Channel {
 }
 
 /// Pending order/row jump scheduled by Bxx, Dxy, or E6x.
+///
+/// ProTracker keeps TWO independent destination variables — a target
+/// *order* and a target *row within the destination pattern* — and the
+/// jump commands each write one of them
+/// (`docs/audio/trackers/mod/mod-position-jump-pattern-break.md`,
+/// "Combined on the same row"). `Bxx` supplies the order (and clears
+/// the row back to 0 — a bare `Bxx` "also performs a pattern-break",
+/// `mod-spec-eblong.txt` Cmd B); `Dxy` supplies the row. Channels are
+/// processed left to right on tick 0, so on a shared row:
+///
+/// - `Bxx` left of `Dxy` → order `xx`, row `x*10+y` (the D merges its
+///   row into the B's pending jump);
+/// - `Dxy` left of `Bxx` → order `xx`, row **0** (the position-jump
+///   routine clears the pending break row — the D row is lost).
 #[derive(Clone, Copy, Debug)]
 struct Jump {
     /// Next order index (None = next order + 1).
     order: Option<u8>,
     /// Row to start at in the new pattern (default 0).
     row: u8,
+    /// True when `order` was written by a `Bxx` position jump. A
+    /// same-row `Dxy` on a later channel merges its row into a
+    /// `Bxx`-scheduled jump (preserving the explicit target order)
+    /// instead of replacing the whole jump. An E6x pattern-loop rewind
+    /// sets this false: it is a different mechanism and a later-channel
+    /// `Dxy` replaces it outright.
+    from_position_jump: bool,
 }
 
 /// Top-level player state. Owns samples, patterns, order, and the
@@ -1933,10 +1954,17 @@ fn apply_tick0_effect(
                 ch.mem_volslide = param;
             }
         0xB => {
-            // Position jump.
+            // Bxx: position jump to order `xx` (hex), row 0. A bare Bxx
+            // "also performs a pattern-break" (`mod-spec-eblong.txt` Cmd B),
+            // i.e. it resets the destination row to 0 — so a Bxx on a
+            // LATER channel than a same-row Dxy discards the Dxy row
+            // (`mod-position-jump-pattern-break.md`, channel-order quirk).
+            // Overwriting the whole pending jump implements both: order
+            // set, row cleared.
             *pending_jump = Some(Jump {
                 order: Some(param),
                 row: 0,
+                from_position_jump: true,
             });
         }
         0xC => {
@@ -1944,12 +1972,41 @@ fn apply_tick0_effect(
             ch.volume = param.min(64);
         }
         0xD => {
-            // Pattern break: row x*10 + y in the NEXT order.
-            let next_row = (x * 10 + y).min(63);
-            *pending_jump = Some(Jump {
-                order: None,
-                row: next_row,
-            });
+            // Dxy: pattern break. The argument is DECIMAL: destination
+            // row = x*10 + y, not x*16 + y
+            // (`Protracker-effects-MODFIL12.txt` D:Pattern-Break). A row
+            // beyond the 64-row pattern (e.g. D64..D99) is out of range;
+            // ProTracker starts at row 0 of the destination in practice
+            // (`mod-position-jump-pattern-break.md`, argument edge cases).
+            let break_row = x * 10 + y;
+            let break_row = if break_row as usize >= PATTERN_ROWS {
+                0
+            } else {
+                break_row
+            };
+            match pending_jump {
+                // A same-row Bxx on an EARLIER channel already scheduled
+                // a position jump: Dxy supplies only the row, preserving
+                // the explicit target order — "jump to row x*10+y of the
+                // pattern at order xx"
+                // (`mod-position-jump-pattern-break.md`, combined rule).
+                Some(jump) if jump.from_position_jump => {
+                    jump.row = break_row;
+                }
+                // Otherwise (no pending jump, an earlier Dxy, or an E6x
+                // rewind): schedule a break to the NEXT order at the
+                // decoded row. Replacing an earlier Dxy keeps the
+                // last-channel-wins row; replacing an E6x rewind keeps
+                // the established later-channel-wins behaviour between
+                // the two mechanisms.
+                _ => {
+                    *pending_jump = Some(Jump {
+                        order: None,
+                        row: break_row,
+                        from_position_jump: false,
+                    });
+                }
+            }
         }
         0xE => apply_extended_tick0(
             ch_idx,
@@ -2037,6 +2094,7 @@ fn apply_extended_tick0(
                 *pending_jump = Some(Jump {
                     order: Some(order_index),
                     row: loop_rows[ch_idx],
+                    from_position_jump: false,
                 });
             } else {
                 loop_counts[ch_idx] -= 1;
@@ -2044,6 +2102,7 @@ fn apply_extended_tick0(
                     *pending_jump = Some(Jump {
                         order: Some(order_index),
                         row: loop_rows[ch_idx],
+                        from_position_jump: false,
                     });
                 }
             }
@@ -2553,6 +2612,52 @@ pub mod tests {
             pat[off + 3] = note.effect_param;
         }
         out.extend(pat);
+
+        for i in 0..32 {
+            let v: i8 = if i < 16 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
+    /// Build a MOD with `n_patterns` orders, each mapped to its own
+    /// pattern (`order[i] = i`, song length = `n_patterns`). `cells` is a
+    /// slice of `(pattern, row, channel, Note)` entries. Sample 1 is the
+    /// same looping 32-byte square wave as `synth_mod_with_pattern`
+    /// (volume 64, finetune 0). Used by the Bxx/Dxy jump tests, which
+    /// need real distinct order destinations.
+    pub fn synth_mod_multi_pattern(
+        n_patterns: usize,
+        cells: &[(usize, usize, usize, Note)],
+    ) -> Vec<u8> {
+        assert!((1..=128).contains(&n_patterns));
+        let mut out = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        out[0..4].copy_from_slice(b"test");
+        out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        out[20 + 24] = 0;
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
+        out[950] = n_patterns as u8;
+        out[951] = 0x7F;
+        for i in 0..n_patterns {
+            out[952 + i] = i as u8;
+        }
+        out[1080..1084].copy_from_slice(b"M.K.");
+
+        let mut pats = vec![0u8; n_patterns * 64 * 4 * 4];
+        for &(pattern, row, channel, ref note) in cells {
+            let off = pattern * 64 * 4 * 4 + row * 4 * 4 + channel * 4;
+            let p_hi = ((note.period >> 8) & 0x0F) as u8;
+            let p_lo = (note.period & 0xFF) as u8;
+            let sample_hi = (note.sample & 0xF0) >> 4;
+            let sample_lo = note.sample & 0x0F;
+            pats[off] = (sample_hi << 4) | p_hi;
+            pats[off + 1] = p_lo;
+            pats[off + 2] = (sample_lo << 4) | note.effect;
+            pats[off + 3] = note.effect_param;
+        }
+        out.extend(pats);
 
         for i in 0..32 {
             let v: i8 = if i < 16 { 100 } else { -100 };
@@ -5077,6 +5182,178 @@ pub mod tests {
             "an out-of-range Bxx must wrap back to order 0, not jump to the \
              literal (out-of-range) target"
         );
+    }
+
+    /// Effect-only cell (no note, no sample) — shorthand for jump tests.
+    fn fx(effect: u8, param: u8) -> Note {
+        Note {
+            period: 0,
+            sample: 0,
+            effect,
+            effect_param: param,
+        }
+    }
+
+    /// Walk `rows` full rows plus one tick, so the last row's pending
+    /// jump has been consumed by `next_row` and the destination row has
+    /// been entered.
+    fn step_rows_and_enter_next(player: &mut PlayerState, rows: usize) {
+        let ticks = player.speed as usize * rows + 1;
+        for _ in 0..ticks {
+            step_one_tick(player);
+        }
+    }
+
+    #[test]
+    fn bxx_left_of_dxy_jumps_to_row_of_target_order() {
+        // `mod-position-jump-pattern-break.md`, worked example 1:
+        // B02 in ch0, D10 in ch3 (B left of D). B sets order = 02, row = 0;
+        // D then overwrites the row with 1*10+0 = 10. ProTracker keeps two
+        // independent destination variables (target order / target row), so
+        // the combined jump is "row 10 of the pattern at order 02" — NOT
+        // "row 10 of the next order" (which is what a whole-jump overwrite
+        // by Dxy would produce).
+        let bytes =
+            synth_mod_multi_pattern(3, &[(0, 0, 0, fx(0xB, 0x02)), (0, 0, 3, fx(0xD, 0x10))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended, "an in-range B+D jump must not end the song");
+        assert_eq!(
+            player.order_index, 2,
+            "Bxx must supply the destination order even when a later-channel \
+             Dxy is present"
+        );
+        assert_eq!(
+            player.row, 10,
+            "Dxy right of Bxx must supply the destination row (decimal 10)"
+        );
+    }
+
+    #[test]
+    fn dxy_left_of_bxx_loses_the_break_row() {
+        // `mod-position-jump-pattern-break.md`, worked example 2 (the
+        // channel-order quirk): D10 in ch0, B02 in ch3 (D left of B). D sets
+        // the pending row; then B re-sets order 02 and CLEARS the row back
+        // to 0 — the position-jump routine discards a pattern-break row set
+        // by an earlier channel ("A Bxx command should reset the effect of a
+        // Dxx command that is left of the Bxx command").
+        let bytes =
+            synth_mod_multi_pattern(3, &[(0, 0, 0, fx(0xD, 0x10)), (0, 0, 3, fx(0xB, 0x02))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(player.order_index, 2, "Bxx order applies");
+        assert_eq!(
+            player.row, 0,
+            "a Bxx RIGHT of a Dxy must clear the break row back to 0 — the \
+             Dxy row is lost"
+        );
+    }
+
+    #[test]
+    fn dxy_bxx_dxy_last_row_wins_with_bxx_order() {
+        // Three commands across the row: D25 (ch0), B02 (ch1), D13 (ch3).
+        // Left-to-right: D25 sets row 25 → B02 sets order 02 and clears the
+        // row → D13 re-sets the row to 13. The two-variable model composes:
+        // final destination is order 02, row 13.
+        let bytes = synth_mod_multi_pattern(
+            3,
+            &[
+                (0, 0, 0, fx(0xD, 0x25)),
+                (0, 0, 1, fx(0xB, 0x02)),
+                (0, 0, 3, fx(0xD, 0x13)),
+            ],
+        );
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(player.order_index, 2);
+        assert_eq!(
+            player.row, 13,
+            "the last Dxy right of the Bxx supplies the row (decimal 13)"
+        );
+    }
+
+    #[test]
+    fn dxy_alone_breaks_to_next_order_with_decimal_row() {
+        // `mod-position-jump-pattern-break.md`, worked example 4 + the
+        // decimal-argument edge case: a lone D32 jumps to the NEXT order and
+        // the packed byte decodes as (x*10 + y) = 32, NOT hex 0x32 = 50
+        // (`Protracker-effects-MODFIL12.txt` D:Pattern-Break).
+        let bytes = synth_mod_multi_pattern(2, &[(0, 0, 0, fx(0xD, 0x32))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(player.order_index, 1, "Dxy alone targets the next order");
+        assert_eq!(
+            player.row, 32,
+            "Dxy argument is decimal: 0x32 decodes to row 32, not row 50"
+        );
+    }
+
+    #[test]
+    fn dxy_row_out_of_range_starts_destination_at_row_zero() {
+        // `mod-position-jump-pattern-break.md`, argument edge cases: a
+        // decoded break row > 63 is out of range for a 64-row pattern and
+        // ProTracker starts the destination pattern at row 0 in practice.
+        // D64 (0x64 → 6*10+4 = 64) is the smallest out-of-range value.
+        let bytes = synth_mod_multi_pattern(2, &[(0, 0, 0, fx(0xD, 0x64))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(player.order_index, 1);
+        assert_eq!(
+            player.row, 0,
+            "an out-of-range break row (64) must start the destination at \
+             row 0, not clamp to row 63"
+        );
+
+        // Same for the largest encodable value, D99 → row 99.
+        let bytes = synth_mod_multi_pattern(2, &[(0, 0, 0, fx(0xD, 0x99))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert_eq!((player.order_index, player.row), (1, 0));
+    }
+
+    #[test]
+    fn out_of_range_bxx_with_dxy_row_wraps_order_and_keeps_row() {
+        // Composition of two pinned rules: B05 in a 3-order song is past the
+        // end of the order list, so the order wraps to 0
+        // (`Protracker-effects-MODFIL12.txt` B:Position-Jump author note);
+        // the later-channel D10 still supplies the row. Destination:
+        // order 0, row 10.
+        let bytes =
+            synth_mod_multi_pattern(3, &[(0, 0, 0, fx(0xB, 0x05)), (0, 0, 3, fx(0xD, 0x10))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended, "an out-of-range Bxx wraps, never ends");
+        assert_eq!(player.order_index, 0, "order wraps to 0");
+        assert_eq!(player.row, 10, "the Dxy row survives the wrap");
+    }
+
+    #[test]
+    fn backward_bxx_dxy_reenters_earlier_order_at_row() {
+        // `mod-position-jump-pattern-break.md`, "Backward Bxx + Dxy =
+        // intentional loops": Bxx may name an EARLIER order, and B+D is the
+        // standard idiom for re-entering a pattern at a specific row. The
+        // jump is unconditional. Route: pattern 0 row 0 carries D00 (skip to
+        // order 1 row 0); pattern 1 row 0 carries B00 + D05 → back to
+        // order 0, row 5.
+        let bytes = synth_mod_multi_pattern(
+            2,
+            &[
+                (0, 0, 0, fx(0xD, 0x00)),
+                (1, 0, 0, fx(0xB, 0x00)),
+                (1, 0, 1, fx(0xD, 0x05)),
+            ],
+        );
+        let mut player = make_player(&bytes);
+        // Row 0 of order 0, then row 0 of order 1, then enter the jump
+        // destination.
+        step_rows_and_enter_next(&mut player, 2);
+        assert!(!player.ended, "a backward B+D loop must not end the song");
+        assert_eq!(player.order_index, 0, "Bxx re-enters the earlier order");
+        assert_eq!(player.row, 5, "Dxy row applies to the backward target");
     }
 
     #[test]
