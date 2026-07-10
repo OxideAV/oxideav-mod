@@ -5370,6 +5370,65 @@ pub mod tests {
     }
 
     #[test]
+    fn b00_d00_clean_restart_from_either_channel_order() {
+        // `mod-position-jump-pattern-break.md`, worked example 5: B00 + D00
+        // is a clean song restart (order 0, row 0) regardless of which
+        // channel carries which command — B left of D merges row 0, D left
+        // of B has its row cleared to the same 0.
+        for cells in [
+            [
+                (1usize, 0usize, 0usize, fx(0xB, 0x00)),
+                (1, 0, 1, fx(0xD, 0x00)),
+            ],
+            [(1, 0, 0, fx(0xD, 0x00)), (1, 0, 1, fx(0xB, 0x00))],
+        ] {
+            // Reach order 1 via a D00 on order 0 row 0, then restart.
+            let mut all = vec![(0, 0, 0, fx(0xD, 0x00))];
+            all.extend_from_slice(&cells);
+            let bytes = synth_mod_multi_pattern(2, &all);
+            let mut player = make_player(&bytes);
+            step_rows_and_enter_next(&mut player, 2);
+            assert!(!player.ended, "a B00+D00 restart must not end the song");
+            assert_eq!(
+                (player.order_index, player.row),
+                (0, 0),
+                "B00+D00 restarts at order 0 row 0 in either channel order"
+            );
+        }
+    }
+
+    #[test]
+    fn backward_bd_loop_is_unconditional_and_keeps_rendering() {
+        // `mod-position-jump-pattern-break.md`, "Backward Bxx + Dxy =
+        // intentional loops": the jump has no loop counter — it fires
+        // unconditionally EVERY time the row is reached. A module whose
+        // pattern loops back on itself therefore never ends: a full
+        // 1-second render request must be satisfied in full with the
+        // song-over flag still down, cycling rows 0..=1 indefinitely.
+        let bytes = synth_mod_multi_pattern(
+            1,
+            &[
+                (0, 0, 0, fx(0x0, 0x00)),
+                (0, 1, 0, fx(0xB, 0x00)),
+                (0, 1, 1, fx(0xD, 0x00)),
+            ],
+        );
+        let mut player = make_player(&bytes);
+        let mut buf = vec![0i16; 44_100 * 2]; // 1 s stereo
+        let produced = player.render(&mut buf);
+        assert_eq!(
+            produced, 44_100,
+            "an unconditional backward B+D loop must keep producing audio"
+        );
+        assert!(!player.ended, "the loop never raises the song-over flag");
+        assert!(
+            player.row <= 1,
+            "playback must still be cycling rows 0..=1, got row {}",
+            player.row
+        );
+    }
+
+    #[test]
     fn same_order_bxx_jump_resets_pattern_loop_state() {
         // `multimedia-cx-protracker.html` §E6x: "The loopback point is reset
         // to -1 for every Bxx or Dxx or pattern transition" — for EVERY Bxx,

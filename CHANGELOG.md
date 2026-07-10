@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Bxx`/`Dxy` doc-example pins: clean restart + unconditional backward
+  loop** (`src/player.rs`). Two more directed tests lock the remaining
+  worked examples of
+  `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`:
+  `B00`+`D00` restarts at order 0 row 0 in either channel order, and a
+  backward B+D self-loop fires unconditionally every time its row is
+  reached — a 1-second render request is satisfied in full with the
+  song-over flag still down while playback cycles the looped rows.
 - **`Axy` both-nibbles-set volume-slide direction is locked to a regression
   test** (`src/player.rs`). When a `Axy` (or `5xy` / `6xy`) volume slide
   has BOTH nibbles non-zero — documented as "illegal" — the ProTracker
