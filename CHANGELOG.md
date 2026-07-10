@@ -92,6 +92,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.min(63)` clamp landed on the *last* row of the destination — one
   spurious row followed by an immediate pattern advance. Pinned at both
   boundary values (`0x64` → 64 and `0x99` → 99).
+- **MOD `E6x` loop state now resets on EVERY `Bxx`/`Dxy` jump, including
+  same-order self-jumps** (`src/player.rs`).
+  `multimedia-cx-protracker.html` §E6x says the loopback point resets "for
+  every Bxx or Dxx or pattern transition"; the old reset fired only when
+  the order index actually changed, so a same-order self-jump (e.g. a
+  `B00` restart, or `B00`+`D03` re-entering the current pattern at a
+  later row) carried a stale `E60` loop-start row and a half-consumed
+  loop counter across the jump — a later `E61` then anchored at a row the
+  jump had skipped over. The reset now also fires when the consumed jump
+  was an explicit `Bxx`/`Dxy` (an `E6x` rewind itself still never resets,
+  preserving the documented "play row 0 twice" loop semantics). Pinned by
+  `same_order_bxx_jump_resets_pattern_loop_state`.
 - **MOD sample-header finetune now retunes every note, not only E5x notes**
   (`src/player.rs`). A sample whose header finetune nibble (byte 44, signed
   -8..+7) is non-zero must retune *every* note played with that instrument —

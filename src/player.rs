@@ -1535,7 +1535,13 @@ impl PlayerState {
         // tick-0 processing runs normally.
         self.in_pattern_delay_repeat = false;
         let prev_order = self.order_index;
+        // True when the consumed jump was an explicit Bxx position jump or
+        // Dxy pattern break (as opposed to an E6x pattern-loop rewind, which
+        // has an explicit order and `from_position_jump == false`). Feeds
+        // the loop-state reset below.
+        let mut explicit_jump = false;
         if let Some(jump) = self.pending_jump.take() {
+            explicit_jump = jump.from_position_jump || jump.order.is_none();
             if let Some(order) = jump.order {
                 // Bxx position jump. An explicit target order at or past the
                 // song length does NOT end the song — ProTracker wraps it back
@@ -1565,19 +1571,26 @@ impl PlayerState {
             }
         }
 
-        // E6x loopback-point reset on a pattern transition.
+        // E6x loopback-point reset on an explicit jump or pattern transition.
         // `multimedia-cx-protracker.html` §E6x: "The loopback point is reset
-        // to -1 for every Bxx or Dxx or pattern transition." Whenever the
-        // order position actually changes — a Bxx/Dxx jump that lands in a
-        // new order, or a natural run-off into the next pattern — the
-        // per-channel pattern-loop start row and counter are cleared so a
-        // dangling E60 from the previous pattern cannot anchor a loop in the
-        // new one (and a half-consumed loop counter does not bleed across the
-        // boundary). An E6x loop that stays inside the same pattern is
-        // untouched: its order index doesn't change between the looped rows,
-        // so the saved start row and counter survive as required for the
-        // documented "play row 0 twice" semantics.
-        if self.order_index != prev_order {
+        // to -1 for every Bxx or Dxx or pattern transition." Two triggers:
+        //
+        // 1. The order position actually changes — a Bxx/Dxy jump that lands
+        //    in a new order, or a natural run-off into the next pattern.
+        // 2. An explicit Bxx/Dxy jump was consumed, EVEN when it lands in
+        //    the same order (e.g. a same-order `B00`, or `B00`+`D03`
+        //    re-entering the current pattern at a later row): the doc's
+        //    "for every Bxx or Dxx" is unconditional, and a stale loop-start
+        //    row / half-consumed loop counter surviving a self-jump would
+        //    anchor the next E6x at a row the jump skipped over.
+        //
+        // The per-channel pattern-loop start rows and counters are cleared so
+        // a dangling E60 cannot anchor a loop across the jump. An E6x loop
+        // rewind itself never triggers the reset (`explicit_jump` is false
+        // for it, and its order index doesn't change), so the saved start
+        // row and counter survive as required for the documented "play row 0
+        // twice" semantics.
+        if self.order_index != prev_order || explicit_jump {
             for r in self.loop_rows.iter_mut() {
                 *r = 0;
             }
@@ -5354,6 +5367,43 @@ pub mod tests {
         assert!(!player.ended, "a backward B+D loop must not end the song");
         assert_eq!(player.order_index, 0, "Bxx re-enters the earlier order");
         assert_eq!(player.row, 5, "Dxy row applies to the backward target");
+    }
+
+    #[test]
+    fn same_order_bxx_jump_resets_pattern_loop_state() {
+        // `multimedia-cx-protracker.html` §E6x: "The loopback point is reset
+        // to -1 for every Bxx or Dxx or pattern transition" — for EVERY Bxx,
+        // not only those that land in a different order. A same-order
+        // self-jump (here `B00`+`D03` re-entering pattern 0 at row 3) must
+        // clear a previously armed E60 loop-start row; a later E61 then
+        // anchors at the pattern default (row 0), not at the stale row the
+        // jump skipped over. An E6x rewind itself must NOT trigger the reset
+        // (covered by the existing pattern-loop tests, which loop within one
+        // order).
+        //
+        // Layout (pattern 0): row 1 arms E60 (loop start = 1); row 2 jumps
+        // to order 0 row 3 via B00+D03; row 3 fires E61. With the reset the
+        // E61 loops back to row 0; with stale state it would loop to row 1.
+        let bytes = synth_mod_multi_pattern(
+            2,
+            &[
+                (0, 1, 0, fx(0xE, 0x60)),
+                (0, 2, 0, fx(0xB, 0x00)),
+                (0, 2, 1, fx(0xD, 0x03)),
+                (0, 3, 0, fx(0xE, 0x61)),
+            ],
+        );
+        let mut player = make_player(&bytes);
+        // Rows 0, 1, 2 play; the jump enters row 3; row 3 plays; then the
+        // E61 loop target is entered — 4 full rows plus one tick.
+        step_rows_and_enter_next(&mut player, 4);
+        assert!(!player.ended);
+        assert_eq!(player.order_index, 0, "everything stays in order 0");
+        assert_eq!(
+            player.row, 0,
+            "the same-order B00+D03 jump must reset the E60 loop-start row, \
+             so E61 loops to row 0 — not to the stale row 1 the jump skipped"
+        );
     }
 
     #[test]

@@ -94,7 +94,7 @@ Spec-level effect coverage per
 | E3x | Glissando control | implemented |
 | E4x / E7x | Vibrato / tremolo waveform (sine / downward-saw / square / retrig bit) | implemented (64-step full cycle; saw is a true monotonic descent +y→-y, square starts from +y, random falls back to sine) |
 | E5x | Set finetune (also re-derives period on same-row note trigger) | implemented |
-| E6x | Pattern loop (per-channel start + count) | implemented (per-channel loop-start row + counter; loop point resets on every `Bxx`/`Dxy`/pattern transition per `multimedia-cx-protracker.html` §E6x so stale loop state cannot bleed across patterns) |
+| E6x | Pattern loop (per-channel start + count) | implemented (per-channel loop-start row + counter; loop point resets on every `Bxx`/`Dxy` — including same-order self-jumps — and on every pattern transition per `multimedia-cx-protracker.html` §E6x, so stale loop state cannot bleed across a jump) |
 | E9x | Retrigger note every *x* ticks | implemented |
 | EAx / EBx | Fine volume slide up / down | implemented |
 | ECx | Note cut | implemented (`ECx` cuts at tick x; `EC0` cuts on tick 0 so "nothing will be heard") |
