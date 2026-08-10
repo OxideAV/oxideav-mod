@@ -16,9 +16,12 @@
 //!      signed-4-bit finetune at sample-header byte 24, the
 //!      `M.K. / M!K! / 4CHN / 6CHN / 8CHN / FLT4 / FLT8 / OCTA /
 //!      CD81 / xxCH` signature dispatch (with `xxCH` only valid for
-//!      10..=32 channels), and the `n_patterns = 1 +
-//!      max(order[0..song_length])` computation that lets a single
-//!      byte ask the parser to walk megabytes of pattern data.
+//!      10..=32 channels), the `n_patterns = min(1 + max(order), 128)`
+//!      computation (whole-table scan) that lets a single byte ask the
+//!      parser to walk megabytes of pattern data, and the SoundTracker
+//!      2.6 / IceTracker dispatch on the `MTN\0` / `IT10` magic at
+//!      offset 1464 (per-track pattern assembly from the 128×4
+//!      track-index table; seeded by `corpus/mod_decode/minimal.st26`).
 //!
 //!   2. `player::parse_patterns` — walks `n_patterns × 64 rows ×
 //!      channels × 4 bytes` of pattern data starting at offset 1084.
