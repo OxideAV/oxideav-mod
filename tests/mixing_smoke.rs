@@ -163,3 +163,52 @@ fn mod_with_no_notes_is_silent() {
         "expected pure silence with no note events, got peak {peak}"
     );
 }
+
+/// Build a minimal SoundTracker 2.6 module
+/// (`docs/audio/trackers/mod/Soundtracker-v2.6-IceTracker-st26.txt`):
+/// one pattern-list position naming stored track 0 on every channel,
+/// track 0 triggering sample 1 at C-2 on row 0, magic `MTN\0` at +1464.
+fn build_st26_mod() -> Vec<u8> {
+    const ST26_TRACK_DATA_OFFSET: usize = 1468;
+    const ST26_MAGIC_OFFSET: usize = 1464;
+    let mut out = vec![0u8; ST26_TRACK_DATA_OFFSET];
+    out[0..4].copy_from_slice(b"st26");
+    out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+    out[20 + 25] = 64; // volume
+    out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes()); // loop len
+    out[950] = 1; // pattern-list size
+    out[951] = 1; // stored tracks
+    out[952..956].copy_from_slice(&[0, 0, 0, 0]);
+    out[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4].copy_from_slice(b"MTN\0");
+    // Track 0: row 0 = sample 1, period 428 (C-2).
+    let mut track = vec![0u8; 64 * 4];
+    track[0] = 0x01; // period high nibble
+    track[1] = 0xAC; // period low byte (0x1AC = 428)
+    track[2] = 1 << 4; // sample 1, effect 0
+    out.extend(track);
+    for i in 0..32 {
+        let v: i8 = if i < 16 { 80 } else { -80 };
+        out.push(v as u8);
+    }
+    out
+}
+
+#[test]
+fn st26_module_decodes_through_public_registry_path() {
+    // End-to-end over the PUBLIC path (packet → registry decoder → S16
+    // frames) for the SoundTracker 2.6 per-track layout: the +1464
+    // magic must dispatch inside the same "mod" codec and the
+    // synthesized pattern must produce audible hard-left output.
+    let pcm = decode_full(build_st26_mod(), 8820);
+    assert!(!pcm.is_empty(), "decoder produced zero samples");
+    let peak = pcm.iter().map(|&s| s.unsigned_abs() as u32).max().unwrap();
+    assert!(peak > 500, "expected audible ST2.6 output, got peak {peak}");
+    let mut left_peak = 0i16;
+    for pair in pcm.chunks_exact(2) {
+        left_peak = left_peak.max(pair[0].abs());
+    }
+    assert!(
+        left_peak > 500,
+        "ST2.6 channel 0 must land hard-left (left_peak={left_peak})"
+    );
+}

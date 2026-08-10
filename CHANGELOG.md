@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confidence as the tag catalogue. Tests cover header
   parsing/normalisation for both magics, tag-precedence, truncation,
   track-to-channel pattern assembly, out-of-range track indices,
-  order-flow over the synthesized list, an end-to-end render, and a
-  hostile saturated-list fixture in the no-panic battery.
+  order-flow over the synthesized list, an end-to-end render, a
+  hostile saturated-list fixture in the no-panic battery, a public
+  registry-path decode smoke (`tests/mixing_smoke.rs`), and a fuzz
+  corpus seed (`fuzz/corpus/mod_decode/minimal.st26`).
 
 ### Fixed
 
