@@ -799,6 +799,22 @@ pub struct PlayerState {
     /// Pending pattern break / position jump (consumed on tick advance).
     pending_jump: Option<Jump>,
 
+    /// Diagnostic counter: number of `Bxx` position jumps whose target
+    /// order was at or past `song_length` and was therefore wrapped back
+    /// to order 0.
+    ///
+    /// The wrap itself is the documented working assumption
+    /// (`docs/audio/trackers/mod/mod-position-jump-pattern-break.md`,
+    /// erratum "Bxx naming an order past the end"): the staged sources
+    /// give three distinct answers (wrap to order 0 / clamp to the last
+    /// order / ignore the effect), and wrap-to-0 is the only one asserted
+    /// by more than one document. The erratum's status section directs
+    /// implementations to "treat any Bxx whose parameter is ≥ the song
+    /// length as a diagnostic — that is exactly the set of modules on
+    /// which players will disagree", so every wrap is counted here for
+    /// callers that want to surface the divergence.
+    pub oob_position_jumps: u32,
+
     /// Per-pattern loop state for E6x. Four channels each track their own
     /// start row + remaining count independently (per spec).
     loop_rows: Vec<u8>,
@@ -924,6 +940,7 @@ impl PlayerState {
             sample_rate,
             ended: false,
             pending_jump: None,
+            oob_position_jumps: 0,
             loop_rows: vec![0; n_ch],
             loop_counts: vec![0; n_ch],
             pattern_delay: 0,
@@ -1540,23 +1557,54 @@ impl PlayerState {
         // has an explicit order and `from_position_jump == false`). Feeds
         // the loop-state reset below.
         let mut explicit_jump = false;
+        // True when the order position wrapped past the end of the order
+        // list back to order 0 (any mechanism). Feeds the E6x loop-state
+        // reset below: a wrap re-enters a pattern even when the index
+        // lands on the same value (single-order songs), and a wrap is
+        // always a pattern transition per the reset rule.
+        let mut wrapped = false;
         if let Some(jump) = self.pending_jump.take() {
             explicit_jump = jump.from_position_jump || jump.order.is_none();
             if let Some(order) = jump.order {
                 // Bxx position jump. An explicit target order at or past the
-                // song length does NOT end the song — ProTracker wraps it back
-                // to order 0 (the song restarts from the top). Cited in
-                // `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt`
-                // B:Position-Jump ("If you do Bxx where xx is order_num or
-                // more, then it simply jumps to order 0. And yes, I have
-                // tested this in ProTracker."). Only the *natural* run-off the
-                // end of the order list (the `else` branch below) raises the
-                // song-over flag.
-                self.order_index = if order >= self.song_length { 0 } else { order };
+                // song length does NOT end the song — it wraps back to order 0
+                // (the song restarts from the top). This is the documented
+                // working assumption of
+                // `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`
+                // (erratum "Bxx naming an order past the end"): the staged
+                // sources disagree (wrap to 0 / clamp to last order / ignore),
+                // and wrap-to-0 is the only answer asserted by more than one
+                // document (`Protracker-effects-MODFIL12.txt` B:Position-Jump
+                // "++" note + `FireLight-MOD-Player-Tutorial.txt` §5.12 "set
+                // it to the first order"). Each wrap increments the
+                // `oob_position_jumps` diagnostic per the erratum's status
+                // section. Only the *pattern-break / natural* run-off the end
+                // of the order list (the branches below) raises the song-over
+                // flag.
+                if order >= self.song_length {
+                    self.order_index = 0;
+                    wrapped = true;
+                    if jump.from_position_jump {
+                        self.oob_position_jumps = self.oob_position_jumps.saturating_add(1);
+                    }
+                } else {
+                    self.order_index = order;
+                }
             } else {
+                // Dxy pattern break past the last order wraps to order 0,
+                // exactly as the `FireLight-MOD-Player-Tutorial.txt` §5.14
+                // pseudocode pins it: "if (ORDER >= SONGLENGTH) ORDER = 0".
+                // The `ended` flag is still raised — it is this crate's
+                // song-over signal and the render loops break on it — but the
+                // position itself conforms, so a caller that clears `ended`
+                // to keep looping resumes at the documented restart point
+                // (order 0) rather than indexing the order-table residue
+                // past the song length.
                 self.order_index = self.order_index.saturating_add(1);
                 if self.order_index >= self.song_length {
+                    self.order_index = 0;
                     self.ended = true;
+                    wrapped = true;
                 }
             }
             self.row = jump.row;
@@ -1564,9 +1612,15 @@ impl PlayerState {
             self.row += 1;
             if self.row as usize >= PATTERN_ROWS {
                 self.row = 0;
+                // Natural run-off the end of the order list: same overflow
+                // handling as the Dxy path above (a bare pattern-break IS
+                // "jump to the next song-position", `mod-spec-eblong.txt`
+                // Cmd D) — wrap to order 0, raise the song-over flag.
                 self.order_index = self.order_index.saturating_add(1);
                 if self.order_index >= self.song_length {
+                    self.order_index = 0;
                     self.ended = true;
+                    wrapped = true;
                 }
             }
         }
@@ -1590,7 +1644,7 @@ impl PlayerState {
         // for it, and its order index doesn't change), so the saved start
         // row and counter survive as required for the documented "play row 0
         // twice" semantics.
-        if self.order_index != prev_order || explicit_jump {
+        if self.order_index != prev_order || explicit_jump || wrapped {
             for r in self.loop_rows.iter_mut() {
                 *r = 0;
             }
@@ -2100,23 +2154,43 @@ fn apply_extended_tick0(
             // E6x: pattern loop (per-channel). When looping back, schedule
             // the jump via `pending_jump` so the rest of the row's ticks
             // still complete before we rewind.
-            if y == 0 {
+            //
+            // The rewind writes ONLY the destination-row variable. The
+            // `FireLight-MOD-Player-Tutorial.txt` §5.22 pseudocode is
+            // "row = stored row number" — unlike Bxx it never touches the
+            // order, and unlike Dxy it never increments it — and §4.3 has
+            // all flow effects share one ORDER/ROW variable pair with
+            // channels processed left to right. Composing per that model:
+            //
+            // - E6x alone → same order, at the stored loop row;
+            // - Bxx (earlier channel) + E6x → the Bxx target order, at the
+            //   loop row (the E6x replaces only the row, like a same-row
+            //   Dxy would);
+            // - Dxy (earlier channel) + E6x → the NEXT order (the Dxy
+            //   increment stands), at the loop row;
+            // - E6x + Bxx/Dxy (later channel) → the later channel wins as
+            //   before (Bxx rewrites both variables, Dxy replaces the
+            //   whole non-position-jump pending entry).
+            let fire = if y == 0 {
                 loop_rows[ch_idx] = row;
+                false
             } else if loop_counts[ch_idx] == 0 {
                 loop_counts[ch_idx] = y;
-                *pending_jump = Some(Jump {
-                    order: Some(order_index),
-                    row: loop_rows[ch_idx],
-                    from_position_jump: false,
-                });
+                true
             } else {
                 loop_counts[ch_idx] -= 1;
-                if loop_counts[ch_idx] > 0 {
-                    *pending_jump = Some(Jump {
-                        order: Some(order_index),
-                        row: loop_rows[ch_idx],
-                        from_position_jump: false,
-                    });
+                loop_counts[ch_idx] > 0
+            };
+            if fire {
+                match pending_jump {
+                    Some(jump) => jump.row = loop_rows[ch_idx],
+                    None => {
+                        *pending_jump = Some(Jump {
+                            order: Some(order_index),
+                            row: loop_rows[ch_idx],
+                            from_position_jump: false,
+                        });
+                    }
                 }
             }
         }
@@ -2656,6 +2730,68 @@ pub mod tests {
         for i in 0..n_patterns {
             out[952 + i] = i as u8;
         }
+        out[1080..1084].copy_from_slice(b"M.K.");
+
+        let mut pats = vec![0u8; n_patterns * 64 * 4 * 4];
+        for &(pattern, row, channel, ref note) in cells {
+            let off = pattern * 64 * 4 * 4 + row * 4 * 4 + channel * 4;
+            let p_hi = ((note.period >> 8) & 0x0F) as u8;
+            let p_lo = (note.period & 0xFF) as u8;
+            let sample_hi = (note.sample & 0xF0) >> 4;
+            let sample_lo = note.sample & 0x0F;
+            pats[off] = (sample_hi << 4) | p_hi;
+            pats[off + 1] = p_lo;
+            pats[off + 2] = (sample_lo << 4) | note.effect;
+            pats[off + 3] = note.effect_param;
+        }
+        out.extend(pats);
+
+        for i in 0..32 {
+            let v: i8 = if i < 16 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
+    /// Build a MOD whose header song length and 128-byte order table are
+    /// set INDEPENDENTLY, mirroring the layout of the erratum in
+    /// `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`
+    /// ("the divergence is not only at the edge"): the on-disk order
+    /// table is always 128 bytes and trackers do not clear the residue
+    /// past the song length, so those bytes routinely hold live pattern
+    /// numbers. `order_table` is written verbatim from index 0; the
+    /// stored pattern count follows the loader's own derivation (highest
+    /// pattern number in the LIVE `song_length` window, + 1), so the
+    /// file layout matches what `parse_header` computes and the sample
+    /// body lands at the right offset. Sample 1 is the same looping
+    /// square wave as `synth_mod_with_pattern`.
+    pub fn synth_mod_with_order_table(
+        song_length: u8,
+        order_table: &[u8],
+        cells: &[(usize, usize, usize, Note)],
+    ) -> Vec<u8> {
+        assert!(order_table.len() <= 128);
+        assert!((1..=order_table.len()).contains(&(song_length as usize)));
+        let n_patterns = order_table
+            .iter()
+            .take(song_length as usize)
+            .copied()
+            .max()
+            .unwrap_or(0) as usize
+            + 1;
+        for &(pattern, _, _, _) in cells {
+            assert!(pattern < n_patterns, "cell targets an unstored pattern");
+        }
+        let mut out = vec![0u8; crate::header::HEADER_FIXED_SIZE];
+        out[0..4].copy_from_slice(b"test");
+        out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        out[20 + 24] = 0;
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
+        out[950] = song_length;
+        out[951] = 0x7F;
+        out[952..952 + order_table.len()].copy_from_slice(order_table);
         out[1080..1084].copy_from_slice(b"M.K.");
 
         let mut pats = vec![0u8; n_patterns * 64 * 4 * 4];
@@ -5342,6 +5478,238 @@ pub mod tests {
         assert!(!player.ended, "an out-of-range Bxx wraps, never ends");
         assert_eq!(player.order_index, 0, "order wraps to 0");
         assert_eq!(player.row, 10, "the Dxy row survives the wrap");
+    }
+
+    #[test]
+    fn dxy_break_past_last_order_wraps_to_order_zero() {
+        // `FireLight-MOD-Player-Tutorial.txt` §5.14 pseudocode:
+        // "if (ORDER >= SONGLENGTH) ORDER = 0" — a pattern break on the
+        // last order wraps the position back to order 0 (carrying its
+        // decoded row) instead of leaving the index past the end of the
+        // order list. The `ended` flag still rises: it is this crate's
+        // song-over signal, and a wrap-around IS the song completing.
+        let bytes = synth_mod_with_pattern(&[(0, 0, fx(0xD, 0x05))]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.song_length, 1);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(player.ended, "wrapping past the last order is song-over");
+        assert_eq!(
+            player.order_index, 0,
+            "the break past the last order must wrap the position to \
+             order 0, not saturate past the end of the order list"
+        );
+        assert_eq!(player.row, 5, "the decoded break row applies at order 0");
+    }
+
+    #[test]
+    fn natural_runoff_past_last_order_wraps_to_order_zero() {
+        // Running off row 63 of the last order is a bare "jump to the
+        // next song-position" (`mod-spec-eblong.txt` Cmd D describes the
+        // same advance) and takes the same §5.14 overflow handling: the
+        // position wraps to order 0 row 0, and the song-over flag rises.
+        let bytes = synth_mod_with_pattern(&[]);
+        let mut player = make_player(&bytes);
+        // 64 rows at speed 6, plus one tick to consume the advance.
+        for _ in 0..(64 * 6 + 1) {
+            step_one_tick(&mut player);
+        }
+        assert!(player.ended, "run-off past the last order is song-over");
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "natural run-off must leave the position at the documented \
+             restart point (order 0, row 0)"
+        );
+    }
+
+    #[test]
+    fn bxx_oob_wrap_increments_diagnostic_counter() {
+        // `mod-position-jump-pattern-break.md`, erratum status section:
+        // wrap-to-0 is a working assumption recorded from a single
+        // replicated claim, so every Bxx whose parameter is >= the song
+        // length is surfaced as a diagnostic — those are exactly the
+        // modules on which players will disagree.
+        let bytes = synth_mod_with_pattern(&[(0, 0, fx(0xB, 0x05))]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.oob_position_jumps, 0, "fresh player starts clean");
+        step_rows_and_enter_next(&mut player, 1);
+        assert_eq!(
+            player.oob_position_jumps, 1,
+            "one out-of-range Bxx consumed = one diagnostic count"
+        );
+        // The wrap re-enters row 0, which carries the same B05 — every
+        // pass is another divergent jump and counts again.
+        step_rows_and_enter_next(&mut player, 1);
+        assert_eq!(player.oob_position_jumps, 2);
+        assert!(!player.ended, "the diagnostic never ends the song");
+    }
+
+    #[test]
+    fn bxx_bound_is_song_length_not_order_table_residue() {
+        // `mod-position-jump-pattern-break.md`, erratum worked example
+        // ("the divergence is not only at the edge"): song length 4,
+        // order table [03, 01, 02, 06, 05, 07, ...] — orders 4-5 are
+        // editing residue naming real, stored-adjacent pattern numbers.
+        // B04 indexes a byte the file genuinely contains, but it is out
+        // of range under the song-length bound, so under the pinned
+        // working assumption it wraps to order 0 (playing pattern 03).
+        // It must NOT play the residue entry (order 4 / pattern 05), NOT
+        // clamp to the last order (order 3 / pattern 06), and NOT be
+        // ignored (which would fall through to row 1 of the current
+        // pattern).
+        let bytes = synth_mod_with_order_table(4, &[3, 1, 2, 6, 5, 7], &[(3, 0, 0, fx(0xB, 0x04))]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.song_length, 4);
+        assert_eq!(player.order[..6], [3, 1, 2, 6, 5, 7]);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "B04 with song length 4 is out of range: wrap to order 0 \
+             (not residue order 4, not a clamp to order 3, not ignored)"
+        );
+        assert_eq!(
+            player.oob_position_jumps, 1,
+            "the residue-window jump is exactly the divergence set the \
+             erratum says to surface"
+        );
+    }
+
+    #[test]
+    fn bxx_below_song_length_ignores_order_table_residue() {
+        // Companion to the residue test: B02 in the same module is an
+        // ordinary in-range jump (erratum worked example, first table
+        // row) — order 2 playing pattern 02, no diagnostic.
+        let bytes = synth_mod_with_order_table(4, &[3, 1, 2, 6, 5, 7], &[(3, 0, 0, fx(0xB, 0x02))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!((player.order_index, player.row), (2, 0));
+        assert_eq!(
+            player.oob_position_jumps, 0,
+            "an in-range Bxx must not count as a divergence diagnostic"
+        );
+    }
+
+    #[test]
+    fn multiple_dxy_same_row_increment_order_once() {
+        // `FireLight-MOD-Player-Tutorial.txt` §5.14: "it is possible to
+        // put more than 1 pattern break on a row, but we don't want to
+        // increment the order every time … set a flag when a pattern
+        // break occurs, and only increment the order if that flag has
+        // not been set" — and §4.2: "you still set the row no matter
+        // what", so the LAST channel's row wins while the order advances
+        // by exactly one.
+        let bytes =
+            synth_mod_multi_pattern(3, &[(0, 0, 0, fx(0xD, 0x25)), (0, 0, 2, fx(0xD, 0x13))]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(
+            player.order_index, 1,
+            "two same-row pattern breaks must advance the order exactly \
+             once, not twice"
+        );
+        assert_eq!(player.row, 13, "the later channel's row wins");
+    }
+
+    #[test]
+    fn bxx_left_of_e6x_loop_keeps_bxx_order_at_loop_row() {
+        // FireLight §4.3 has all flow effects share one ORDER/ROW pair,
+        // and §5.22's loop rewind is "row = stored row number" — it
+        // writes ONLY the row. So a same-row Bxx (earlier channel) +
+        // firing E6x (later channel) composes to: order from the Bxx,
+        // row from the loop start.
+        let bytes = synth_mod_multi_pattern(
+            3,
+            &[
+                (0, 1, 1, fx(0xE, 0x60)), // loop start = row 1 (channel 1)
+                (0, 2, 0, fx(0xB, 0x02)), // ch0: jump to order 2
+                (0, 2, 1, fx(0xE, 0x61)), // ch1: loop rewind fires
+            ],
+        );
+        let mut player = make_player(&bytes);
+        // Walk rows 0..=2 and consume the combined jump.
+        step_rows_and_enter_next(&mut player, 3);
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (2, 1),
+            "E6x right of Bxx must supply only the row (loop start), \
+             keeping the Bxx target order"
+        );
+    }
+
+    #[test]
+    fn dxy_left_of_e6x_loop_breaks_to_next_order_at_loop_row() {
+        // Same §4.3 composition with a pattern break: Dxy increments the
+        // order (its flag logic runs first, channel-left), then the
+        // later-channel E6x rewind overwrites the row with the loop
+        // start. Destination: next order, loop-start row.
+        let bytes = synth_mod_multi_pattern(
+            3,
+            &[
+                (0, 1, 1, fx(0xE, 0x60)), // loop start = row 1 (channel 1)
+                (0, 2, 0, fx(0xD, 0x05)), // ch0: break to next order row 5
+                (0, 2, 1, fx(0xE, 0x61)), // ch1: loop rewind fires
+            ],
+        );
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 3);
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (1, 1),
+            "E6x right of Dxy must overwrite the break row with the loop \
+             start while the Dxy order increment stands"
+        );
+    }
+
+    #[test]
+    fn e6x_without_e60_loops_to_row_zero_default_start() {
+        // `Protracker-effects-MODFIL12.txt` E6:Loop-pattern: "If no
+        // start point was specified in the current pattern being played,
+        // the loop start defaults to the first line in the pattern."
+        let bytes = synth_mod_with_pattern(&[(2, 0, fx(0xE, 0x62))]);
+        let mut player = make_player(&bytes);
+        // Rows 0..=2, then consume the rewind.
+        step_rows_and_enter_next(&mut player, 3);
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "an E6x rewind with no prior E60 must target row 0"
+        );
+    }
+
+    #[test]
+    fn e60_e61_e61_column_loops_forever() {
+        // `multimedia-cx-protracker.html` §E6x: "the loopback point
+        // remains where it is, so an E60/E61/E61 sequence down a column
+        // will result in an infinite loop." The stored loop start and
+        // the per-channel counter survive E6x rewinds (only explicit
+        // Bxx/Dxy jumps and pattern transitions reset them), so the two
+        // E61 rows keep re-arming each other against the same start row.
+        let bytes = synth_mod_with_pattern(&[
+            (0, 0, fx(0xE, 0x60)),
+            (1, 0, fx(0xE, 0x61)),
+            (2, 0, fx(0xE, 0x61)),
+        ]);
+        let mut player = make_player(&bytes);
+        // Walk the equivalent of 48 rows — far past the 3-row body. The
+        // player must still be cycling rows 0..=2 of order 0.
+        for _ in 0..(48 * 6) {
+            step_one_tick(&mut player);
+            assert!(!player.ended, "the E60/E61/E61 column must never end");
+            assert!(
+                player.row <= 2,
+                "the E60/E61/E61 column must keep looping rows 0..=2 \
+                 (got row {})",
+                player.row
+            );
+            assert_eq!(player.order_index, 0);
+        }
     }
 
     #[test]

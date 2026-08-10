@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Order-list overflow now wraps to order 0, and out-of-range `Bxx`
+  jumps are surfaced as a diagnostic** (`src/player.rs`). A `Dxy`
+  pattern break past the last order — and the natural run-off row 63 of
+  the last order — now leave the position at order 0 (row per the break
+  argument), exactly as the `FireLight-MOD-Player-Tutorial.txt` §5.14
+  pseudocode pins it (`if (ORDER >= SONGLENGTH) ORDER = 0`); previously
+  the index saturated past the end of the order list. The `ended`
+  song-over flag still rises on wrap-around, so render loops terminate
+  as before, but a caller that clears `ended` to keep looping now
+  resumes at the documented restart point instead of indexing the
+  order-table residue. Separately, the erratum added to
+  `docs/audio/trackers/mod/mod-position-jump-pattern-break.md` (the
+  `Bxx`-past-the-end question) records wrap-to-0 as a working assumption
+  the staged sources do not agree on, and directs implementations to
+  treat every `Bxx` whose parameter is ≥ the song length as a
+  diagnostic: the new public `PlayerState::oob_position_jumps` counter
+  increments on each such wrap. New tests cover the break-overflow wrap,
+  the natural run-off wrap, and the counter.
+- **Erratum residue-window conformance for `Bxx`** (`src/player.rs`).
+  The erratum's worked example — song length 4, order table
+  `[03, 01, 02, 06, 05, 07, …]` with live editing residue at orders 4–5
+  — is pinned by two new tests built on a fixture whose song length and
+  order table are set independently: `B04` (an index the file genuinely
+  contains, but past the song length) wraps to order 0 and counts as a
+  divergence diagnostic — it must not play the residue entry, clamp to
+  the last order, or be ignored — while `B02` stays an ordinary in-range
+  jump. This locks the *bound* to the header song-length byte (offset
+  950), not the 128-byte order-table extent and not the stored-pattern
+  count.
+- **`E6x` loop rewind now writes only the row destination variable**
+  (`src/player.rs`). `FireLight-MOD-Player-Tutorial.txt` §5.22's rewind
+  is "row = stored row number" — unlike `Bxx` it never supplies an
+  order, and unlike `Dxy` it never increments one — and §4.3 has all
+  flow effects share a single ORDER/ROW variable pair with channels
+  processed left to right. The rewind therefore merges its loop-start
+  row into any pending same-row jump instead of replacing it: `Bxx`
+  (earlier channel) + firing `E6x` lands at the `Bxx` order, loop row;
+  `Dxy` (earlier channel) + firing `E6x` lands at the next order, loop
+  row. Previously the rewind overwrote the whole pending jump with a
+  same-order target, discarding the earlier channel's order/increment.
+  `E6x` alone, and `Bxx`/`Dxy` on a channel right of the `E6x`, are
+  unchanged. Also pinned by new tests: two same-row `Dxy` advance the
+  order exactly once (§5.14's break flag), an `E6x` rewind with no prior
+  `E60` targets row 0 (`Protracker-effects-MODFIL12.txt` E6 default
+  start point), and an `E60`/`E61`/`E61` column loops forever
+  (`multimedia-cx-protracker.html` §E6x: the loopback point and counter
+  survive rewinds).
 - **`Bxx`/`Dxy` doc-example pins: clean restart + unconditional backward
   loop** (`src/player.rs`). Two more directed tests lock the remaining
   worked examples of
