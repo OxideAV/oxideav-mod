@@ -37,7 +37,7 @@ use oxideav_core::{
 };
 use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
 
-// ---------- Public-API ABI mirror (from modplug.h) ----------
+// ---------- Published C-interface ABI mirror of the reference dylib ----------
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -59,14 +59,14 @@ struct ModPlugSettings {
     mLoopCount: i32,
 }
 
-// modplug.h: enum _ModPlug_Flags
+// Reference-dylib configuration flags (published C interface)
 const MODPLUG_ENABLE_OVERSAMPLING: i32 = 1 << 0;
 const MODPLUG_ENABLE_NOISE_REDUCTION: i32 = 1 << 1;
 const MODPLUG_ENABLE_REVERB: i32 = 1 << 2;
 const MODPLUG_ENABLE_MEGABASS: i32 = 1 << 3;
 const MODPLUG_ENABLE_SURROUND: i32 = 1 << 4;
 
-// modplug.h: enum _ModPlug_ResamplingMode
+// Reference-dylib resampling modes (published C interface)
 #[allow(dead_code)]
 const MODPLUG_RESAMPLE_NEAREST: i32 = 0;
 const MODPLUG_RESAMPLE_LINEAR: i32 = 1;
