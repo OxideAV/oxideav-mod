@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stored-pattern count now scans the ENTIRE 128-byte order table**
+  (`src/header.rs`). Three staged sources pin the loader rule — the
+  `FireLight-MOD-Player-Tutorial.txt` §2.5 pseudocode ("loop 128 times …
+  the highest value found is stored as the number of patterns"), the
+  `Protracker-effects-MODFIL12.txt` §2.7 annotation ("Be sure to scan
+  ALL the values (128 of them) and to increment the highest pattern nr
+  once"), and `Ultimate-Soundtracker-mod.txt` ("pattern data (1024
+  bytes) for each pattern number that can be found in entire pattern
+  table") — but the derivation had scanned only the live `song_length`
+  window since the original scaffold. Trackers do not clear the
+  order-table residue past the song length, and a pattern referenced
+  only by residue is still physically stored, so the old scan misplaced
+  the sample-data offset of every residue-bearing module (the same
+  module population as the position-jump erratum). Both the 31-sample
+  and UST paths now share one documented derivation, additionally
+  capped at 128 patterns per the §2.7 annotation "The nr of patterns is
+  limited to 128 (from 0 to 127)" (hostile 0xFF tables previously
+  demanded 255). New header tests pin the residue scan (both paths) and
+  the cap.
+
 ### Added
 
 - **Order-list overflow now wraps to order 0, and out-of-range `Bxx`

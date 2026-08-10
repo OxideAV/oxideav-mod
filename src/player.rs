@@ -2761,10 +2761,10 @@ pub mod tests {
     /// past the song length, so those bytes routinely hold live pattern
     /// numbers. `order_table` is written verbatim from index 0; the
     /// stored pattern count follows the loader's own derivation (highest
-    /// pattern number in the LIVE `song_length` window, + 1), so the
-    /// file layout matches what `parse_header` computes and the sample
-    /// body lands at the right offset. Sample 1 is the same looping
-    /// square wave as `synth_mod_with_pattern`.
+    /// pattern number anywhere in the table, + 1 — FireLight §2.5 /
+    /// MODFIL12 §2.7), so the file layout matches what `parse_header`
+    /// computes and the sample body lands at the right offset. Sample 1
+    /// is the same looping square wave as `synth_mod_with_pattern`.
     pub fn synth_mod_with_order_table(
         song_length: u8,
         order_table: &[u8],
@@ -2772,13 +2772,7 @@ pub mod tests {
     ) -> Vec<u8> {
         assert!(order_table.len() <= 128);
         assert!((1..=order_table.len()).contains(&(song_length as usize)));
-        let n_patterns = order_table
-            .iter()
-            .take(song_length as usize)
-            .copied()
-            .max()
-            .unwrap_or(0) as usize
-            + 1;
+        let n_patterns = order_table.iter().copied().max().unwrap_or(0) as usize + 1;
         for &(pattern, _, _, _) in cells {
             assert!(pattern < n_patterns, "cell targets an unstored pattern");
         }

@@ -261,19 +261,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
         }
     }
 
-    // Highest referenced pattern index + 1. Order entries are raw `u8`, so
-    // a hostile / corrupt table whose max entry is 0xFF (255) would overflow
-    // `1 + 255` in the `u8` domain (panic in debug, wrap in release). Saturate
-    // instead: valid modules never reference pattern index 254+ in practice
-    // (M.K. tops out well below), and the degenerate 0xFF case clamps to 255
-    // patterns whose trailing cell reads zero-fill anyway rather than crashing.
-    let n_patterns = order
-        .iter()
-        .take(song_length as usize)
-        .max()
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1);
+    let n_patterns = derive_n_patterns(&order);
 
     Ok(ModHeader {
         title,
@@ -286,6 +274,38 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
         n_patterns,
         variant: ModVariant::Standard31,
     })
+}
+
+/// Stored-pattern count: highest pattern number anywhere in the 128-byte
+/// order table, + 1.
+///
+/// The scan covers the ENTIRE table, not just the live `song_length`
+/// window — three staged sources pin this: the
+/// `FireLight-MOD-Player-Tutorial.txt` §2.5 loader pseudocode ("loop 128
+/// times … the highest value found is stored as the number of patterns"),
+/// the `Protracker-effects-MODFIL12.txt` §2.7 annotation ("Be sure to
+/// scan ALL the values (128 of them) and to increment the highest pattern
+/// nr once"), and `Ultimate-Soundtracker-mod.txt` ("pattern data (1024
+/// bytes) for each pattern number that can be found in entire pattern
+/// table"). Trackers do not clear the order-table residue past the song
+/// length, so a pattern referenced only by residue is still physically
+/// stored in the file — deriving the count from the live window alone
+/// shifts the sample-data offset of every such module.
+///
+/// Hardening on top of the documented rule: the `+ 1` saturates in the
+/// `u8` domain (a hostile 0xFF entry must not panic/wrap), and the result
+/// is capped at 128 patterns per the `Protracker-effects-MODFIL12.txt`
+/// §2.7 annotation "The nr of patterns is limited to 128 (from 0 to
+/// 127)" — corrupt tables cannot demand more pattern data than the
+/// format can address.
+fn derive_n_patterns(order: &[u8]) -> u8 {
+    order
+        .iter()
+        .max()
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(128)
 }
 
 /// Parse the 15-sample Ultimate SoundTracker header layout.
@@ -358,19 +378,10 @@ pub fn parse_ust_header(bytes: &[u8]) -> Result<ModHeader> {
     let signature = *b"M.K.";
     let channels = 4;
 
-    // Highest referenced pattern index + 1. Order entries are raw `u8`, so
-    // a hostile / corrupt table whose max entry is 0xFF (255) would overflow
-    // `1 + 255` in the `u8` domain (panic in debug, wrap in release). Saturate
-    // instead: valid modules never reference pattern index 254+ in practice
-    // (M.K. tops out well below), and the degenerate 0xFF case clamps to 255
-    // patterns whose trailing cell reads zero-fill anyway rather than crashing.
-    let n_patterns = order
-        .iter()
-        .take(song_length as usize)
-        .max()
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1);
+    // Same entire-table scan as the 31-sample path:
+    // `Ultimate-Soundtracker-mod.txt` places "pattern data (1024 bytes)
+    // for each pattern number that can be found in entire pattern table".
+    let n_patterns = derive_n_patterns(&order);
 
     Ok(ModHeader {
         title,
@@ -496,6 +507,55 @@ mod tests {
         assert_eq!(h.signature, *b"M.K.");
         assert_eq!(h.song_length, 1);
         assert_eq!(h.samples.len(), 31);
+    }
+
+    #[test]
+    fn n_patterns_scans_entire_order_table_not_just_live_window() {
+        // `FireLight-MOD-Player-Tutorial.txt` §2.5 ("loop 128 times …
+        // the highest value found is stored as the number of patterns"),
+        // `Protracker-effects-MODFIL12.txt` §2.7 annotation ("Be sure to
+        // scan ALL the values (128 of them)"), and
+        // `Ultimate-Soundtracker-mod.txt` ("for each pattern number that
+        // can be found in entire pattern table"): editing residue past
+        // the song length still names physically stored patterns, so
+        // the stored-pattern count — and with it the sample-data offset
+        // — must come from the whole 128-byte table.
+        let mut bytes = make_fake_mod(b"M.K.", 2);
+        bytes[952] = 3; // live window: patterns 3, 1
+        bytes[953] = 1;
+        bytes[954] = 6; // residue: highest pattern number in the table
+        bytes[955] = 5;
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.song_length, 2);
+        assert_eq!(
+            h.n_patterns, 7,
+            "residue entry 6 must raise the stored-pattern count to 7; \
+             a live-window-only scan would report 4 and misplace the \
+             sample data of every residue-bearing module"
+        );
+        assert_eq!(h.pattern_data_size(), 7 * 0x400);
+
+        let h = parse_ust_header(&{
+            let mut b = make_fake_ust(1);
+            b[UST_ORDER_TABLE_OFFSET + 5] = 2; // residue on the UST path
+            b
+        })
+        .unwrap();
+        assert_eq!(h.n_patterns, 3);
+    }
+
+    #[test]
+    fn n_patterns_capped_at_128() {
+        // `Protracker-effects-MODFIL12.txt` §2.7 annotation: "The nr of
+        // patterns is limited to 128 (from 0 to 127)." A corrupt table
+        // whose entries run to 0xFF must not demand 256 patterns of
+        // data — the count clamps to the format's addressable maximum.
+        let mut bytes = make_fake_mod(b"M.K.", 1);
+        for i in 0..128 {
+            bytes[952 + i] = 0xFF;
+        }
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.n_patterns, 128);
     }
 
     #[test]
