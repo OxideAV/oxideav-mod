@@ -85,16 +85,16 @@ Spec-level effect coverage per
 | 7xy | Tremolo | implemented |
 | 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk) |
 | Axy | Volume slide | implemented |
-| Bxx | Position jump | implemented (out-of-range target wraps to order 0; also clears a pending break row — see the same-row `Bxx`/`Dxy` bullet below) |
+| Bxx | Position jump | implemented (an out-of-range target — bound = the song-length byte, NOT the 128-byte order-table extent — wraps to order 0 per the staged erratum's working assumption and increments the public `oob_position_jumps` diagnostic; also clears a pending break row — see the same-row `Bxx`/`Dxy` bullet below) |
 | Cxx | Set volume | implemented |
-| Dxy | Pattern break (decimal `x*10 + y`) | implemented (row > 63 starts the destination at row 0; merges its row into a same-row earlier-channel `Bxx`) |
+| Dxy | Pattern break (decimal `x*10 + y`) | implemented (row > 63 starts the destination at row 0; merges its row into a same-row earlier-channel `Bxx`; two breaks on one row advance the order exactly once; a break past the last order wraps the position to order 0 per FireLight §5.14 while still raising the song-over flag) |
 | Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM; $00 = halt) | implemented (F00 raises the song-over `ended` flag) |
 | E0x | Filter on/off | implemented (1-pole IIR lowpass at 11.5 kHz; LED defaults ON) |
 | E1x / E2x | Fine portamento up / down (tick-0 one-shot) | implemented |
 | E3x | Glissando control | implemented |
 | E4x / E7x | Vibrato / tremolo waveform (sine / downward-saw / square / retrig bit) | implemented (64-step full cycle; saw is a true monotonic descent +y→-y, square starts from +y, random falls back to sine) |
 | E5x | Set finetune (also re-derives period on same-row note trigger) | implemented |
-| E6x | Pattern loop (per-channel start + count) | implemented (per-channel loop-start row + counter; loop point resets on every `Bxx`/`Dxy` — including same-order self-jumps — and on every pattern transition per `multimedia-cx-protracker.html` §E6x, so stale loop state cannot bleed across a jump) |
+| E6x | Pattern loop (per-channel start + count) | implemented (per-channel loop-start row + counter; loop point resets on every `Bxx`/`Dxy` — including same-order self-jumps — and on every pattern transition per `multimedia-cx-protracker.html` §E6x, so stale loop state cannot bleed across a jump; the rewind writes only the ROW destination variable per FireLight §4.3/§5.22, so a same-row earlier-channel `Bxx` keeps its target order and a `Dxy` keeps its order increment; with no prior `E60` the loop start defaults to row 0; an `E60`/`E61`/`E61` column loops forever) |
 | E9x | Retrigger note every *x* ticks | implemented |
 | EAx / EBx | Fine volume slide up / down | implemented |
 | ECx | Note cut | implemented (`ECx` cuts at tick x; `EC0` cuts on tick 0 so "nothing will be heard") |
@@ -124,6 +124,18 @@ is documented in
 carries, so both decode identically. Tags whose digits fall outside the
 documented ranges (e.g. `0CHN`, `99CH`, `TDZ4`) are rejected by both the
 probe and the parser.
+
+**SoundTracker 2.6 / IceTracker** (`MTN\0` / `IT10` magic at offset
+1464 instead of a tag at 1080) is also supported, per
+`docs/audio/trackers/mod/Soundtracker-v2.6-IceTracker-st26.txt`: each
+64-row track is stored once, and the 128-position pattern list names
+four track indices (one per channel) per position. The parser
+normalises the list to an identity order table with one synthesized
+logical pattern per position, so the whole order-flow engine
+(`Bxx`/`Dxy`/`E6x` rules above) runs unchanged; the unused finetune
+byte is ignored, and track cells decode with the standard event
+layout. A recognised offset-1080 tag always wins over a coincidental
+ST2.6 magic.
 
 Loop handling is forward-only per MOD spec — ping-pong / bidi loops are an
 XM/IT/S3M-era extension and are deliberately not used here.

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SoundTracker 2.6 / IceTracker (`MTN\0` / `IT10`) support**
+  (`src/header.rs`, `src/player.rs`, `src/container.rs`). The staged
+  `docs/audio/trackers/mod/Soundtracker-v2.6-IceTracker-st26.txt`
+  layout is now decoded end to end: magic at +1464, pattern-list size
+  at +950, stored-track count at +951, the 128×4 track-index table at
+  +952, 256-byte single-channel tracks at +1468, then sample bodies.
+  The parser normalises the pattern list to an identity order table
+  with one synthesized logical pattern per position (assembled from the
+  four tracks the position names), so the entire order-flow engine —
+  `Bxx`/`Dxy` same-row rules, §5.14 overflow wrap, `E6x` interactions —
+  runs unchanged on ST2.6 modules. The unused ST2.6 finetune byte is
+  ignored; track cells decode with the standard event layout (the
+  ST2.6 effect table is a subset, and its `e` set-filter writes the
+  same `E0y` bytes the standard dispatch routes to the LED filter). A
+  recognised offset-1080 tag always wins over a coincidental +1464
+  magic; the container probe accepts the ST2.6 magic at the same
+  confidence as the tag catalogue. Tests cover header
+  parsing/normalisation for both magics, tag-precedence, truncation,
+  track-to-channel pattern assembly, out-of-range track indices,
+  order-flow over the synthesized list, an end-to-end render, and a
+  hostile saturated-list fixture in the no-panic battery.
+
 ### Fixed
 
 - **Stored-pattern count now scans the ENTIRE 128-byte order table**

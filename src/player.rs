@@ -398,13 +398,39 @@ pub fn parse_patterns(header: &ModHeader, bytes: &[u8]) -> Vec<Pattern> {
     let base = header.pattern_data_offset();
     let flt8 = header.is_flt8();
     let ust = header.is_ust();
+    // SoundTracker 2.6 / IceTracker: patterns are assembled from
+    // independently stored 64-row single-channel tracks. The 128×4
+    // table at +952 names, for each pattern-list position, the track
+    // that plays on each channel
+    // (`Soundtracker-v2.6-IceTracker-st26.txt`). The header normalises
+    // the list to identity order, so logical pattern `p` reads the four
+    // track indices of list position `p`. Track cells are "stored like
+    // Protracker" — same 4-byte event decode, no effect translation
+    // (the ST2.6 effect table is a subset of the standard one, and its
+    // `e : set filter` writes the same `E0y` byte pattern the standard
+    // dispatch already routes to the LED filter).
+    let st26_n_tracks = match header.variant {
+        crate::header::ModVariant::SoundTracker26 { n_tracks } => Some(n_tracks as usize),
+        _ => None,
+    };
 
     for p in 0..header.n_patterns as usize {
         let mut rows = Vec::with_capacity(PATTERN_ROWS);
         for r in 0..PATTERN_ROWS {
             let mut row = Vec::with_capacity(channels);
             for c in 0..channels {
-                let off = if flt8 {
+                let off = if let Some(n_tracks) = st26_n_tracks {
+                    let idx_off = crate::header::ST26_TRACK_TABLE_OFFSET + p * 4 + c;
+                    let track = bytes.get(idx_off).copied().unwrap_or(0) as usize;
+                    if track >= n_tracks {
+                        // A track index past the stored-track count has
+                        // no data — leave the cell empty rather than
+                        // reading into the sample region.
+                        row.push(Note::decode([0; 4]));
+                        continue;
+                    }
+                    base + track * crate::header::ST26_TRACK_BYTES + r * 4
+                } else if flt8 {
                     // Paired stored layout: 4-channel stored patterns,
                     // first of the pair = low channels, second = high.
                     let (stored, sc) = if c < 4 {
@@ -2809,6 +2835,50 @@ pub mod tests {
         out
     }
 
+    /// Build a SoundTracker 2.6 / IceTracker module
+    /// (`Soundtracker-v2.6-IceTracker-st26.txt` layout): `positions`
+    /// holds one `[track; 4]` index row per pattern-list position,
+    /// `tracks[t]` lists `(row, Note)` cells for stored track `t`.
+    /// Sample 1 is the usual looping 32-byte square wave.
+    pub fn synth_st26_mod(positions: &[[u8; 4]], tracks: &[&[(usize, Note)]]) -> Vec<u8> {
+        use crate::header::{ST26_MAGIC_OFFSET, ST26_TRACK_BYTES, ST26_TRACK_DATA_OFFSET};
+        assert!(positions.len() <= 128);
+        let mut out = vec![0u8; ST26_TRACK_DATA_OFFSET];
+        out[0..4].copy_from_slice(b"st26");
+        out[20 + 22..20 + 24].copy_from_slice(&16u16.to_be_bytes());
+        out[20 + 25] = 64;
+        out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
+        out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
+        out[950] = positions.len() as u8;
+        out[951] = tracks.len() as u8;
+        for (i, pos) in positions.iter().enumerate() {
+            out[952 + i * 4..952 + i * 4 + 4].copy_from_slice(pos);
+        }
+        out[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4].copy_from_slice(b"MTN\0");
+
+        let mut td = vec![0u8; tracks.len() * ST26_TRACK_BYTES];
+        for (t, cells) in tracks.iter().enumerate() {
+            for &(row, ref note) in cells.iter() {
+                let off = t * ST26_TRACK_BYTES + row * 4;
+                let p_hi = ((note.period >> 8) & 0x0F) as u8;
+                let p_lo = (note.period & 0xFF) as u8;
+                let sample_hi = (note.sample & 0xF0) >> 4;
+                let sample_lo = note.sample & 0x0F;
+                td[off] = (sample_hi << 4) | p_hi;
+                td[off + 1] = p_lo;
+                td[off + 2] = (sample_lo << 4) | note.effect;
+                td[off + 3] = note.effect_param;
+            }
+        }
+        out.extend(td);
+
+        for i in 0..32 {
+            let v: i8 = if i < 16 { 100 } else { -100 };
+            out.push(v as u8);
+        }
+        out
+    }
+
     fn make_player(bytes: &[u8]) -> PlayerState {
         let header = parse_header(bytes).unwrap();
         let samples = extract_samples(&header, bytes);
@@ -2882,6 +2952,27 @@ pub mod tests {
             parse_header(&[0u8; 100]),
             Err(oxideav_core::Error::NeedMore)
         ));
+
+        // 5. Hostile ST2.6: valid magic but a saturated pattern list
+        //    (128 positions), track indices all 0xFF (past the declared
+        //    track count), a huge declared track count with no track
+        //    data appended, and over-declared sample lengths — every
+        //    track/cell/sample read must clamp, never index out of
+        //    bounds.
+        let mut st26 = vec![0u8; crate::header::ST26_TRACK_DATA_OFFSET];
+        st26[0..4].copy_from_slice(b"test");
+        for i in 0..31 {
+            let off = 20 + i * 30;
+            st26[off + 22..off + 24].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        }
+        st26[950] = 0xFF; // pattern-list size past the 128-entry table
+        st26[951] = 0xFF; // declared tracks with no data present
+        for b in st26[952..1464].iter_mut() {
+            *b = 0xFF;
+        }
+        st26[crate::header::ST26_MAGIC_OFFSET..crate::header::ST26_MAGIC_OFFSET + 4]
+            .copy_from_slice(b"IT10");
+        drive_pipeline_no_panic(&st26);
     }
 
     /// Build a synthetic Startrekker `FLT8` module: one logical
@@ -5936,6 +6027,113 @@ pub mod tests {
             player.row,
             player.order_index,
             player.ended,
+        );
+    }
+
+    #[test]
+    fn st26_patterns_assemble_from_track_indices() {
+        // `Soundtracker-v2.6-IceTracker-st26.txt`: each pattern-list
+        // position names four independently stored 64-row tracks, one
+        // per channel. The same track may appear under several
+        // positions and channels.
+        let t0: &[(usize, Note)] = &[];
+        let t1: &[(usize, Note)] = &[(
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0,
+                effect_param: 0,
+            },
+        )];
+        let t2: &[(usize, Note)] = &[(
+            3,
+            Note {
+                period: 339,
+                sample: 1,
+                effect: 0,
+                effect_param: 0,
+            },
+        )];
+        let bytes = synth_st26_mod(&[[1, 0, 1, 0], [0, 2, 0, 1]], &[t0, t1, t2]);
+        let player = make_player(&bytes);
+        assert_eq!(player.song_length, 2);
+        assert_eq!(player.patterns.len(), 2);
+        // Position 0: track 1 on channels 0 and 2, empty track elsewhere.
+        let p0 = &player.patterns[0];
+        assert_eq!(p0.rows[0][0].period, 428);
+        assert_eq!(p0.rows[0][1].period, 0);
+        assert_eq!(p0.rows[0][2].period, 428);
+        assert_eq!(p0.rows[0][3].period, 0);
+        // Position 1: track 2 (note at row 3) on channel 1, track 1 on
+        // channel 3.
+        let p1 = &player.patterns[1];
+        assert_eq!(p1.rows[3][1].period, 339);
+        assert_eq!(p1.rows[0][3].period, 428);
+        assert_eq!(p1.rows[3][0].period, 0);
+    }
+
+    #[test]
+    fn st26_out_of_range_track_index_reads_as_silence() {
+        // A track index at or past the stored-track count names no
+        // data; the cell must decode empty instead of reading into the
+        // sample region.
+        let t0: &[(usize, Note)] = &[(
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0,
+                effect_param: 0,
+            },
+        )];
+        let bytes = synth_st26_mod(&[[5, 0, 0, 0]], &[t0]);
+        let player = make_player(&bytes);
+        let p0 = &player.patterns[0];
+        assert_eq!(p0.rows[0][0].period, 0, "index 5 of 1 stored track");
+        assert_eq!(p0.rows[0][1].period, 428, "in-range track still reads");
+    }
+
+    #[test]
+    fn st26_order_flow_runs_on_synthesized_pattern_list() {
+        // `Bxx` and `Dxy` are both in the ST2.6 effect table; the
+        // identity-order normalisation lets the standard order-flow
+        // engine (incl. the §5.14 wrap and the same-row rules) walk the
+        // pattern list. A D05 on position 0 must land on position 1,
+        // row 5.
+        let t0: &[(usize, Note)] = &[];
+        let t1: &[(usize, Note)] = &[(0, fx(0xD, 0x05))];
+        let bytes = synth_st26_mod(&[[1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], &[t0, t1]);
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (1, 5),
+            "pattern break must advance to the next pattern-list position"
+        );
+    }
+
+    #[test]
+    fn st26_note_renders_audio() {
+        // End-to-end: the synthesized pattern triggers the square
+        // sample and the mixer produces signal.
+        let t1: &[(usize, Note)] = &[(
+            0,
+            Note {
+                period: 428,
+                sample: 1,
+                effect: 0,
+                effect_param: 0,
+            },
+        )];
+        let bytes = synth_st26_mod(&[[0, 0, 0, 0]], &[t1]);
+        let mut player = make_player(&bytes);
+        let mut buf = vec![0i16; 2000];
+        player.render(&mut buf);
+        assert!(
+            buf.iter().any(|&s| s != 0),
+            "an ST2.6 note must produce audible output"
         );
     }
 

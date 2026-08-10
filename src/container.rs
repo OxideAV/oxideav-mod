@@ -60,10 +60,15 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
     // resolve to a channel count is a tag we probe positively. This keeps
     // probe and parse acceptance from ever drifting apart.
     if crate::header::is_known_signature(&magic) {
-        100
-    } else {
-        0
+        return 100;
     }
+    // SoundTracker 2.6 / IceTracker keeps its magic at +1464 instead
+    // (`Soundtracker-v2.6-IceTracker-st26.txt`); `parse_header`
+    // dispatches on the same check, keeping probe and parse aligned.
+    if crate::header::is_st26_magic(p.buf) {
+        return 100;
+    }
+    0
 }
 
 fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {

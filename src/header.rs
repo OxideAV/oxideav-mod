@@ -63,6 +63,28 @@ pub const UST_BPM_OFFSET: usize = 471;
 /// Offset of the 128-entry pattern order table in the UST layout.
 pub const UST_ORDER_TABLE_OFFSET: usize = 472;
 
+/// Offset of the SoundTracker 2.6 / IceTracker 128×4 track-index table
+/// (`Soundtracker-v2.6-IceTracker-st26.txt`: "0952 128*4 Track indices
+/// for each pattern" — one byte per channel per pattern-list position).
+pub const ST26_TRACK_TABLE_OFFSET: usize = 952;
+/// Offset of the ST2.6 / IceTracker magic ID (`MTN\0` / `IT10`), per
+/// `Soundtracker-v2.6-IceTracker-st26.txt` ("1464 4 Magic ID").
+pub const ST26_MAGIC_OFFSET: usize = 1464;
+/// Offset where ST2.6 track data begins ("1468 ? Track data (stored
+/// like Protracker)").
+pub const ST26_TRACK_DATA_OFFSET: usize = 1468;
+/// Bytes per stored ST2.6 track: 64 rows × one 4-byte channel cell.
+pub const ST26_TRACK_BYTES: usize = PATTERN_ROWS * 4;
+
+/// True when `bytes` carries the SoundTracker 2.6 / IceTracker magic at
+/// offset 1464 (`MTN\0` for SoundTracker 2.6, `IT10` for IceTracker
+/// 1.0/1.1, per `Soundtracker-v2.6-IceTracker-st26.txt`).
+pub fn is_st26_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= ST26_MAGIC_OFFSET + 4
+        && (&bytes[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4] == b"MTN\0"
+            || &bytes[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4] == b"IT10")
+}
+
 /// Which on-disk header layout a [`ModHeader`] was parsed from.
 ///
 /// The two variants share the [`ModHeader`] / [`Sample`] / pattern-cell
@@ -79,6 +101,21 @@ pub enum ModVariant {
     Standard31,
     /// The 15-sample Ultimate SoundTracker layout (no signature).
     UltimateSoundTracker15,
+    /// SoundTracker 2.6 / IceTracker (`MTN\0` / `IT10` magic at +1464).
+    ///
+    /// Per `Soundtracker-v2.6-IceTracker-st26.txt`: each 64-row track is
+    /// stored independently, and the 128-position pattern list holds
+    /// FOUR track indices per position (one per channel) instead of one
+    /// pattern number. The parser normalises the list to an identity
+    /// order table (position `i` plays synthesized logical pattern `i`),
+    /// and `player::parse_patterns` assembles each logical pattern from
+    /// its four indexed tracks. `n_tracks` is the "Number of stored
+    /// tracks" header byte (+951), needed to size the track-data region
+    /// that precedes the sample bodies.
+    SoundTracker26 {
+        /// Number of stored 256-byte tracks (header byte +951).
+        n_tracks: u8,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +200,11 @@ impl ModHeader {
         self.variant == ModVariant::UltimateSoundTracker15
     }
 
+    /// True for the SoundTracker 2.6 / IceTracker per-track layout.
+    pub fn is_st26(&self) -> bool {
+        matches!(self.variant, ModVariant::SoundTracker26 { .. })
+    }
+
     /// Total size of the header block preceding pattern data (in bytes).
     ///
     /// The 31-sample layout reserves a fixed 1084-byte header; the UST
@@ -172,6 +214,10 @@ impl ModHeader {
         match self.variant {
             ModVariant::Standard31 => HEADER_FIXED_SIZE,
             ModVariant::UltimateSoundTracker15 => UST_HEADER_FIXED_SIZE,
+            // ST2.6 track data starts right after the +1464 magic
+            // (`Soundtracker-v2.6-IceTracker-st26.txt`: "1468 ? Track
+            // data (stored like Protracker)").
+            ModVariant::SoundTracker26 { .. } => ST26_TRACK_DATA_OFFSET,
         }
     }
 
@@ -201,7 +247,14 @@ impl ModHeader {
     /// patterns of `PATTERN_ROWS * 4 * 4` bytes each, which is
     /// exactly `PATTERN_ROWS * 8 * 4` bytes per logical pattern.
     pub fn pattern_data_size(&self) -> usize {
-        self.n_patterns as usize * PATTERN_ROWS * self.channels as usize * 4
+        match self.variant {
+            // ST2.6 stores each 64-row single-channel track once; the
+            // region before the sample bodies is `n_tracks` tracks of
+            // 256 bytes, NOT `n_patterns` interleaved patterns
+            // (`Soundtracker-v2.6-IceTracker-st26.txt`).
+            ModVariant::SoundTracker26 { n_tracks } => n_tracks as usize * ST26_TRACK_BYTES,
+            _ => self.n_patterns as usize * PATTERN_ROWS * self.channels as usize * 4,
+        }
     }
 
     /// Absolute offset where sample bodies begin.
@@ -214,6 +267,21 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
     if bytes.len() < HEADER_FIXED_SIZE {
         return Err(Error::NeedMore);
     }
+
+    // SoundTracker 2.6 / IceTracker dispatch. These files place their
+    // magic at +1464 and hold track-index bytes at +1080 where the
+    // 31-sample family keeps its signature, so the tag check below
+    // would reject them. A recognised +1080 tag always wins (the
+    // catalogue is the primary discriminator); only when the tag is
+    // unknown do we look for the ST2.6 magic.
+    {
+        let mut sig = [0u8; 4];
+        sig.copy_from_slice(&bytes[1080..1084]);
+        if !is_known_signature(&sig) && is_st26_magic(bytes) {
+            return parse_st26_header(bytes);
+        }
+    }
+
     let title = read_padded_ascii(&bytes[0..20]);
 
     let mut samples = Vec::with_capacity(SAMPLE_COUNT);
@@ -273,6 +341,82 @@ pub fn parse_header(bytes: &[u8]) -> Result<ModHeader> {
         channels,
         n_patterns,
         variant: ModVariant::Standard31,
+    })
+}
+
+/// Parse the SoundTracker 2.6 / IceTracker header layout
+/// (`Soundtracker-v2.6-IceTracker-st26.txt`).
+///
+/// Layout: title (20 bytes), then 31 × 30-byte instruments (the
+/// finetune byte is "Unused (finetune not available in ST2.6)" and is
+/// forced to 0 here), pattern-list size (+950), number of stored tracks
+/// (+951), the 128×4 track-index table (+952), the magic `MTN\0`/`IT10`
+/// (+1464), track data (+1468), and finally sample data. Event cells
+/// and sample bodies are "stored like Protracker".
+///
+/// Normalisation: the pattern list is exposed as an identity order
+/// table (`order[i] = i` for the live window), one synthesized logical
+/// pattern per list position; `player::parse_patterns` assembles each
+/// logical pattern from the four tracks its list entry names. The
+/// order-flow effects (`Bxx`/`Dxy` — both in the ST2.6 effect table)
+/// therefore run unchanged against the list positions.
+pub fn parse_st26_header(bytes: &[u8]) -> Result<ModHeader> {
+    if bytes.len() < ST26_TRACK_DATA_OFFSET {
+        return Err(Error::NeedMore);
+    }
+    if !is_st26_magic(bytes) {
+        return Err(Error::invalid("MOD: not a SoundTracker 2.6 module"));
+    }
+    let title = read_padded_ascii(&bytes[0..20]);
+
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    for i in 0..SAMPLE_COUNT {
+        let off = 20 + i * 30;
+        let name = read_padded_ascii(&bytes[off..off + 22]);
+        let len_words = u16::from_be_bytes([bytes[off + 22], bytes[off + 23]]) as u32;
+        let volume = bytes[off + 25].min(64);
+        let repeat_start_words = u16::from_be_bytes([bytes[off + 26], bytes[off + 27]]) as u32;
+        let repeat_length_words = u16::from_be_bytes([bytes[off + 28], bytes[off + 29]]) as u32;
+        samples.push(Sample {
+            name,
+            length: len_words.saturating_mul(2),
+            // "+ 0024 1 Unused (finetune not available in ST2.6)".
+            finetune: 0,
+            volume,
+            repeat_start: repeat_start_words.saturating_mul(2),
+            repeat_length: repeat_length_words.saturating_mul(2),
+        });
+    }
+
+    // "0950 1 Size of the pattern list" — the playable position count,
+    // bounded by the 128-entry table.
+    let song_length = bytes[950].min(ORDER_TABLE_SIZE as u8);
+    let n_tracks = bytes[951];
+
+    // Identity order table: list position i plays synthesized logical
+    // pattern i. Residue past the live window is zero-filled (there is
+    // no on-disk order table to carry residue — the list itself is the
+    // 4-wide track-index table).
+    let order: Vec<u8> = (0..ORDER_TABLE_SIZE)
+        .map(|i| if (i as u8) < song_length { i as u8 } else { 0 })
+        .collect();
+    let n_patterns = derive_n_patterns(&order);
+
+    let mut signature = [0u8; 4];
+    signature.copy_from_slice(&bytes[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4]);
+
+    Ok(ModHeader {
+        title,
+        samples,
+        song_length,
+        // ST2.6 has no restart byte (+951 is the track count); surface
+        // the conventional 0x7F filler.
+        restart: 0x7F,
+        order,
+        signature,
+        channels: 4,
+        n_patterns,
+        variant: ModVariant::SoundTracker26 { n_tracks },
     })
 }
 
@@ -507,6 +651,82 @@ mod tests {
         assert_eq!(h.signature, *b"M.K.");
         assert_eq!(h.song_length, 1);
         assert_eq!(h.samples.len(), 31);
+    }
+
+    /// Minimal SoundTracker 2.6 / IceTracker file: 3 pattern-list
+    /// positions over 2 stored tracks, garbage in sample 1's unused
+    /// finetune byte, `magic` at +1464.
+    fn make_fake_st26(magic: &[u8; 4]) -> Vec<u8> {
+        let mut out = vec![0u8; ST26_TRACK_DATA_OFFSET + 2 * ST26_TRACK_BYTES];
+        out[0..4].copy_from_slice(b"st26");
+        // Sample 1: unused finetune byte holds garbage the parser must
+        // ignore ("+ 0024 1 Unused (finetune not available in ST2.6)").
+        out[20 + 24] = 0x05;
+        out[950] = 3; // pattern-list size
+        out[951] = 2; // stored tracks
+                      // Position 0 plays track 1 on channels 0/2, track 0 on 1/3.
+        out[952..956].copy_from_slice(&[1, 0, 1, 0]);
+        out[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4].copy_from_slice(magic);
+        out
+    }
+
+    #[test]
+    fn st26_header_parses_and_normalises() {
+        // `Soundtracker-v2.6-IceTracker-st26.txt`: magic at +1464,
+        // pattern-list size at +950, stored-track count at +951, track
+        // data at +1468. The parser exposes an identity order table so
+        // the standard order-flow engine walks list positions directly.
+        let h = parse_header(&make_fake_st26(b"MTN\0")).unwrap();
+        assert!(h.is_st26());
+        assert!(!h.is_ust());
+        assert!(!h.is_flt8());
+        assert_eq!(h.channels, 4);
+        assert_eq!(h.song_length, 3);
+        assert_eq!(h.variant, ModVariant::SoundTracker26 { n_tracks: 2 });
+        assert_eq!(h.signature, *b"MTN\0");
+        assert_eq!(&h.order[..4], &[0, 1, 2, 0], "identity live window");
+        assert_eq!(h.n_patterns, 3, "one logical pattern per list position");
+        assert_eq!(h.pattern_data_offset(), ST26_TRACK_DATA_OFFSET);
+        assert_eq!(h.pattern_data_size(), 2 * ST26_TRACK_BYTES);
+        assert_eq!(
+            h.sample_data_offset(),
+            ST26_TRACK_DATA_OFFSET + 2 * ST26_TRACK_BYTES,
+            "sample bodies follow the stored tracks, not n_patterns * 1024"
+        );
+        assert_eq!(
+            h.samples[0].finetune, 0,
+            "the unused ST2.6 finetune byte must be ignored"
+        );
+        assert_eq!(h.restart, 0x7F);
+    }
+
+    #[test]
+    fn st26_it10_magic_dispatches_like_mtn() {
+        // IceTracker 1.0/1.1 writes `IT10` at the same offset.
+        let h = parse_header(&make_fake_st26(b"IT10")).unwrap();
+        assert!(h.is_st26());
+        assert_eq!(h.signature, *b"IT10");
+    }
+
+    #[test]
+    fn st26_known_1080_tag_wins_over_st26_magic() {
+        // A recognised +1080 signature is the primary discriminator; a
+        // coincidental `MTN\0` inside a standard module's pattern data
+        // must not reroute the parse.
+        let mut bytes = make_fake_mod(b"M.K.", 1);
+        bytes.resize(ST26_TRACK_DATA_OFFSET, 0);
+        bytes[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4].copy_from_slice(b"MTN\0");
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.variant, ModVariant::Standard31);
+    }
+
+    #[test]
+    fn st26_truncated_needs_more() {
+        let bytes = make_fake_st26(b"MTN\0");
+        assert!(matches!(
+            parse_st26_header(&bytes[..ST26_TRACK_DATA_OFFSET - 1]),
+            Err(Error::NeedMore)
+        ));
     }
 
     #[test]
