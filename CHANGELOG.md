@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run-off + break overflow land on the restart order; fillers and
   out-of-range bytes keep the order-0 wrap; `Bxx` OOB ignores a live
   restart and still counts its diagnostic).
+- **EEx × order-flow interaction battery** (`src/player.rs`). Three
+  directed tests pin the composition of the pattern delay with the
+  jump machinery, which had no coverage: a same-row `Dxy` + `EE2`
+  parks the position through both repeat passes and then breaks
+  exactly once (the repeats skip tick-0 dispatch, so the one break
+  cannot advance the order per pass); a same-row `Bxx` + `EE1` defers
+  the position jump the same way; and an `E61` + `EE1` row defers the
+  loop rewind until the delay expires, then rewinds — with the loop
+  counter consumed once per *entered* row, not once per repeat pass,
+  so the second visit exhausts the loop and falls through after one
+  more delay. Grounded in `Protracker-effects-MODFIL12.txt` EE ("the
+  next line will be delayed … before it is executed" — with a same-row
+  transition, the "next line" IS the transition target) and
+  `FireLight-MOD-Player-Tutorial.txt` §5.30 ("not playing the note or
+  incrementing the row for x number of notes … When it is 0 the mod
+  should keep playing as if nothing had happened"). No behaviour
+  change — the deferral already fell out of the delay check running
+  before jump consumption in `next_row` — but the ordering is now
+  load-bearing and refactor-proof.
 
 - **SoundTracker 2.6 / IceTracker (`MTN\0` / `IT10`) support**
   (`src/header.rs`, `src/player.rs`, `src/container.rs`). The staged

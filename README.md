@@ -99,7 +99,7 @@ Spec-level effect coverage per
 | EAx / EBx | Fine volume slide up / down | implemented |
 | ECx | Note cut | implemented (`ECx` cuts at tick x; `EC0` cuts on tick 0 so "nothing will be heard") |
 | EDx | Note delay | implemented (`ED0` = "play at tick 0" fires immediately like an ordinary note-on; only `ED1`+ defer the trigger) |
-| EEx | Pattern delay | implemented |
+| EEx | Pattern delay | implemented (repeats suppress note retrigger + tick-0 re-fire while per-tick effects keep animating; a same-row `Bxx`/`Dxy`/`E6x` transition is deferred until the delay expires, never cancelled and never double-consumed — per MODFIL12 EE "the next line will be delayed … before it is executed" + FireLight §5.30) |
 | EFx | Invert loop ("funkrepeat") | implemented (per-tick counter from the 16-entry speed table; XORs one loop byte at a time, position wraps mod loop length, resets on new sample) |
 | 8xx | Set FINE Panning (FT extension) | implemented (raw 0..=255: $00 LEFT, $FF RIGHT; per-channel) |
 | E8x | Set ROUGH Panning (FT extension) | implemented (nibble replicated: $0 LEFT, $F RIGHT; per-channel) |

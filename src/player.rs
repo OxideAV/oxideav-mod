@@ -5743,6 +5743,121 @@ pub mod tests {
     }
 
     #[test]
+    fn pattern_delay_defers_dxy_break_and_advances_order_once() {
+        // EEx delays the row transition, it does not cancel it:
+        // `Protracker-effects-MODFIL12.txt` EE ("the next line will be
+        // delayed 24 ticks before it is executed" — with a same-row
+        // break, the "next line" IS the break destination) +
+        // `FireLight-MOD-Player-Tutorial.txt` §5.30 ("not playing the
+        // note or incrementing the row for x number of notes … When it
+        // is 0 the mod should keep playing as if nothing had
+        // happened"). And because the repeated passes skip the tick-0
+        // effect dispatch, the one D05 must advance the order exactly
+        // once, not once per pass.
+        let bytes =
+            synth_mod_multi_pattern(2, &[(0, 0, 0, fx(0xD, 0x05)), (0, 0, 1, fx(0xE, 0xE2))]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.speed, 6);
+        // Row passes at speed 6: ticks 0-5 (initial), 6-11 and 12-17
+        // (the two EE2 repeats). Mid-repeat the position must still be
+        // parked on the delayed row.
+        for _ in 0..7 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "during the EE2 repeats the break must NOT have fired yet"
+        );
+        for _ in 7..19 {
+            step_one_tick(&mut player);
+        }
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (1, 5),
+            "after the delay expires the pending break fires exactly \
+             once: next order, decoded row 5"
+        );
+    }
+
+    #[test]
+    fn pattern_delay_defers_bxx_jump_until_after_repeats() {
+        // Same deferral for a position jump: B02 + EE1 on one row holds
+        // the position for the repeat pass, then jumps — the delayed
+        // passes must neither drop the pending jump nor re-latch it.
+        let bytes =
+            synth_mod_multi_pattern(3, &[(0, 0, 0, fx(0xB, 0x02)), (0, 0, 1, fx(0xE, 0xE1))]);
+        let mut player = make_player(&bytes);
+        // Ticks 0-5 initial pass, 6-11 the EE1 repeat, tick 12 enters
+        // the destination.
+        for _ in 0..7 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "during the EE1 repeat the jump must NOT have fired yet"
+        );
+        for _ in 7..13 {
+            step_one_tick(&mut player);
+        }
+        assert!(!player.ended);
+        assert_eq!(
+            (player.order_index, player.row),
+            (2, 0),
+            "after the delay expires the Bxx fires: order 2, row 0"
+        );
+    }
+
+    #[test]
+    fn pattern_delay_composes_with_same_row_e6x_loop() {
+        // E60 on row 0; row 1 carries E61 (ch0) + EE1 (ch1). The delay
+        // repeats row 1, then the loop rewind fires (EEx defers, never
+        // cancels — §5.30's "keep playing as if nothing had happened");
+        // the second visit of row 1 re-enters tick-0 dispatch, so the
+        // E61 decrements its counter to exhaustion and the EE1 delays
+        // once more before falling through to row 2. Per-pass loop
+        // decrements would instead exhaust the counter during the
+        // repeats and never rewind.
+        let bytes = synth_mod_with_pattern(&[
+            (0, 0, fx(0xE, 0x60)),
+            (1, 0, fx(0xE, 0x61)),
+            (1, 1, fx(0xE, 0xE1)),
+        ]);
+        let mut player = make_player(&bytes);
+        // Timeline at speed 6: row 0 ticks 0-5; row 1 first pass 6-11,
+        // EE1 repeat 12-17; tick 18 consumes the E6 rewind -> row 0.
+        for _ in 0..13 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            player.row, 1,
+            "the EE1 repeat parks the position on the loop row"
+        );
+        for _ in 13..19 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "the pattern delay must defer, not cancel, the E6x rewind"
+        );
+        // Second lap: row 0 ticks 18-23, row 1 ticks 24-29 (counter
+        // exhausts, EE1 re-latches), repeat 30-35, tick 36 falls
+        // through to row 2.
+        for _ in 19..37 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 2),
+            "an exhausted loop with a fresh EE1 delay falls through to \
+             the next row after one more repeat"
+        );
+    }
+
+    #[test]
     fn bxx_oob_wrap_increments_diagnostic_counter() {
         // `mod-position-jump-pattern-break.md`, erratum status section:
         // wrap-to-0 is a working assumption recorded from a single
