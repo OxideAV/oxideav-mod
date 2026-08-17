@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run-off + break overflow land on the restart order; fillers and
   out-of-range bytes keep the order-0 wrap; `Bxx` OOB ignores a live
   restart and still counts its diagnostic).
+- **`restart_position` container-metadata key** (`src/container.rs`).
+  The MOD demuxer's metadata now carries the live +951 restart order
+  (via `ModHeader::restart_position()`) so metadata reporters and
+  player UIs can see where the module authored its song-end loop. The
+  key is emitted only when the byte is a real restart position — the
+  ProTracker `$7F` / SoundTracker `$78` fillers and out-of-range
+  values stay silent, so ordinary modules gain no spurious key. New
+  `container::tests` unit test covers both sides.
 - **EEx × order-flow interaction battery** (`src/player.rs`). Three
   directed tests pin the composition of the pattern delay with the
   jump machinery, which had no coverage: a same-row `Dxy` + `EE2`

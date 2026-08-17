@@ -117,6 +117,13 @@ fn build_metadata(h: &crate::header::ModHeader) -> Vec<(String, String)> {
     if !h.title.is_empty() {
         out.push(("title".into(), h.title.clone()));
     }
+    // Live +951 restart position (NoiseTracker / FastTracker lineage —
+    // see `header::ModHeader::restart_position`). Only emitted when the
+    // byte is a real restart order: the ProTracker `$7F` / SoundTracker
+    // `$78` fillers and out-of-range values carry no information.
+    if let Some(restart) = h.restart_position() {
+        out.push(("restart_position".into(), restart.to_string()));
+    }
     // Emit the same key for every sample name so CLI continuation
     // formatting collapses the run into one block under a single label.
     for s in h.samples.iter() {
@@ -452,5 +459,35 @@ impl Demuxer for XmDemuxer {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_surfaces_live_restart_position_only() {
+        use crate::player::tests::synth_mod_with_order_table_and_restart;
+        // A live +951 byte (below the song length, not a $7F/$78
+        // filler) is real information for players and metadata
+        // reporters; the filler conventions must stay silent so
+        // ordinary ProTracker-lineage modules don't grow a spurious
+        // key.
+        let live = synth_mod_with_order_table_and_restart(3, 1, &[0, 1, 2], &[]);
+        let h = crate::header::parse_header(&live).unwrap();
+        let md = build_metadata(&h);
+        assert!(
+            md.iter().any(|(k, v)| k == "restart_position" && v == "1"),
+            "a live restart byte must surface as restart_position=1"
+        );
+
+        let filler = synth_mod_with_order_table_and_restart(3, 0x7F, &[0, 1, 2], &[]);
+        let h = crate::header::parse_header(&filler).unwrap();
+        let md = build_metadata(&h);
+        assert!(
+            !md.iter().any(|(k, _)| k == "restart_position"),
+            "the $7F filler must not emit a restart_position key"
+        );
     }
 }

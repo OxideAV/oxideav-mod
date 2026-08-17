@@ -14,7 +14,9 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   The container probe delegates to the parser's tag classifier
   (`header::is_known_signature`), so probe acceptance and parse acceptance can
   never drift apart. Populates stream metadata (title, sample names, pattern /
-  channel counts) and an upper-bound duration.
+  channel counts, plus a `restart_position` key when the +951 restart byte
+  is live — see the restart-byte bullet under *Real-world MOD fidelity*)
+  and an upper-bound duration.
 - **Decoder**: parses the header, patterns, and raw signed-8-bit sample
   bodies; drives a `PlayerState` (rows → ticks, Paula periods, Protracker
   sine-table vibrato / tremolo, sample-offset, tone portamento, pattern
