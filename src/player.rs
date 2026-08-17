@@ -7078,6 +7078,58 @@ pub mod tests {
     }
 
     #[test]
+    fn ust_looped_sample_plays_only_the_loop_area() {
+        use crate::header::parse_ust_header;
+        // `Ultimate-Soundtracker-mod.txt` §"Notes on playing
+        // repeat-samples": "Unlike PT only the loop-area is played …
+        // Sample Start = Repeat Start, Sample Length = Repeat Length."
+        // Sample 1: 16-sample all-negative head, then a 16-sample
+        // all-positive loop region (repeat offset 16 BYTES, repeat
+        // length 8 words). A conforming render must never emit the
+        // head — the left channel (ch 0 is hard-left) stays
+        // non-negative from the first frame, ramping up into the
+        // positive plateau. Playing the head first (the PT rule) would
+        // instead open with a negative ramp.
+        let note = Note {
+            period: 428,
+            sample: 1,
+            effect: 0,
+            effect_param: 0,
+        };
+        let mut bytes = synth_ust_mod(&[(0, 0, note)]);
+        // Rewrite sample 1's header: repeat start 16 bytes, repeat
+        // length 8 words (= 16 samples).
+        bytes[20 + 26..20 + 28].copy_from_slice(&16u16.to_be_bytes());
+        bytes[20 + 28..20 + 30].copy_from_slice(&8u16.to_be_bytes());
+        // Rewrite the body: negative head, positive loop area.
+        let body_start = bytes.len() - 32;
+        for (i, b) in bytes[body_start..].iter_mut().enumerate() {
+            *b = if i < 16 { (-100i8) as u8 } else { 100i8 as u8 };
+        }
+        let header = parse_ust_header(&bytes).unwrap();
+        let samples = extract_samples(&header, &bytes);
+        assert_eq!(
+            samples[0].pcm.len(),
+            16,
+            "extraction must trim the looped UST body to the loop area"
+        );
+        let patterns = parse_patterns(&header, &bytes);
+        let mut player = PlayerState::new(&header, samples, patterns, 44_100);
+        let mut buf = vec![0i16; 2048];
+        let written = player.render(&mut buf);
+        assert!(written > 0);
+        let left: Vec<i16> = buf[..written * 2].iter().step_by(2).copied().collect();
+        assert!(
+            left.iter().all(|&s| s >= 0),
+            "the discarded pre-loop head (all-negative) must never be heard"
+        );
+        assert!(
+            left.iter().any(|&s| s > 1000),
+            "the positive loop area must reach the output plateau"
+        );
+    }
+
+    #[test]
     fn ust_pitchbend_drives_period_slide() {
         use crate::header::parse_ust_header;
         // Row 0: note + sample. Row 1: UST 2x0 pitch-down (period rises).

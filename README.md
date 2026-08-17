@@ -221,6 +221,15 @@ machinery runs unchanged:
 - **Repeat offset in bytes** — UST stores the loop start in *bytes*,
   unlike PT / NT / ST-2.5 which use word counts, so `parse_ust_header`
   passes it straight through without the ×2 word→sample scaling.
+- **Looped samples play only the loop area** — per the doc's "Notes on
+  playing repeat-samples" ("Unlike PT only the loop-area is played …
+  Hence: Sample Start = Repeat Start, Sample Length = Repeat Length.
+  UST modules often (!) sound screwed if repeat-samples are played
+  incorrectly"), `samples::extract_samples` trims a looped UST sample's
+  body to its loop region and rebases the loop to `[0, len)`, so every
+  trigger path starts at the old repeat start and the pre-loop head is
+  never emitted. One-shot UST samples and all 31-sample layouts keep
+  the PT "play start → repeat end, then loop" behaviour.
 - **No finetune** — UST has no finetune nibble (the byte at +24 is the
   high half of the volume word), so `finetune` is fixed to 0.
 - **Effect translation** — UST defines only two effects, numbered

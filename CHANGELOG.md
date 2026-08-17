@@ -90,6 +90,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **UST looped samples now play only the loop area** (`src/samples.rs`).
+  `Ultimate-Soundtracker-mod.txt` §"Notes on playing repeat-samples" is
+  explicit: "Unlike PT only the loop-area is played … Hence: Sample
+  Start = Repeat Start, Sample Length = Repeat Length. UST modules
+  often (!) sound screwed if repeat-samples are played incorrectly."
+  The extraction path previously handed UST bodies to the mixer under
+  the PT rule (play from the start to the repeat end, then loop), so a
+  looped UST sample audibly played its discarded pre-loop head on every
+  trigger. `extract_samples` now trims a looped UST sample's body to
+  its (already PCM-clamped) loop region and rebases the loop to
+  `[0, len)` — a single normalisation point that makes every trigger
+  site conform at once (note-on, note-delay fire, retrig). One-shot UST
+  samples and every 31-sample layout are untouched. Four new tests:
+  the trim + rebase, the one-shot pass-through, a 31-sample control
+  keeping the pre-loop head, and a rendered pin that a UST module with
+  an all-negative head and all-positive loop area emits no negative
+  frame at all.
+
 - **Stored-pattern count now scans the ENTIRE 128-byte order table**
   (`src/header.rs`). Three staged sources pin the loader rule — the
   `FireLight-MOD-Player-Tutorial.txt` §2.5 pseudocode ("loop 128 times …
