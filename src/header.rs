@@ -240,6 +240,60 @@ impl ModHeader {
         self.signature == *b"FLT8"
     }
 
+    /// The live song-restart order carried by the header byte at +951,
+    /// or `None` when the byte is a filler / not a restart position.
+    ///
+    /// The +951 byte is a restart position in the NoiseTracker /
+    /// FastTracker lineage and a meaningless filler everywhere else:
+    ///
+    /// - `mod-spec-eblong.txt` (+951): "This byte is set to 127, so
+    ///   that old trackers will search through all patterns when
+    ///   loading. Noisetracker uses this byte for restart, ProTracker
+    ///   doesn't."
+    /// - `Pro-Noise-Soundtracker-rev4.txt` / `Sound-Noise-Protracker-mod.txt`
+    ///   (header table): "Historically set to 127, but can be safely
+    ///   ignored. Noisetracker uses this byte to indicate restart
+    ///   position - this has been made redundant by the 'Position
+    ///   Jump' effect."
+    /// - `multimedia-cx-protracker.html` (header list): "Traditionally
+    ///   $78 in SoundTracker. Was used in NoiseTracker as a restart
+    ///   point. ProTracker uses $7F. FastTracker uses it as a restart
+    ///   point."
+    ///
+    /// Validity rules, in order:
+    ///
+    /// 1. Only the 31-sample layout carries the byte as a restart. The
+    ///    UST layout stores the song-speed BPM at the offset surfaced
+    ///    on `restart` (`Ultimate-Soundtracker-mod.txt` +471), and the
+    ///    ST2.6 layout has no restart byte at all (+951 is its stored-
+    ///    track count; the parser synthesizes the `$7F` filler).
+    /// 2. `$7F` and `$78` are the two documented non-restart filler
+    ///    conventions (quoted above) and are never treated as live
+    ///    restart points. A genuine restart at order 127 or 120 in a
+    ///    long-enough song is indistinguishable from the filler; the
+    ///    filler reading wins because it is the overwhelmingly common
+    ///    encoding and the docs pin both values as conventions.
+    /// 3. Any other value is live only when it indexes a played order,
+    ///    i.e. `restart < song_length` — the same bound the order-flow
+    ///    engine uses everywhere else (`FireLight-MOD-Player-Tutorial.txt`
+    ///    §5.14 `SONGLENGTH`).
+    ///
+    /// `Some(0)` is returned for an explicit zero byte: it is a valid
+    /// (if redundant) "restart at the top" encoding and callers can
+    /// distinguish it from `None` when reporting metadata.
+    pub fn restart_position(&self) -> Option<u8> {
+        if self.variant != ModVariant::Standard31 {
+            return None;
+        }
+        if self.restart == 0x7F || self.restart == 0x78 {
+            return None;
+        }
+        if self.restart >= self.song_length {
+            return None;
+        }
+        Some(self.restart)
+    }
+
     /// Size of the pattern data region in bytes.
     ///
     /// The formula also holds for the paired `FLT8` layout: each
@@ -698,6 +752,78 @@ mod tests {
             "the unused ST2.6 finetune byte must be ignored"
         );
         assert_eq!(h.restart, 0x7F);
+    }
+
+    #[test]
+    fn restart_position_live_value_range_rule_and_pt_filler() {
+        // `mod-spec-eblong.txt` +951: "This byte is set to 127 …
+        // Noisetracker uses this byte for restart, ProTracker doesn't."
+        let mut h = parse_header(&make_fake_mod(b"M.K.", 4)).unwrap();
+        assert_eq!(h.restart, 0x7F);
+        assert_eq!(
+            h.restart_position(),
+            None,
+            "$7F is the ProTracker filler, never a restart"
+        );
+        h.restart = 0x02;
+        assert_eq!(
+            h.restart_position(),
+            Some(2),
+            "a value below the song length is a live restart order"
+        );
+        h.restart = 0x00;
+        assert_eq!(
+            h.restart_position(),
+            Some(0),
+            "an explicit zero byte is a valid restart-at-the-top encoding"
+        );
+        h.restart = 4;
+        assert_eq!(
+            h.restart_position(),
+            None,
+            "at/past the song length is not a played order (§5.14 bound)"
+        );
+    }
+
+    #[test]
+    fn restart_position_fillers_beat_the_range_rule() {
+        // 121 orders puts the SoundTracker-tradition $78 = 120 filler
+        // (`multimedia-cx-protracker.html`: "Traditionally $78 in
+        // SoundTracker") INSIDE the played range — the documented
+        // filler reading must still win over the range rule, for both
+        // conventional values.
+        let mut h = parse_header(&make_fake_mod(b"M.K.", 121)).unwrap();
+        for filler in [0x78u8, 0x7F] {
+            h.restart = filler;
+            assert_eq!(
+                h.restart_position(),
+                None,
+                "filler {filler:#04x} must never be read as a restart"
+            );
+        }
+        h.restart = 0x77;
+        assert_eq!(
+            h.restart_position(),
+            Some(0x77),
+            "a non-filler value inside the played range stays live"
+        );
+    }
+
+    #[test]
+    fn restart_position_non_standard_variants_are_never_restarts() {
+        // UST surfaces the +471 song-speed BPM byte on `restart`
+        // (`Ultimate-Soundtracker-mod.txt` — a timer value, not an
+        // order), and ST2.6 has no restart byte at all (+951 is its
+        // stored-track count; the parser synthesizes the $7F filler).
+        let mut ust = parse_ust_header(&make_fake_ust(4)).unwrap();
+        ust.restart = 0x02; // would be "live" under the Standard31 rules
+        assert_eq!(
+            ust.restart_position(),
+            None,
+            "the UST byte is a BPM, never a restart order"
+        );
+        let st26 = parse_header(&make_fake_st26(b"MTN\0")).unwrap();
+        assert_eq!(st26.restart_position(), None);
     }
 
     #[test]

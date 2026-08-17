@@ -371,6 +371,22 @@ a unit test in `src/player.rs`):
   `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` B:Position-Jump
   ("If you do Bxx where xx is order_num or more, then it simply jumps to
   order 0. And yes, I have tested this in ProTracker.").
+- **Restart byte (offset 951) steers the song-end wrap** — the header
+  byte at +951 is a song-restart position in the NoiseTracker /
+  FastTracker lineage and a filler everywhere else (`mod-spec-eblong.txt`
+  +951 "Noisetracker uses this byte for restart, ProTracker doesn't";
+  `Pro-Noise-Soundtracker-rev4.txt` header table; `multimedia-cx-
+  protracker.html` header list "Traditionally $78 in SoundTracker …
+  ProTracker uses $7F. FastTracker uses it as a restart point").
+  `header::ModHeader::restart_position()` exposes the typed reading —
+  `None` for the `$7F`/`$78` filler conventions, for values at/past the
+  song length, and for the UST (+471 is a BPM) and ST2.6 (no such byte)
+  layouts; `Some(order)` otherwise — and the player wraps the natural
+  run-off and the `Dxy`-overflow paths to that order instead of order 0
+  when it is live. The song-over `ended` flag still rises on every wrap,
+  and the out-of-range-`Bxx` path is untouched (its order-0 wrap is the
+  erratum's working assumption, pinned independently of the restart
+  byte).
 - **Startrekker `FLT8` paired patterns** — `FLT8` files keep the plain
   4-channel 0x400-byte pattern layout on disk and pair two consecutive
   stored patterns into one logical 8-channel pattern: stored `2k`

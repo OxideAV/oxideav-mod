@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Restart byte (+951) honoured on the song-end wrap**
+  (`src/header.rs`, `src/player.rs`). The header byte at offset 951 is
+  a song-restart position in the NoiseTracker / FastTracker lineage
+  and a filler everywhere else — `mod-spec-eblong.txt` +951
+  ("Noisetracker uses this byte for restart, ProTracker doesn't"),
+  `Pro-Noise-Soundtracker-rev4.txt` / `Sound-Noise-Protracker-mod.txt`
+  header table ("Historically set to 127 … Noisetracker uses this byte
+  to indicate restart position"), `multimedia-cx-protracker.html`
+  header list ("Traditionally $78 in SoundTracker … ProTracker uses
+  $7F. FastTracker uses it as a restart point"). New typed accessor
+  `ModHeader::restart_position()` returns the live restart order or
+  `None` for the `$7F` / `$78` filler conventions, values at/past the
+  song length (the §5.14 bound), and the UST / ST2.6 layouts (whose
+  byte at that surface is a BPM / absent). The player's natural
+  run-off and `Dxy`-overflow wraps now land on
+  `PlayerState::restart_order` (the accessor's value, 0 when `None`)
+  instead of a hardcoded order 0, so a caller that clears `ended` to
+  keep looping resumes where the module authored its loop. The
+  out-of-range-`Bxx` wrap stays pinned to order 0 — the erratum in
+  `docs/audio/trackers/mod/mod-position-jump-pattern-break.md` records
+  that working assumption from ProTracker-replayer evidence, where the
+  +951 byte is a filler by definition. Seven new tests pin the
+  accessor (filler / range / variant rules, including the $78-inside-
+  range carve-out on a 121-order song) and the player wraps (natural
+  run-off + break overflow land on the restart order; fillers and
+  out-of-range bytes keep the order-0 wrap; `Bxx` OOB ignores a live
+  restart and still counts its diagnostic).
+
 - **SoundTracker 2.6 / IceTracker (`MTN\0` / `IT10`) support**
   (`src/header.rs`, `src/player.rs`, `src/container.rs`). The staged
   `docs/audio/trackers/mod/Soundtracker-v2.6-IceTracker-st26.txt`

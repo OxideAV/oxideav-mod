@@ -841,6 +841,21 @@ pub struct PlayerState {
     /// callers that want to surface the divergence.
     pub oob_position_jumps: u32,
 
+    /// Order the position wraps to when the song runs off the end of
+    /// its order list (naturally or via a `Dxy` break past the last
+    /// order). `0` for the ProTracker `$7F` / SoundTracker `$78`
+    /// filler conventions; the header's +951 restart position when it
+    /// is live (`header::ModHeader::restart_position` — the
+    /// NoiseTracker / FastTracker restart-point reading of the byte,
+    /// `mod-spec-eblong.txt` +951 / `Pro-Noise-Soundtracker-rev4.txt`
+    /// header table / `multimedia-cx-protracker.html` header list).
+    /// An out-of-range `Bxx` does NOT use this: the erratum in
+    /// `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`
+    /// pins that wrap to order 0 as the working assumption, and its
+    /// evidence is specifically about the ProTracker replayer, where
+    /// the restart byte is a filler by definition.
+    pub restart_order: u8,
+
     /// Per-pattern loop state for E6x. Four channels each track their own
     /// start row + remaining count independently (per spec).
     loop_rows: Vec<u8>,
@@ -967,6 +982,7 @@ impl PlayerState {
             ended: false,
             pending_jump: None,
             oob_position_jumps: 0,
+            restart_order: header.restart_position().unwrap_or(0),
             loop_rows: vec![0; n_ch],
             loop_counts: vec![0; n_ch],
             pattern_delay: 0,
@@ -1617,18 +1633,23 @@ impl PlayerState {
                     self.order_index = order;
                 }
             } else {
-                // Dxy pattern break past the last order wraps to order 0,
-                // exactly as the `FireLight-MOD-Player-Tutorial.txt` §5.14
-                // pseudocode pins it: "if (ORDER >= SONGLENGTH) ORDER = 0".
-                // The `ended` flag is still raised — it is this crate's
-                // song-over signal and the render loops break on it — but the
-                // position itself conforms, so a caller that clears `ended`
-                // to keep looping resumes at the documented restart point
-                // (order 0) rather than indexing the order-table residue
-                // past the song length.
+                // Dxy pattern break past the last order wraps, exactly as
+                // the `FireLight-MOD-Player-Tutorial.txt` §5.14 pseudocode
+                // pins it: "if (ORDER >= SONGLENGTH) ORDER = 0" — with the
+                // wrap target refined by the header's +951 restart byte
+                // (`restart_order`): 0 under the ProTracker `$7F` /
+                // SoundTracker `$78` filler conventions (i.e. §5.14
+                // verbatim), the NoiseTracker / FastTracker restart
+                // position when the byte is live (see
+                // `header::ModHeader::restart_position`). The `ended` flag
+                // is still raised — it is this crate's song-over signal and
+                // the render loops break on it — but the position itself
+                // conforms, so a caller that clears `ended` to keep looping
+                // resumes at the documented restart point rather than
+                // indexing the order-table residue past the song length.
                 self.order_index = self.order_index.saturating_add(1);
                 if self.order_index >= self.song_length {
-                    self.order_index = 0;
+                    self.order_index = self.restart_order;
                     self.ended = true;
                     wrapped = true;
                 }
@@ -1641,10 +1662,11 @@ impl PlayerState {
                 // Natural run-off the end of the order list: same overflow
                 // handling as the Dxy path above (a bare pattern-break IS
                 // "jump to the next song-position", `mod-spec-eblong.txt`
-                // Cmd D) — wrap to order 0, raise the song-over flag.
+                // Cmd D) — wrap to `restart_order` (0 unless the +951
+                // restart byte is live), raise the song-over flag.
                 self.order_index = self.order_index.saturating_add(1);
                 if self.order_index >= self.song_length {
-                    self.order_index = 0;
+                    self.order_index = self.restart_order;
                     self.ended = true;
                     wrapped = true;
                 }
@@ -2796,6 +2818,21 @@ pub mod tests {
         order_table: &[u8],
         cells: &[(usize, usize, usize, Note)],
     ) -> Vec<u8> {
+        // 0x7F is the ProTracker filler convention for the +951 byte
+        // (`mod-spec-eblong.txt`), i.e. "no live restart position".
+        synth_mod_with_order_table_and_restart(song_length, 0x7F, order_table, cells)
+    }
+
+    /// Like [`synth_mod_with_order_table`], but with an explicit value
+    /// for the +951 restart byte — the NoiseTracker / FastTracker
+    /// restart-position reading covered by
+    /// `header::ModHeader::restart_position`.
+    pub fn synth_mod_with_order_table_and_restart(
+        song_length: u8,
+        restart: u8,
+        order_table: &[u8],
+        cells: &[(usize, usize, usize, Note)],
+    ) -> Vec<u8> {
         assert!(order_table.len() <= 128);
         assert!((1..=order_table.len()).contains(&(song_length as usize)));
         let n_patterns = order_table.iter().copied().max().unwrap_or(0) as usize + 1;
@@ -2810,7 +2847,7 @@ pub mod tests {
         out[20 + 26..20 + 28].copy_from_slice(&0u16.to_be_bytes());
         out[20 + 28..20 + 30].copy_from_slice(&16u16.to_be_bytes());
         out[950] = song_length;
-        out[951] = 0x7F;
+        out[951] = restart;
         out[952..952 + order_table.len()].copy_from_slice(order_table);
         out[1080..1084].copy_from_slice(b"M.K.");
 
@@ -5605,6 +5642,104 @@ pub mod tests {
             "natural run-off must leave the position at the documented \
              restart point (order 0, row 0)"
         );
+    }
+
+    #[test]
+    fn natural_runoff_wraps_to_live_restart_position() {
+        // The +951 header byte is a restart position in the
+        // NoiseTracker / FastTracker lineage ("Noisetracker uses this
+        // byte for restart, ProTracker doesn't" — `mod-spec-eblong.txt`
+        // +951; "FastTracker uses it as a restart point" —
+        // `multimedia-cx-protracker.html` header list). With a live
+        // value (here 1, < song length and not a $7F/$78 filler), the
+        // natural run-off wraps the position to THAT order instead of
+        // order 0. The song-over flag still rises — the crate's
+        // signal is unchanged; only the resume point moves.
+        let bytes = synth_mod_with_order_table_and_restart(3, 1, &[0, 1, 2], &[]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.restart_order, 1, "live +951 byte must be honoured");
+        // Three 64-row patterns at speed 6, plus one tick to consume
+        // the final advance.
+        for _ in 0..(3 * 64 * 6 + 1) {
+            step_one_tick(&mut player);
+        }
+        assert!(player.ended, "run-off past the last order is song-over");
+        assert_eq!(
+            (player.order_index, player.row),
+            (1, 0),
+            "run-off must wrap to the header's restart position, not \
+             order 0, when the +951 byte is live"
+        );
+    }
+
+    #[test]
+    fn dxy_break_past_last_order_wraps_to_live_restart_position() {
+        // The Dxy overflow path shares the run-off wrap (`FireLight-MOD-
+        // Player-Tutorial.txt` §5.14), so a live restart byte moves its
+        // wrap target too — while the decoded break row still applies
+        // at the destination.
+        let bytes = synth_mod_with_order_table_and_restart(
+            2,
+            1,
+            &[0, 1],
+            &[(0, 0, 0, fx(0xD, 0x00)), (1, 0, 0, fx(0xD, 0x05))],
+        );
+        let mut player = make_player(&bytes);
+        // Row 0 of order 0 breaks to order 1 row 0; its row 0 breaks
+        // past the last order.
+        step_rows_and_enter_next(&mut player, 2);
+        assert!(player.ended, "wrapping past the last order is song-over");
+        assert_eq!(
+            (player.order_index, player.row),
+            (1, 5),
+            "the overflow break must land on the restart order with the \
+             decoded break row"
+        );
+    }
+
+    #[test]
+    fn restart_byte_fillers_and_out_of_range_values_wrap_to_order_zero() {
+        // $7F is the ProTracker filler and $78 the SoundTracker
+        // tradition (`mod-spec-eblong.txt` +951 / `Pro-Noise-
+        // Soundtracker-rev4.txt` header table / `multimedia-cx-
+        // protracker.html` header list) — neither is a live restart
+        // even when it would index a played order. Anything at or past
+        // the song length is not a played order and is ignored too.
+        // 121 orders puts $78 = 120 inside the played range, isolating
+        // the sentinel carve-out from the range rule.
+        let table = [0u8; 121];
+        for (restart, expect) in [(0x7Fu8, 0u8), (0x78, 0), (121, 0), (0x77, 0x77)] {
+            let bytes = synth_mod_with_order_table_and_restart(121, restart, &table, &[]);
+            let player = make_player(&bytes);
+            assert_eq!(
+                player.restart_order, expect,
+                "restart byte {restart:#04x} must resolve to wrap target {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn bxx_oob_wraps_to_order_zero_even_with_live_restart() {
+        // The erratum working assumption
+        // (`mod-position-jump-pattern-break.md`, "Bxx naming an order
+        // past the end") pins the out-of-range Bxx wrap to ORDER 0 —
+        // its evidence is about the ProTracker replayer, where the
+        // +951 byte is a filler by definition. A live restart byte
+        // must therefore move only the run-off/overflow wrap, never
+        // the Bxx divergence path, and the diagnostic still counts.
+        let bytes =
+            synth_mod_with_order_table_and_restart(3, 1, &[0, 1, 2], &[(0, 0, 0, fx(0xB, 0x05))]);
+        let mut player = make_player(&bytes);
+        assert_eq!(player.restart_order, 1);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended, "an out-of-range Bxx wraps, never ends");
+        assert_eq!(
+            (player.order_index, player.row),
+            (0, 0),
+            "the out-of-range Bxx wrap target stays order 0 (erratum \
+             working assumption), independent of the restart byte"
+        );
+        assert_eq!(player.oob_position_jumps, 1);
     }
 
     #[test]
