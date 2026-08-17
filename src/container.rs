@@ -118,7 +118,7 @@ fn build_metadata(h: &crate::header::ModHeader) -> Vec<(String, String)> {
         out.push(("title".into(), h.title.clone()));
     }
     // Emit the same key for every sample name so CLI continuation
-    // formatting collapses them into one block (matching ffprobe).
+    // formatting collapses the run into one block under a single label.
     for s in h.samples.iter() {
         if !s.name.is_empty() {
             out.push(("sample".into(), s.name.clone()));
