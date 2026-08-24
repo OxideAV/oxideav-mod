@@ -3381,4 +3381,87 @@ pub mod tests {
         let r = tick_envelope(&env, tick, seg, true, 64);
         assert_eq!(r.value, 64);
     }
+    // ------------- multi-sample instrument routing (round 451) -------------
+
+    /// Second sample with a distinct default volume / relative note so
+    /// routing is observable on the channel state.
+    fn push_second_sample(st: &mut XmPlayerState) {
+        let s2 = crate::xm::XmSampleHeader {
+            name: String::new(),
+            length: 0,
+            loop_start: 0,
+            loop_length: 0,
+            volume: 32,
+            finetune: 0,
+            type_byte: 0,
+            panning: 128,
+            relative_note: 12, // +1 octave
+            loop_mode: XmSampleLoopMode::None,
+            is_16_bit: false,
+            pcm16: Vec::new(),
+            pcm8: vec![0; 256],
+        };
+        st.instruments[0].samples.push(s2);
+        st.instruments[0].num_samples = 2;
+    }
+
+    #[test]
+    fn sample_map_routes_notes_to_distinct_samples() {
+        // `FastTracker-2-v2.04-xm.txt` +33: "Sample number for all
+        // notes" — a 96-entry per-note routing table. Notes mapped to
+        // different samples must land on those samples' headers
+        // (observable via the per-sample default volume + the
+        // relative-note pitch shift).
+        let mut st = make_multi_row_xm_state(vec![
+            (40, 0x00, 0x00), // row 0: low note → sample 0
+            (60, 0x00, 0x00), // row 1: high note → sample 1
+            (0, 0x00, 0x00),
+        ]);
+        push_second_sample(&mut st);
+        // Route notes 49.. (map index 48..) to sample 1.
+        for i in 48..96 {
+            st.instruments[0].sample_map[i] = 1;
+        }
+        st.advance_tick(); // row 0 tick 0
+        assert_eq!(st.channels[0].sample_in_instr, 0);
+        assert_eq!(st.channels[0].volume, 64, "sample 0 default volume");
+        let low_period = st.channels[0].period;
+        // walk the rest of row 0, entering row 1
+        st.tick += 1;
+        st.advance_tick();
+        st.tick += 1;
+        st.advance_tick();
+        st.tick = 0;
+        st.next_row();
+        st.advance_tick(); // row 1 tick 0
+        assert_eq!(
+            st.channels[0].sample_in_instr, 1,
+            "note 60 routes to sample 1"
+        );
+        assert_eq!(st.channels[0].volume, 32, "sample 1 default volume");
+        let high_period = st.channels[0].period;
+        // Note 60 on a +12 relative-note sample = real note 71 vs real
+        // note 40: the period must be far lower (higher pitch) than a
+        // plain 20-semitone gap — just assert the direction.
+        assert!(
+            high_period < low_period,
+            "sample 1's +12 relative note must raise the pitch (lower period)"
+        );
+    }
+
+    #[test]
+    fn sample_map_out_of_range_entry_clamps_to_last_sample() {
+        // Robustness pin: a map entry naming a sample the instrument
+        // does not have clamps to the last real sample instead of
+        // dropping the note or indexing out of bounds.
+        let mut st = make_multi_row_xm_state(vec![(49, 0x00, 0x00), (0, 0x00, 0x00)]);
+        push_second_sample(&mut st);
+        st.instruments[0].sample_map[48] = 200; // nonsense entry
+        st.advance_tick(); // row 0 tick 0
+        assert_eq!(
+            st.channels[0].sample_in_instr, 1,
+            "out-of-range map entry clamps to the last sample"
+        );
+        assert!(st.channels[0].voice.active, "the note still plays");
+    }
 }

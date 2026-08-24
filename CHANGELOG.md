@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-sample keymap routing + STM song-file coverage**
+  (`src/xm_player.rs`, `src/stm.rs`). Directed tests now pin the
+  96-entry "Sample number for all notes" table routing notes to
+  distinct samples (observable via per-sample default volume and the
+  relative-note pitch shift), the clamp of a nonsense map entry to
+  the last real sample, and the STM file-type-1 "song (contains no
+  samples)" pipeline parsing + rendering silence end-to-end.
 - **STM + XM reference-compare conformance gates**
   (`tests/stm_xm_reference_compare.rs`). The black-box side-by-side
   harness that has long covered MOD now extends to the other two

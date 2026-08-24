@@ -592,4 +592,27 @@ mod tests {
         let samples = extract_samples(&h, &bytes);
         assert_eq!(samples[0].pcm.len(), 2);
     }
+    #[test]
+    fn song_file_type_parses_and_renders_without_samples() {
+        // File type 1 = "song (contains no samples)" per the staged
+        // layout doc (offset 0x1D). The instrument records keep their
+        // metadata but no PCM bodies follow the pattern data — the
+        // whole pipeline must parse, extract empty bodies, and render
+        // silence rather than erroring or panicking.
+        let mut bytes = build_minimal_stm(1);
+        bytes[0x1D] = 1; // song
+                         // Drop the sample bodies: a song file ends after the patterns.
+        bytes.truncate(PATTERN_DATA_OFFSET + BYTES_PER_PATTERN);
+        assert!(is_stm(&bytes), "type-1 song files are valid STM");
+        let h = parse_header(&bytes).unwrap();
+        assert_eq!(h.file_type, StmFileType::Song);
+        let patterns = parse_patterns(&h, &bytes);
+        let samples = extract_samples(&h, &bytes);
+        assert!(samples.iter().all(|s| s.pcm.is_empty()));
+        let mut player = crate::stm_player::StmPlayerState::new(&h, samples, patterns, 44_100);
+        let mut buf = vec![0i16; 2048 * 2];
+        let produced = player.render(&mut buf);
+        assert_eq!(produced, 2048);
+        assert!(buf.iter().all(|&s| s == 0), "no samples => silence");
+    }
 }
