@@ -121,6 +121,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `E90` retrig honours the same section's carve-out ("it resets it
   whenever a retrig occurs, *except* on tick 0") and preserves the
   counter. Five directed tests in `xm_player::tests` pin the matrix.
+- **XM volume-column values survive the note trigger and yield to
+  standard effects** (`src/xm_player.rs`). Per
+  `FastTracker-2-v2.04-xm.txt` "The volume column is interpreted
+  before the standard effects", but a note+instrument cell's trigger
+  loads the sample's default volume/panning — and our row-entry ran
+  the volume column BEFORE the trigger, so the default clobbered a
+  same-cell vol-col `SetVolume`/`SetPanning`/fine-slide. The pipeline
+  now runs default-load → volume-column value writes → standard
+  effects; parameter-memory latches (vol-slide, vibrato speed/depth,
+  vol-col tone-porta speed) stay in the pre-trigger pass. Directed
+  tests pin `Cxx` overriding the vol-col and the vol-col overriding
+  the sample default.
 - **XM parser ignores the stored `sample_header_size` dword**
   (`src/xm.rs`). Sample headers now stride at the fixed on-disk 40
   bytes; the dword is surfaced on `XmInstrument::sample_header_size`

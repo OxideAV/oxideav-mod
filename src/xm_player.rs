@@ -529,34 +529,28 @@ impl XmPlayerState {
                 }
             }
 
-            // Volume-column handling. The FT2 spec says volume-column
-            // effects are processed *before* standard effects and may be
-            // overridden by them.
+            // Volume-column handling, part 1: parameter-memory latches.
+            // The value-writing arms (SetVolume / SetPanning / fine
+            // slides) are applied AFTER the note-trigger block below —
+            // a note+instrument cell loads the sample's default volume
+            // and panning at trigger, and the volume column must land
+            // on top of that default, while still running BEFORE the
+            // standard effects per FastTracker-2-v2.04-xm.txt ("The
+            // volume column is interpreted before the standard
+            // effects, so some standard effects may override volume
+            // column effects").
             match cell.volume_kind() {
                 XmVolume::Empty => {}
-                XmVolume::SetVolume(v) => {
-                    ch.volume = v.min(64);
-                    ch.base_volume = ch.volume;
-                }
-                XmVolume::SetPanning(p) => {
-                    // Volume-column panning: 0xC0..=0xCF, displayed as
-                    // 0..=15, maps to 0..=0xFF (see FT2 volume-column
-                    // table).
-                    ch.base_panning = (p as u16 * 17).min(255) as u8;
+                XmVolume::SetVolume(_)
+                | XmVolume::SetPanning(_)
+                | XmVolume::FineVolumeSlideUp(_)
+                | XmVolume::FineVolumeSlideDown(_) => {
+                    // Applied post-trigger; see part 2 below.
                 }
                 XmVolume::VolumeSlideUp(p) | XmVolume::VolumeSlideDown(p) => {
                     if p != 0 {
                         ch.vol_slide_col_mem = p;
                     }
-                }
-                XmVolume::FineVolumeSlideUp(p) => {
-                    // Fine slides apply once, on tick 0.
-                    ch.volume = (ch.volume as u16 + p as u16).min(64) as u8;
-                    ch.base_volume = ch.volume;
-                }
-                XmVolume::FineVolumeSlideDown(p) => {
-                    ch.volume = ch.volume.saturating_sub(p);
-                    ch.base_volume = ch.volume;
                 }
                 XmVolume::SetVibratoSpeed(p) => {
                     if p != 0 {
@@ -793,6 +787,35 @@ impl XmPlayerState {
                 if !has_vol_env {
                     ch.voice.active = false;
                 }
+            }
+
+            // Volume-column handling, part 2: value writes. These land
+            // after the trigger's sample-default load (so a vol-col
+            // SetVolume on a note+instrument cell survives) and before
+            // `apply_tick0_effect` (so standard effects like Cxx still
+            // override them, per the v2.04 ordering sentence quoted in
+            // part 1).
+            match cell.volume_kind() {
+                XmVolume::SetVolume(v) => {
+                    ch.volume = v.min(64);
+                    ch.base_volume = ch.volume;
+                }
+                XmVolume::SetPanning(p) => {
+                    // Volume-column panning: 0xC0..=0xCF, displayed as
+                    // 0..=15, maps to 0..=0xFF (see FT2 volume-column
+                    // table).
+                    ch.base_panning = (p as u16 * 17).min(255) as u8;
+                }
+                XmVolume::FineVolumeSlideUp(p) => {
+                    // Fine slides apply once, on tick 0.
+                    ch.volume = (ch.volume as u16 + p as u16).min(64) as u8;
+                    ch.base_volume = ch.volume;
+                }
+                XmVolume::FineVolumeSlideDown(p) => {
+                    ch.volume = ch.volume.saturating_sub(p);
+                    ch.base_volume = ch.volume;
+                }
+                _ => {}
             }
 
             apply_tick0_effect(ch);
@@ -3267,5 +3290,28 @@ pub mod tests {
             st.channels[0].multi_retrig_counter, 0,
             "an instrument-number row resets the Rxy counter even without a note"
         );
+    }
+    #[test]
+    fn volume_column_interpreted_before_standard_effects() {
+        // FastTracker-2-v2.04-xm.txt §"Effects in volume column": "The
+        // volume column is interpreted before the standard effects, so
+        // some standard effects may override volume column effects."
+        // A cell carrying BOTH a volume-column SetVolume(16) and a C40
+        // (set volume 64) must land on the standard effect's value.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x0C, 0x40), // note + C40
+            (0, 0x00, 0x00),
+        ]);
+        st.patterns[0].rows[0][0].volume = 0x20; // vol col: SetVolume(16)
+        st.advance_tick(); // row 0 tick 0
+        assert_eq!(
+            st.channels[0].volume, 64,
+            "standard C40 must override the volume-column SetVolume(16)"
+        );
+        // Converse: with no standard effect, the volume column sticks.
+        let mut st2 = make_multi_row_xm_state(vec![(49, 0x00, 0x00), (0, 0x00, 0x00)]);
+        st2.patterns[0].rows[0][0].volume = 0x20;
+        st2.advance_tick();
+        assert_eq!(st2.channels[0].volume, 16);
     }
 }

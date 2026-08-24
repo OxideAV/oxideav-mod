@@ -549,6 +549,15 @@ items are all closed:
   note number 97" per `multimedia-cx-fasttracker-2.html`) now silences a
   voice on an envelope-less instrument immediately, exactly like a
   note-97 cell, instead of only releasing the key.
+- **Volume-column ordering is pinned to the v2.04 sentence** —
+  `FastTracker-2-v2.04-xm.txt`: "The volume column is interpreted
+  before the standard effects, so some standard effects may override
+  volume column effects." The row-entry pipeline now runs
+  instrument-default load → volume-column value writes → standard
+  effects, so a vol-col `SetVolume` on a note+instrument cell survives
+  the trigger's sample-default load (previously the default clobbered
+  it) while a same-cell `Cxx` still overrides the volume column.
+  Directed tests pin both directions.
 - **Broken `sample_header_size` dwords are ignored** — the instrument
   extended header's sample-header-size field is surfaced for metadata
   fidelity but never steers the parse: sample headers stride at the
