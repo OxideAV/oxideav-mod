@@ -477,8 +477,12 @@ pub struct XmInstrument {
     /// Raw instrument-type byte (spec says "always 0").
     pub instrument_type: u8,
     pub num_samples: u16,
-    /// Sample-header size from the instrument's extended header
-    /// (typically 0x28); absent when `num_samples == 0`.
+    /// Sample-header size dword from the instrument's extended header
+    /// (typically 0x28); absent when `num_samples == 0`. Surfaced for
+    /// metadata fidelity only — the parser strides sample headers at
+    /// the fixed on-disk 40 bytes, because FT2 ignores this field and
+    /// modules in the wild carry broken values in it (per
+    /// `multimedia-cx-fasttracker-2.html` §File Format).
     pub sample_header_size: u32,
     /// `sample_map[note]` = which of this instrument's samples plays for
     /// `note` (0..=95). Only populated when `num_samples > 0`.
@@ -880,20 +884,23 @@ fn parse_one_instrument(bytes: &[u8], cur: usize) -> Result<(XmInstrument, usize
     };
 
     // Sample headers follow the instrument header block (`header_size`
-    // bytes from `cur`). Each sample header is `sample_header_size`
-    // bytes (normally 0x28). We accept a nonstandard value but require
-    // it to be at least 40 to contain the known fields.
-    if inst.sample_header_size < 40 {
-        return Err(Error::invalid(format!(
-            "XM: sample_header_size {} too small (expected >=40)",
-            inst.sample_header_size
-        )));
-    }
+    // bytes from `cur`). Each sample header occupies exactly 40 bytes
+    // on disk regardless of what the stored `sample_header_size` dword
+    // claims: per `multimedia-cx-fasttracker-2.html` §File Format,
+    // "The sample header size field is completely ignored by Fast
+    // Tracker 2 ... it's best to assume the sample header size is
+    // always 40 bytes and to not skip this data!" — modules in the
+    // wild carry completely broken values in the field, so honouring
+    // it either mis-strides every subsequent header + PCM body (value
+    // > 40) or used to reject the whole file (value < 40). The raw
+    // dword is still surfaced on `inst.sample_header_size` for
+    // metadata fidelity; it just never steers the parse.
+    const SAMPLE_HEADER_DISK_SIZE: usize = 40;
 
     let headers_start = cur + header_size as usize;
     let mut hcur = headers_start;
     for i in 0..num_samples as usize {
-        if hcur + inst.sample_header_size as usize > bytes.len() {
+        if hcur + SAMPLE_HEADER_DISK_SIZE > bytes.len() {
             return Err(Error::invalid(format!(
                 "XM: truncated sample header #{i} in instrument"
             )));
@@ -929,7 +936,7 @@ fn parse_one_instrument(bytes: &[u8], cur: usize) -> Result<(XmInstrument, usize
             pcm16: Vec::new(),
             pcm8: Vec::new(),
         });
-        hcur += inst.sample_header_size as usize;
+        hcur += SAMPLE_HEADER_DISK_SIZE;
     }
 
     inst.sample_data_offset = hcur;
@@ -1420,6 +1427,48 @@ mod tests {
         extract_sample_bodies(&mut insts, &bytes);
         let decoded = &insts[0].samples[0].pcm8;
         assert_eq!(decoded, &[1, 3, 6, 10]);
+    }
+
+    #[test]
+    fn broken_sample_header_size_dword_is_ignored_for_parsing() {
+        // `multimedia-cx-fasttracker-2.html` §File Format: "The sample
+        // header size field is completely ignored by Fast Tracker 2
+        // ... it's best to assume the sample header size is always 40
+        // bytes and to not skip this data!" — writers in the wild stamp
+        // broken values in the dword. Both broken shapes must parse to
+        // the same instrument + PCM as a well-formed file:
+        //   * a too-small value (0) used to hard-reject the file;
+        //   * a too-large value (100) used to mis-stride past the
+        //     sample header and mis-locate the PCM body.
+        for broken in [0u32, 100u32] {
+            let mut bytes = build_header(4, 0, 1, false);
+            let inst_off = {
+                let h = parse_header(&bytes).unwrap();
+                pattern_data_offset(&h)
+            };
+            let body = [1i8, 2, 3, 4];
+            let body_bytes: Vec<u8> = body.iter().map(|&b| b as u8).collect();
+            bytes.extend(build_one_sample_instrument(b"kick", &body_bytes));
+            // Stamp the broken dword over the extended header's
+            // sample_header_size field (+29 from the record start).
+            bytes[inst_off + 29..inst_off + 33].copy_from_slice(&broken.to_le_bytes());
+
+            let h = parse_header(&bytes).unwrap();
+            let mut insts = parse_instruments(&h, &bytes, inst_off)
+                .unwrap_or_else(|e| panic!("sample_header_size={broken} must parse: {e:?}"));
+            assert_eq!(insts.len(), 1);
+            // The raw dword is surfaced verbatim for metadata fidelity…
+            assert_eq!(insts[0].sample_header_size, broken);
+            // …but never steers the parse: the sample header at the
+            // fixed 40-byte stride decodes intact, and the PCM body is
+            // found exactly where a 40-byte header leaves it.
+            let smp = &insts[0].samples[0];
+            assert_eq!(smp.length, body.len() as u32);
+            assert_eq!(smp.volume, 0x40);
+            assert_eq!(smp.name, "snd");
+            extract_sample_bodies(&mut insts, &bytes);
+            assert_eq!(insts[0].samples[0].pcm8, [1, 3, 6, 10]);
+        }
     }
 
     #[test]

@@ -107,6 +107,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `E90` retrig honours the same section's carve-out ("it resets it
   whenever a retrig occurs, *except* on tick 0") and preserves the
   counter. Five directed tests in `xm_player::tests` pin the matrix.
+- **XM parser ignores the stored `sample_header_size` dword**
+  (`src/xm.rs`). Sample headers now stride at the fixed on-disk 40
+  bytes; the dword is surfaced on `XmInstrument::sample_header_size`
+  for metadata fidelity only. `multimedia-cx-fasttracker-2.html` §File
+  Format: the field "is completely ignored by Fast Tracker 2" and
+  modules in the wild (Sk@le Tracker exports are called out) carry
+  broken values — previously a value < 40 hard-rejected the whole
+  file and a value > 40 mis-strode every subsequent sample header and
+  PCM body. Regression test covers both broken shapes through PCM
+  extraction.
 
 - **UST looped samples now play only the loop area** (`src/samples.rs`).
   `Ultimate-Soundtracker-mod.txt` §"Notes on playing repeat-samples" is

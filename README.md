@@ -549,6 +549,15 @@ items are all closed:
   note number 97" per `multimedia-cx-fasttracker-2.html`) now silences a
   voice on an envelope-less instrument immediately, exactly like a
   note-97 cell, instead of only releasing the key.
+- **Broken `sample_header_size` dwords are ignored** — the instrument
+  extended header's sample-header-size field is surfaced for metadata
+  fidelity but never steers the parse: sample headers stride at the
+  fixed on-disk 40 bytes. Per `multimedia-cx-fasttracker-2.html` §File
+  Format the field "is completely ignored by Fast Tracker 2" and
+  modules in the wild carry completely broken values in it — honouring
+  it either hard-rejected the file (value < 40) or mis-located every
+  subsequent sample header and PCM body (value > 40). A regression
+  test drives both broken shapes end-to-end through PCM extraction.
 
 The instrument-level autovibrato (`vibrato_type` byte) now honours the
 type byte's waveform shape and the +4 "don't retrigger" flag, sharing
