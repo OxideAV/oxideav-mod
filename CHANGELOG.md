@@ -133,6 +133,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vol-col tone-porta speed) stay in the pre-trigger pass. Directed
   tests pin `Cxx` overriding the vol-col and the vol-col overriding
   the sample default.
+- **XM `Lxy` evaluates at the jumped-to envelope position immediately**
+  (`src/xm_player.rs`). `tick_envelope` now re-aligns its segment
+  cursor with the tick BEFORE evaluating; previously the first
+  evaluation after an `Lxy` (set envelope position) interpolated
+  inside the stale segment clamped to its right edge — an `Lxy` past
+  the final point returned the second point's value for one tick
+  instead of the last point's. Three new corner pins cover Lxy past
+  the end (hold last value, cursor clamps), inverted loop points
+  (degrade to forward walk + hold), and a sustain index past the
+  points vector (clamp to last point).
 - **XM pattern row counts are bounded to the spec's 1..=256**
   (`src/xm.rs`). Both staged spec texts bound the pattern header's
   row count; an unclamped u16 was also an allocation bomb — the

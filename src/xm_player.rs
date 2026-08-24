@@ -1903,6 +1903,17 @@ fn tick_envelope(
     let mut seg = (cur_seg as usize).min(n.saturating_sub(1));
     let mut tick = cur_tick;
 
+    // 0. Re-align the segment cursor with the tick BEFORE evaluating.
+    // An Lxy jump (set envelope position) moves `tick` arbitrarily and
+    // resets the caller's segment to 0; without this pass the very
+    // first evaluation after the jump interpolates inside the stale
+    // segment (clamped to its right edge) instead of at the jumped-to
+    // position — e.g. an Lxy past the final point returned the
+    // second point's value for one tick instead of the last point's.
+    while seg + 1 < n && tick >= env.points[seg + 1].0 {
+        seg += 1;
+    }
+
     // 1. Evaluate the current (tick, seg) pair.
     let value = eval_envelope_at(&env.points, seg, tick);
 
@@ -3313,5 +3324,61 @@ pub mod tests {
         st2.patterns[0].rows[0][0].volume = 0x20;
         st2.advance_tick();
         assert_eq!(st2.channels[0].volume, 16);
+    }
+    // ---------------- envelope corner pins (round 451) ----------------
+
+    #[test]
+    fn envelope_lxx_beyond_last_point_holds_last_value() {
+        // Lxy moves the volume-envelope cursor to `param`. A position
+        // past the last point's x must settle on the last point's
+        // value and stay there (tick_envelope's "past the last point:
+        // hold" rule) — never wrap, never panic.
+        let env = env_with_points(vec![(0, 64), (10, 32), (20, 8)], 0x01);
+        let mut tick = 200u16; // way past x=20
+        let mut seg = 0u8;
+        for _ in 0..5 {
+            let r = tick_envelope(&env, tick, seg, true, 64);
+            assert_eq!(r.value, 8, "past-the-end position holds last y");
+            tick = r.next_tick;
+            seg = r.next_seg;
+            assert!(tick <= 20, "cursor must clamp to the last point's x");
+        }
+    }
+
+    #[test]
+    fn envelope_inverted_loop_points_do_not_loop() {
+        // loop_end's tick <= loop_start's tick (a broken file) must
+        // degrade to no-loop — the guard is `loop_end_tick >
+        // loop_start_tick`. The cursor just walks forward and holds.
+        let mut env = env_with_points(vec![(0, 0), (10, 64), (20, 32)], 0x01 | 0x04);
+        env.loop_start_point = 2; // x=20
+        env.loop_end_point = 1; // x=10  (inverted)
+        let mut tick = 0u16;
+        let mut seg = 0u8;
+        for _ in 0..40 {
+            let r = tick_envelope(&env, tick, seg, true, 64);
+            tick = r.next_tick;
+            seg = r.next_seg;
+        }
+        assert_eq!(tick, 20, "inverted loop degrades to forward walk + hold");
+    }
+
+    #[test]
+    fn envelope_sustain_index_beyond_points_clamps() {
+        // A sustain index past the points vector (broken file) clamps
+        // to the last point instead of indexing out of bounds.
+        let mut env = env_with_points(vec![(0, 0), (10, 64)], 0x01 | 0x02);
+        env.sustain_point = 11; // only 2 points exist
+        let mut tick = 0u16;
+        let mut seg = 0u8;
+        for _ in 0..30 {
+            let r = tick_envelope(&env, tick, seg, true, 64);
+            tick = r.next_tick;
+            seg = r.next_seg;
+        }
+        // Clamped sustain point = last point (x=10): cursor stalls there.
+        assert_eq!(tick, 10, "clamped sustain point stalls at last point");
+        let r = tick_envelope(&env, tick, seg, true, 64);
+        assert_eq!(r.value, 64);
     }
 }
