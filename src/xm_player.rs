@@ -53,7 +53,8 @@
 //!    multiplies all voice volumes by `global_volume / 64`.
 //!  - **Panning slide (Pxy)** — per-tick base-panning slide.
 //!  - **Retrig E9x** — periodic sample-position restart every `param`
-//!    ticks (`E90` = no retrig per multimedia-cx FT2 reference).
+//!    ticks; `E90` retrigs exactly once, on tick 0 (both per the
+//!    multimedia-cx FT2 reference §2.1.15.10).
 //!  - **Multi-retrig (Rxy)** — counter-based retrig with 16 volume
 //!    modifier modes.
 //!  - **Tremor (Txy)** — duty-cycle volume gating: on for `x+1` ticks,
@@ -763,10 +764,16 @@ impl XmPlayerState {
                             ch.auto_vib_pos = 0;
                         }
                         ch.auto_vib_sweep_cnt = 0;
-                        // Multi-retrig counter resets on note trigger and
-                        // also when an instrument-only column is set —
-                        // see the cell.instrument != 0 branch above.
-                        ch.multi_retrig_counter = 0;
+                        // Multi-retrig counter: NOT reset here. Per
+                        // `multimedia-cx-fasttracker-2.html` §2.1.22 the
+                        // Rxy counter resets only (a) before the song
+                        // starts, (b) on a row whose channel carries an
+                        // INSTRUMENT number ("doesn't matter if there's a
+                        // note in the note column" — handled in the
+                        // cell.instrument != 0 branch above), and (c)
+                        // after a non-tick-0 E9x retrig. A bare note with
+                        // no instrument byte is none of those, so its
+                        // trigger leaves the counter running.
                         ch.tremor_counter = 0;
                     }
                 }
@@ -869,6 +876,28 @@ impl XmPlayerState {
                                 if ch.pat_loop_count > 0 {
                                     self.pending_pat_loop_row = Some(ch.pat_loop_row);
                                 }
+                            }
+                        }
+                        0x09 if y == 0 => {
+                            // E90 — retrig once, on tick 0. Per
+                            // `multimedia-cx-fasttracker-2.html` §2.1.15.10:
+                            // "If the parameter x is 0, this effect retrigs
+                            // the sample only once - on tick 0." On a row
+                            // with a note the tick-0 note-on already
+                            // restarts the voice, so re-seating the cursor
+                            // is a no-op there; the audible case is a bare
+                            // E90 on a row WITHOUT a note, which restarts
+                            // the playing sample from the top. The same
+                            // section's Rxy-counter note gates the reset
+                            // on the retrig happening off tick 0 ("it
+                            // resets it whenever a retrig occurs, *except*
+                            // on tick 0"), so this tick-0 retrig leaves
+                            // `multi_retrig_counter` alone.
+                            let ch = &mut self.channels[ch_idx];
+                            if ch.instrument != 0 {
+                                ch.voice.pos = 0.0;
+                                ch.voice.direction = 1;
+                                ch.voice.active = true;
                             }
                         }
                         0x0E => {
@@ -994,7 +1023,7 @@ impl XmPlayerState {
             // trigger must mirror the tick-0 note-on (`enter_row`) exactly
             // — a deferred note is still a note-on, so the same envelope /
             // fadeout reset, the same waveform no-retrigger gating, and
-            // the same retrig / tremor counter resets apply.
+            // the same tremor counter reset apply.
             if ch.note_delay_tick > 0 && cur_tick == ch.note_delay_tick {
                 let v = ch.volume as f32 / 64.0;
                 let freq = period_to_freq(table, ch.period);
@@ -1024,14 +1053,19 @@ impl XmPlayerState {
                     ch.auto_vib_pos = 0;
                 }
                 ch.auto_vib_sweep_cnt = 0;
-                ch.multi_retrig_counter = 0;
+                // The Rxy counter is NOT reset by the delayed fire: per
+                // `multimedia-cx-fasttracker-2.html` §2.1.22 the reset
+                // cases are song start / an instrument-number row / a
+                // non-tick-0 E9x retrig. The instrument-number reset for
+                // this row (if any) already ran in `enter_row`.
                 ch.tremor_counter = 0;
                 ch.note_delay_tick = 0;
             }
 
-            // E9x — Periodic retrig. param=0: no retrig (only tick 0
-            // triggers, which the row already handled). param>0: retrig
-            // sample on every (tick % param == 0) tick except tick 0.
+            // E9x — Periodic retrig, param > 0 leg: retrig the sample
+            // on every (tick % param == 0) tick except tick 0. The
+            // param == 0 leg (single retrig ON tick 0) lives in
+            // `enter_row`'s 0x0E arm.
             if ch.effect == 0x0E && (ch.effect_param >> 4) == 0x09 {
                 let p = ch.effect_param & 0x0F;
                 if p > 0 && cur_tick > 0 && (cur_tick % p) == 0 {
@@ -3106,5 +3140,132 @@ pub mod tests {
         out.extend_from_slice(&delta);
 
         out
+    }
+    #[test]
+    fn e90_without_note_retrigs_once_on_tick0() {
+        // multimedia-cx-fasttracker-2.html §2.1.15.10: "If the parameter
+        // x is 0, this effect retrigs the sample only once - on tick 0."
+        // Row 0 triggers a note; row 1 carries a bare E90 (no note, no
+        // instrument) — the playing sample must restart from the top at
+        // row 1's tick 0, and must NOT retrig again on later ticks.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x00, 0x00), // row 0: note-on
+            (0, 0x0E, 0x90),  // row 1: bare E90
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        // The helper stamps instrument=1 only on note rows, so row 1 is
+        // a true bare-effect row.
+        walk_row(&mut st); // row 0 plays; parked at row 1 tick 0 (not entered)
+                           // Simulate the voice being mid-sample when row 1 begins.
+        st.channels[0].voice.pos = 100.0;
+        st.advance_tick(); // row 1 tick 0 — E90 must fire exactly here
+        assert_eq!(
+            st.channels[0].voice.pos, 0.0,
+            "E90 must retrig (restart) the playing sample on tick 0"
+        );
+        assert!(st.channels[0].voice.active);
+        // Later ticks of the same row must NOT retrig again.
+        st.channels[0].voice.pos = 50.0;
+        st.tick += 1;
+        st.advance_tick(); // row 1 tick 1
+        assert_eq!(
+            st.channels[0].voice.pos, 50.0,
+            "E90 retrigs only once, on tick 0 — tick 1 must not rewind"
+        );
+        st.tick += 1;
+        st.advance_tick(); // row 1 tick 2
+        assert_eq!(st.channels[0].voice.pos, 50.0);
+    }
+
+    #[test]
+    fn e90_tick0_retrig_preserves_rxy_counter() {
+        // §2.1.15.10: the E9x retrig "resets [the Rxy counter] whenever
+        // a retrig occurs, *except* on tick 0". E90's single retrig IS
+        // the tick-0 one, so the counter must survive it.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x00, 0x00), // row 0: note-on
+            (0, 0x0E, 0x90),  // row 1: bare E90
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        walk_row(&mut st); // row 0 done; parked at row 1 tick 0
+        st.channels[0].multi_retrig_counter = 3;
+        st.advance_tick(); // row 1 tick 0 — E90 fires
+        assert_eq!(
+            st.channels[0].voice.pos, 0.0,
+            "sanity: the tick-0 retrig itself must still fire"
+        );
+        assert_eq!(
+            st.channels[0].multi_retrig_counter, 3,
+            "a tick-0 E9x retrig must NOT reset the Rxy counter"
+        );
+    }
+
+    #[test]
+    fn e9x_nonzero_retrig_still_resets_rxy_counter() {
+        // Counter-part to the tick-0 carve-out: a NON-tick-0 E9x retrig
+        // is one of the documented reset cases ("after the E9x effect,
+        // but only if it wasn't E90 and has retriggered the sample").
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x00, 0x00), // row 0: note-on
+            (0, 0x0E, 0x91),  // row 1: bare E91 — retrig every tick > 0
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        walk_row(&mut st); // row 0 done; parked at row 1 tick 0
+        st.channels[0].multi_retrig_counter = 3;
+        st.advance_tick(); // row 1 tick 0 — E91 does nothing on tick 0
+        assert_eq!(
+            st.channels[0].multi_retrig_counter, 3,
+            "E91 must not fire (or reset the counter) on tick 0"
+        );
+        st.tick += 1;
+        st.channels[0].voice.pos = 40.0;
+        st.advance_tick(); // row 1 tick 1 — E91 retrigs
+        assert_eq!(st.channels[0].voice.pos, 0.0, "E91 retrigs on tick 1");
+        assert_eq!(
+            st.channels[0].multi_retrig_counter, 0,
+            "a non-tick-0 E9x retrig resets the Rxy counter"
+        );
+    }
+
+    #[test]
+    fn note_without_instrument_preserves_rxy_counter() {
+        // §2.1.22 lists the Rxy counter's reset cases exhaustively:
+        // song start, an INSTRUMENT-number row ("doesn't matter if
+        // there's a note in the note column"), and a non-tick-0 E9x
+        // retrig. A bare note with NO instrument byte is none of those,
+        // so its trigger must leave the counter running.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x00, 0x00), // row 0: note-on (with instrument 1)
+            (49, 0x00, 0x00), // row 1: note — instrument stripped below
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        st.patterns[0].rows[1][0].instrument = 0;
+        walk_row(&mut st); // row 0 done; parked at row 1 tick 0
+        st.channels[0].multi_retrig_counter = 5;
+        st.advance_tick(); // row 1 tick 0 — note triggers, no instrument
+        assert!(st.channels[0].voice.active, "sanity: note still triggers");
+        assert_eq!(
+            st.channels[0].multi_retrig_counter, 5,
+            "a note WITHOUT an instrument byte must not reset the Rxy counter"
+        );
+    }
+
+    #[test]
+    fn instrument_row_resets_rxy_counter() {
+        // The positive side of the same rule: a row carrying an
+        // instrument number resets the counter, note or no note.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x00, 0x00), // row 0: note-on (instrument 1)
+            (0, 0x00, 0x00),  // row 1: instrument-only — stamped below
+            (0, 0x00, 0x00),  // row 2: settle
+        ]);
+        st.patterns[0].rows[1][0].instrument = 1;
+        walk_row(&mut st); // row 0 done; parked at row 1 tick 0
+        st.channels[0].multi_retrig_counter = 5;
+        st.advance_tick(); // row 1 tick 0 — instrument column, no note
+        assert_eq!(
+            st.channels[0].multi_retrig_counter, 0,
+            "an instrument-number row resets the Rxy counter even without a note"
+        );
     }
 }

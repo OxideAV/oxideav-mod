@@ -90,6 +90,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **XM `E90` now retrigs the sample once, on tick 0** (`src/xm_player.rs`).
+  `multimedia-cx-fasttracker-2.html` §2.1.15.10: "If the parameter x is
+  0, this effect retrigs the sample only once - on tick 0." A bare `E90`
+  on a row without a note previously did nothing; it now restarts the
+  playing sample from the top at tick 0 (on a row with a note the tick-0
+  note-on already restarts the voice, so that case is unchanged). The
+  non-zero leg keeps its except-tick-0 cadence.
+- **XM `Rxy` counter reset scope narrowed to the documented three cases**
+  (`src/xm_player.rs`). §2.1.22 lists the multi-retrig counter's resets
+  exhaustively: song start, a row whose channel carries an instrument
+  number (with or without a note), and a non-tick-0 `E9x` retrig. The
+  player previously also reset the counter on every note trigger and on
+  the `EDx` delayed fire; both extra resets are removed, so a bare note
+  with no instrument byte now leaves the counter running. The tick-0
+  `E90` retrig honours the same section's carve-out ("it resets it
+  whenever a retrig occurs, *except* on tick 0") and preserves the
+  counter. Five directed tests in `xm_player::tests` pin the matrix.
+
 - **UST looped samples now play only the loop area** (`src/samples.rs`).
   `Ultimate-Soundtracker-mod.txt` §"Notes on playing repeat-samples" is
   explicit: "Unlike PT only the loop-area is played … Hence: Sample

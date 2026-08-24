@@ -520,9 +520,31 @@ items are all closed:
 - **Note-delay (`EDx`) trigger consistency** — a deferred note is still a
   note-on, so the delayed fire now applies the same vibrato / tremolo /
   autovibrato phase resets as a tick-0 trigger, gated on the waveform
-  "don't retrigger" flag (bit 2), and resets the `Rxy` / `Txy` counters
+  "don't retrigger" flag (bit 2), and resets the `Txy` tremor counter
   and autovibrato sweep counter. Previously the delayed fire reset the
-  LFO phases unconditionally and skipped the counter resets.
+  LFO phases unconditionally and skipped the counter resets. (The `Rxy`
+  counter is *not* reset by the fire itself — see the retrig-counter
+  bullet below.)
+- **`E90` retrigs exactly once, on tick 0** — per
+  `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.15.10
+  ("If the parameter x is 0, this effect retrigs the sample only once -
+  on tick 0"), a bare `E90` on a row without a note restarts the
+  playing sample from the top at tick 0. Previously `E90` was a no-op,
+  which is only equivalent when the row also carries a note. The
+  non-zero leg is unchanged (`E9x` retrigs on every `x`-th tick,
+  *except* tick 0), and the tick-0 retrig honours the same section's
+  carve-out that only a **non**-tick-0 `E9x` retrig resets the `Rxy`
+  counter.
+- **`Rxy` counter reset cases are exhaustive** — §2.1.22 lists exactly
+  three resets: before the song starts, a row whose channel carries an
+  **instrument number** ("doesn't matter if there's a note in the note
+  column"), and a non-tick-0 `E9x` retrig. A bare note with no
+  instrument byte is none of those, so its trigger now leaves the
+  counter running (previously every note trigger reset it). Five
+  directed tests pin the matrix: `E90` fires once on tick 0 and never
+  later, the tick-0 fire preserves the counter, an `E91` tick-1 fire
+  resets it, a note-without-instrument preserves it, and an
+  instrument-only row resets it.
 - **`Kxy` key-off equivalence to note 97** — `Kxy` ("Key off. Same as
   note number 97" per `multimedia-cx-fasttracker-2.html`) now silences a
   voice on an envelope-less instrument immediately, exactly like a
