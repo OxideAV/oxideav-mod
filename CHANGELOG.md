@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-mod/compare/v0.0.9...v0.0.10) - 2026-08-24
+
+### Other
+
+- multi-sample keymap routing + STM song-file pipeline pins
+- Lxy evaluates at the jumped-to envelope position from the first tick
+- close two fuzz findings — row-count allocation bomb + truncated-instrument panic
+- volume-column values apply after the trigger's default load, before standard effects
+- STM + XM reference-compare conformance gates
+- sample headers stride at the fixed 40 bytes — the stored dword is metadata only
+- E90 single tick-0 retrig + exhaustive Rxy counter-reset cases
+- UST looped bodies trim to the loop area at extraction
+- surface the live +951 restart position as metadata
+- describe the sample-name metadata grouping on its own terms
+- pin EEx pattern-delay composition with Bxx/Dxy/E6x transitions
+- honour the +951 restart byte on the song-end wrap
+- name the oracle's published C interface without citing its header file
+- ST2.6 decode smoke over the public registry path
+- seed the ST2.6 parse path + refresh the mod_decode pipeline notes
+- SoundTracker 2.6 / IceTracker (MTN\0 / IT10) support
+- stored-pattern count scans the entire order table, capped at 128
+- order-flow conformance — §5.14 overflow wrap, Bxx OOB diagnostic, E6x row-only rewind
+- untrack generated corpus entries, keep only the minimal.* seeds
+- pin B00+D00 clean-restart symmetry + unconditional backward B+D loop
+- reset E6x loop state on every Bxx/Dxy jump, including same-order self-jumps
+- Bxx+Dxy same-row precedence — two-variable jump model with channel-order quirk
+- README — document ED0 immediate-trigger + n_patterns overflow hardening
+- harden n_patterns derivation against u8 overflow on 0xFF order entries
+- pin arpeggio's finetune-aware period-table walk with a regression test
+- ED0 note-delay triggers immediately on tick 0 instead of dropping the note
+- add CI / crates.io / docs.rs / MIT-license badges
+- sample-header finetune retunes every note, not only E5x notes
+- 9xx without a note retriggers the playing sample to the offset
+- lock Axy both-nibbles-set volume-slide direction (x wins)
+- tone-porta target resolves through the channel finetune table
+- end-to-end decode-pipeline PCM checkpoint
+- rendered-PCM checkpoints for the planar driver + loop sustain
+- rendered-PCM checkpoint regression net for the mix/render driver
+- README — document shared-mixer loop boundary for STM + XM
+- ping-pong loop coverage in the shared mixer
+- shared mixer forward-loop wraps at loop_end, not buffer end
+- README — note E6x loop-point cross-pattern reset
+- reset E6x pattern-loop point on pattern transition
+- README — document fine-slide memory, note-delay + Kxy consistency
+- Kxy key-off matches note-97 voice-silence on envelope-less instruments
+- note-delay (EDx) fire mirrors tick-0 note-on LFO/counter resets
+- last-non-zero memory for E1x/E2x/EAx/EBx/X1x/X2x fine slides
+- E4x/E7x downward-saw vibrato/tremolo waveform over the full 64-step cycle
+- Bxx out-of-range position jump wraps to order 0 (PT quirk)
+- EC0 note-cut silences on tick 0 ("nothing will be heard")
+- F00 halts playback (Protracker Set-speed param 0)
+- complete offset-1080 format-tag channel map (2CHN/dCHN/xxCN/TDZx/OKTA/M&K!)
+- refresh to current status, drop per-round changelog cruft
+- honour UST +471 song-speed byte in the tick scheduler
+- implement EFx invert-loop (funkrepeat) effect
+- state Amiga LED-filter pole from hardware behaviour, drop external citation
+- 15-sample Ultimate SoundTracker layout + UST effect translation
+- Startrekker FLT8 paired-pattern layout + order-table halving
+- honour E4x/E7x vibrato + tremolo waveform control
+- typed Note::has_period + has_sample + has_effect + is_empty predicates
+- typed XmSampleHeader::finetune_semitones + transpose_semitones
+- typed XmSampleHeader::is_looped + loop_region_frames + length_frames
+- drop release-plz.toml — use release-plz defaults across the workspace
+- implement E3x glissando control
+- typed Sample::is_looped + loop_region accessors on header parser
+- Rxy per-nibble memory — y=0 reuses last speed, x=0 reuses last volume modifier
+- implement E9x retrigger-note effect
+- implement 9xx set-sample-offset effect with PT memory + out-of-range quirk
+- implement E6x pattern loop + EEx pattern delay
+- paraphrase remaining third-party-renderer narrative prose
+- promote codec id "xm" from stub to full playback decoder
+- promote codec id "stm" from stub to full playback decoder
+
 ### Added
 
 - **Multi-sample keymap routing + STM song-file coverage**
