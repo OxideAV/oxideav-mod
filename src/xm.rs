@@ -710,6 +710,22 @@ pub fn parse_patterns(header: &XmHeader, bytes: &[u8]) -> Result<(Vec<XmPattern>
         let num_rows = read_u16_le(bytes, cur + 5);
         let packed_size = read_u16_le(bytes, cur + 7);
 
+        // Both spec texts bound the row count: "Number of rows in
+        // pattern (1..256)" (`FastTracker-2-v2.04-xm.txt` pattern
+        // header, `multimedia-cx-fasttracker-2.html` §File Format).
+        // Rejecting out-of-range values also closes an allocation
+        // bomb: the `packed_size == 0` branch below synthesizes
+        // `num_rows * num_channels` default cells with NO file bytes
+        // backing them, so an unclamped u16 row count times 256
+        // patterns times 32 channels turns a ~2 KB input into
+        // multi-GB of allocations (found as sustained RSS creep by
+        // `oxideav-mod-fuzz/xm_decode`, round 451).
+        if !(1..=256).contains(&num_rows) {
+            return Err(Error::invalid(format!(
+                "XM: implausible row count {num_rows} in pattern #{pat_idx} (expected 1..=256)"
+            )));
+        }
+
         // Skip over the pattern header *using its declared length*, so
         // nonstandard writers (that pad extra bytes) don't desync us.
         let data_start = cur
@@ -826,7 +842,18 @@ fn parse_one_instrument(bytes: &[u8], cur: usize) -> Result<(XmInstrument, usize
         )));
     }
     let ext_base = cur + 29;
-    // Sample header size lives at extended offset +0 (file offset ext_base + 0 = cur+29).
+    // Sample header size lives at extended offset +0 (file offset
+    // ext_base + 0 = cur+29). The `cur + header_size` guard above is
+    // NOT sufficient here: with `num_samples > 0` a hostile
+    // `header_size` of 29..=32 passes that check while the file ends
+    // before `ext_base + 4`, and the bare dword read panics on the
+    // slice index. Found by `oxideav-mod-fuzz/xm_decode`
+    // (crash-bb1e627e, round 451).
+    if ext_base + 4 > bytes.len() {
+        return Err(Error::invalid(
+            "XM: truncated instrument extended header (sample_header_size dword past EOF)",
+        ));
+    }
     inst.sample_header_size = read_u32_le(bytes, ext_base);
 
     // Sample map (96 bytes) at ext_base+4.
@@ -1427,6 +1454,57 @@ mod tests {
         extract_sample_bodies(&mut insts, &bytes);
         let decoded = &insts[0].samples[0].pcm8;
         assert_eq!(decoded, &[1, 3, 6, 10]);
+    }
+
+    #[test]
+    fn truncated_instrument_extended_header_errors_cleanly() {
+        // A hostile instrument header_size of 29..=32 with
+        // num_samples > 0 passes the `cur + header_size` bound while
+        // the file ends before the sample_header_size dword at
+        // cur+29..cur+33 — the read must error, not panic
+        // (fuzz crash-bb1e627e).
+        let mut bytes = build_header(4, 0, 1, false);
+        let h = parse_header(&bytes).unwrap();
+        let inst_off = pattern_data_offset(&h);
+        bytes.truncate(inst_off);
+        bytes.extend_from_slice(&29u32.to_le_bytes()); // header_size 29
+        let mut nbuf = [0u8; 22];
+        nbuf[..4].copy_from_slice(b"trap");
+        bytes.extend_from_slice(&nbuf);
+        bytes.push(0); // type
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // num_samples = 1
+                                                      // File ends exactly at cur+29.
+        assert!(parse_instruments(&h, &bytes, inst_off).is_err());
+    }
+
+    #[test]
+    fn hostile_row_count_is_rejected() {
+        // Spec bound: "Number of rows in pattern (1..256)". An
+        // unclamped u16 row count with packed_size == 0 is a
+        // multi-GB allocation bomb (cells are synthesized with no
+        // file bytes backing them) — see the guard in
+        // `parse_patterns`.
+        for hostile_rows in [0u16, 257, 0xFFFF] {
+            let mut bytes = build_header(32, 1, 0, false);
+            let h = parse_header(&bytes).unwrap();
+            bytes.extend_from_slice(&9u32.to_le_bytes()); // header length
+            bytes.push(0); // packing type
+            bytes.extend_from_slice(&hostile_rows.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // packed_size 0
+            assert!(
+                parse_patterns(&h, &bytes).is_err(),
+                "row count {hostile_rows} must be rejected"
+            );
+        }
+        // The spec maximum itself stays accepted.
+        let mut bytes = build_header(4, 1, 0, false);
+        let h = parse_header(&bytes).unwrap();
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&256u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        let (pats, _) = parse_patterns(&h, &bytes).unwrap();
+        assert_eq!(pats[0].rows.len(), 256);
     }
 
     #[test]

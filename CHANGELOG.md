@@ -133,6 +133,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vol-col tone-porta speed) stay in the pre-trigger pass. Directed
   tests pin `Cxx` overriding the vol-col and the vol-col overriding
   the sample default.
+- **XM pattern row counts are bounded to the spec's 1..=256**
+  (`src/xm.rs`). Both staged spec texts bound the pattern header's
+  row count; an unclamped u16 was also an allocation bomb — the
+  `packed_size == 0` branch synthesizes `num_rows * num_channels`
+  default cells with no file bytes backing them, so 256 declared
+  patterns of 65535 rows x 32 channels turned a ~2 KB input into
+  multi-GB of transient allocations. Found as sustained RSS creep
+  (2.6 GB, ~75 exec/s) by the `xm_decode` fuzz target; post-fix the
+  target holds ~0.5 GB at ~6500 exec/s. Regression test pins 0 /
+  257 / 0xFFFF rejected and 256 accepted.
+- **XM truncated-instrument slice-index panic fixed** (`src/xm.rs`).
+  With `num_samples > 0`, a hostile instrument `header_size` of
+  29..=32 passed the `cur + header_size` bound while the file ended
+  before the `sample_header_size` dword at cur+29..cur+33, and the
+  bare `read_u32_le` panicked on the slice index. Found by the
+  `xm_decode` fuzz target (crash-bb1e627e) within minutes of the
+  row-count fix unlocking ~100x fuzz throughput; now errors cleanly
+  and is pinned by a regression test.
 - **XM parser ignores the stored `sample_header_size` dword**
   (`src/xm.rs`). Sample headers now stride at the fixed on-disk 40
   bytes; the dword is surfaced on `XmInstrument::sample_header_size`
