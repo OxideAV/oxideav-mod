@@ -667,6 +667,34 @@ compound across the delay (per `Protracker-effects-MODFIL12.txt` EE —
 underneath, which is what gives EE its characteristic
 held-note-with-LFO-still-running texture on real-world rips.
 
+## Reference-compare conformance gates
+
+Two integration harnesses drive this crate's engines side-by-side with a
+runtime-loaded black-box reference render binary (dlopen'd via
+`libloading`; only its published C entry-points are called, and it is
+used strictly as an opaque behaviour oracle whose output is compared
+against ours — the tests skip cleanly when the dylib is absent):
+
+- **`tests/tracker_reference_compare.rs`** (MOD) — per-chunk
+  `(order, pattern, row, speed, tempo)` traces plus PCM RMS / scaled-diff
+  analysis over real-world MOD fixtures, with gain-calibration pins.
+- **`tests/stm_xm_reference_compare.rs`** (STM + XM, round 451) —
+  synthetic fixtures whose order flow exercises pattern break (`Dxy`
+  decimal row), order jump (`Bxx`), and a mid-song speed change (`Fxx`):
+  - the **XM** gate asserts `(order, row, speed)` **lockstep at all 240
+    probes** of a 30-second trace (measured: 0 mismatches);
+  - the **STM** gate asserts the reference *accepts* the staged header
+    layout (it demonstrably validates the file-type byte) and that our
+    engine traverses the whole 3-order flow audibly. The reference's own
+    STM *playback* is recorded as an observation, not asserted: it
+    renders every variant we tried (fixed cells with each documented
+    marker byte, packed marker reading, several version/tempo stampings)
+    as ~0.12 s of silence with the order cursor racing to the end, and
+    with no known-good real-world STM available and no staged
+    effect/tempo semantics to arbitrate
+    (`docs/audio/trackers/stm/stm-effect-semantics-gap.md`), the
+    divergence is unattributable.
+
 ## Fuzz harness
 
 A `cargo-fuzz` harness under `fuzz/` drives the three parser

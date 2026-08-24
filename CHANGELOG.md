@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **STM + XM reference-compare conformance gates**
+  (`tests/stm_xm_reference_compare.rs`). The black-box side-by-side
+  harness that has long covered MOD now extends to the other two
+  formats: synthetic fixtures exercising `Dxy` pattern break, `Bxx`
+  order jump, and an `Fxx` speed change are rendered by both our
+  engines and the runtime-loaded reference dylib. The XM gate asserts
+  `(order, row, speed)` lockstep at all 240 probes of a 30-second
+  trace (measured green: 0 mismatches). The STM gate asserts the
+  reference accepts the staged header layout and that our engine
+  traverses the whole 3-order flow audibly; the reference's own STM
+  playback is recorded as an unattributable observation (it renders
+  every fixture variant as ~0.12 s of silence — see the README's
+  reference-compare section).
+
 - **Restart byte (+951) honoured on the song-end wrap**
   (`src/header.rs`, `src/player.rs`). The header byte at offset 951 is
   a song-restart position in the NoiseTracker / FastTracker lineage
