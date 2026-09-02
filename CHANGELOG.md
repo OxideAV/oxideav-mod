@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-mod/compare/v0.0.10...v0.0.11) - 2026-09-02
+
+### Other
+
+- unit pins — compat-Gxx text rules, old-effects hold, panbrello period, S00/S6x/T0x/T1x, note fade, S7x, instrument column, pan-envelope scaling
+- oracle batch 3 — old-effects period-domain vibrato + row-tick hold, panbrello 256-step/4x-slower table, compat-Gxx gate scoped to text-agreeing rows
+- it_decode fuzz target + corpus seeds; README Impulse Tracker coverage section
+- black-box oracle harness + fixes — Pxy direction, pan-envelope scaling, Qxy counter continuity, vibrato phase, sample-mode note-off, ViR unclamped
+- framework registration — IMPM probe, demuxer + metadata, "it" playback decoder, writer helper, smoke test
+- row/tick engine, sample + instrument modes, NNA voices, envelopes, linear/Amiga slides, Axx..Zxx
+- packed pattern rows — channel masks, previous-value memories, volume column, module bundle
+- instruments — old + new headers, keymap, vol/pan/pitch envelopes, NNA/DCT/DCA, fadeout
+- sample headers + bodies — 8/16-bit, signed/unsigned, byte order, delta, normal + sustain loops
+- IMPM header — counts, flags, channel pan/vol, orders, offset tables, song message
+
 ### Added
 
 - Impulse Tracker (`.it`) `IMPM` header parser (`it::parse_header`): counts, flags (stereo / instruments / linear slides / old effects / compatible Gxx), special bits, global + mix volume, speed / tempo, pan separation, per-channel pan + volume, order list, instrument / sample / pattern offset tables, song message (`it::extract_message`).
