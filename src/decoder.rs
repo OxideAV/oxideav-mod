@@ -22,6 +22,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 use crate::container::OUTPUT_SAMPLE_RATE;
 use crate::header::parse_header;
+use crate::it_player::ItPlayerState;
 use crate::player::{parse_patterns, PlayerState};
 use crate::samples::extract_samples;
 use crate::stm_player::StmPlayerState;
@@ -83,6 +84,111 @@ pub fn register(reg: &mut CodecRegistry) {
             .capabilities(xm_caps)
             .decoder(make_xm_decoder),
     );
+
+    // IT — full playback decoder. Drives `ItPlayerState` over the
+    // Impulse Tracker engine (sample + instrument modes, NNA virtual
+    // channels, envelopes, linear / Amiga slides, Axx..Zxx) and emits
+    // interleaved S16 stereo at OUTPUT_SAMPLE_RATE.
+    let it_caps = CodecCapabilities::audio("it_sw")
+        .with_lossy(false)
+        .with_lossless(true)
+        .with_intra_only(false)
+        .with_max_channels(64)
+        .with_max_sample_rate(OUTPUT_SAMPLE_RATE);
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::CODEC_ID_IT_STR))
+            .capabilities(it_caps)
+            .decoder(make_it_decoder),
+    );
+}
+
+/// Direct factory for the IT playback decoder (the registry path above
+/// reaches the same constructor).
+pub fn make_it_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(ItDecoder {
+        codec_id: CodecId::new(crate::CODEC_ID_IT_STR),
+        state: ItDecoderState::AwaitingPacket,
+    }))
+}
+
+/// Impulse Tracker decoder. Consumes the whole-file packet from the IT
+/// container, parses it with [`crate::it::parse_module`], and drives an
+/// [`ItPlayerState`] forward, emitting interleaved S16 stereo PCM at
+/// [`OUTPUT_SAMPLE_RATE`] until the song ends.
+struct ItDecoder {
+    codec_id: CodecId,
+    state: ItDecoderState,
+}
+
+enum ItDecoderState {
+    AwaitingPacket,
+    Playing {
+        player: Box<ItPlayerState>,
+        emit_pts: i64,
+    },
+    Done,
+}
+
+impl Decoder for ItDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if !matches!(self.state, ItDecoderState::AwaitingPacket) {
+            return Err(Error::other(
+                "IT decoder received a second packet; only one is expected per song",
+            ));
+        }
+        if !crate::it::is_it(&packet.data) {
+            return Err(Error::invalid(
+                "IT: packet does not start with the 'IMPM' magic",
+            ));
+        }
+        let module = crate::it::parse_module(&packet.data)?;
+        let player = ItPlayerState::new(module, OUTPUT_SAMPLE_RATE);
+        self.state = ItDecoderState::Playing {
+            player: Box::new(player),
+            emit_pts: 0,
+        };
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        match &mut self.state {
+            ItDecoderState::AwaitingPacket => Err(Error::NeedMore),
+            ItDecoderState::Done => Err(Error::Eof),
+            ItDecoderState::Playing { player, emit_pts } => {
+                let mut pcm = vec![0i16; CHUNK_FRAMES as usize * 2];
+                let produced = player.render(&mut pcm);
+                if produced == 0 {
+                    self.state = ItDecoderState::Done;
+                    return Err(Error::Eof);
+                }
+                pcm.truncate(produced * 2);
+                let mut bytes = Vec::with_capacity(pcm.len() * 2);
+                for s in &pcm {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let pts = *emit_pts;
+                *emit_pts += produced as i64;
+                Ok(Frame::Audio(AudioFrame {
+                    samples: produced as u32,
+                    pts: Some(pts),
+                    data: vec![bytes],
+                }))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.state = ItDecoderState::AwaitingPacket;
+        Ok(())
+    }
 }
 
 fn make_mixed_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -746,6 +852,59 @@ mod tests {
             total_nonzero > 100,
             "expected non-silent PCM, got {total_nonzero} non-zero samples"
         );
+    }
+
+    #[test]
+    fn it_decoder_pipeline_emits_pcm_rejects_junk_and_resets() {
+        let bytes = crate::it_player::tests::build_ping_it();
+        let params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_IT_STR));
+        let mut dec = make_it_decoder(&params).unwrap();
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            bytes.clone(),
+        );
+        dec.send_packet(&pkt).unwrap();
+        match dec.send_packet(&pkt) {
+            Err(Error::Other(_)) => {}
+            other => panic!("expected Other on duplicate send_packet, got {other:?}"),
+        }
+        let mut total_samples = 0u64;
+        let mut total_nonzero = 0u64;
+        for _ in 0..200 {
+            match dec.receive_frame() {
+                Ok(Frame::Audio(a)) => {
+                    total_samples += a.samples as u64;
+                    let plane = &a.data[0];
+                    assert_eq!(plane.len(), a.samples as usize * 4);
+                    for chunk in plane.chunks_exact(2) {
+                        if i16::from_le_bytes([chunk[0], chunk[1]]) != 0 {
+                            total_nonzero += 1;
+                        }
+                    }
+                }
+                Ok(_) => unreachable!("IT emits audio only"),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected decode error: {e:?}"),
+            }
+        }
+        assert!(total_samples > 1000, "got {total_samples}");
+        assert!(total_nonzero > 100, "got {total_nonzero}");
+        assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+        dec.reset().unwrap();
+        dec.send_packet(&pkt).expect("reset clears the state");
+
+        let mut dec = make_it_decoder(&params).unwrap();
+        let junk = Packet::new(
+            0,
+            TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+            vec![0u8; 0x100],
+        );
+        match dec.send_packet(&junk) {
+            Err(Error::InvalidData(_)) => {}
+            other => panic!("expected InvalidData on non-IT blob, got {other:?}"),
+        }
+        assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
     }
 
     #[test]

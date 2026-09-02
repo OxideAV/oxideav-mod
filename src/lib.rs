@@ -70,18 +70,34 @@
 //!   still reach for [`xm::parse_header`] / [`xm::parse_patterns`] /
 //!   [`xm::parse_instruments`] / [`xm::extract_sample_bodies`]
 //!   directly.
+//! - A **container** (`it`) that recognises Impulse Tracker modules by
+//!   the `IMPM` magic at offset 0 and parses the header, order list,
+//!   instrument / sample / pattern offset tables, song message,
+//!   instruments (old 1.x and 2.x layouts), samples (8/16-bit,
+//!   signed/unsigned, delta, both loop pairs) and packed patterns per
+//!   `docs/audio/trackers/it/ImpulseTracker-it.txt`. The associated
+//!   codec id [`CODEC_ID_IT_STR`] = `"it"` is a **full playback
+//!   decoder** driving [`it_player::ItPlayerState`] — sample mode and
+//!   instrument mode (envelopes, fadeout, NNA virtual channels,
+//!   duplicate checks), linear and Amiga slides, and the `Axx`..`Zxx`
+//!   effect set — over the shared [`mixer::MixerVoice`]. Structural
+//!   callers use [`it::parse_module`] (or the per-block
+//!   [`it::parse_header`] / [`it::parse_instruments`] /
+//!   [`it::parse_samples`] / [`it::parse_patterns`]) directly.
 //!
 //! The tracker convention of exposing per-channel streams alongside a
 //! mixed stereo mix is shared across tracker formats — see
 //! `MEMORY.md → MOD multichannel` for the broader sketch.
 //!
-//! Decode only — there is no MOD or STM encoder, by design.
+//! Decode only — there is no MOD, STM, XM or IT encoder, by design.
 
 pub mod container;
 pub mod decoder;
 pub mod header;
 pub mod it;
 pub mod it_player;
+#[doc(hidden)]
+pub mod it_writer;
 pub mod mixer;
 pub mod player;
 pub mod samples;
@@ -105,6 +121,9 @@ pub const CODEC_ID_STM_STR: &str = "stm";
 
 /// Codec id for the XM (FastTracker 2 Extended Module) playback decoder.
 pub const CODEC_ID_XM_STR: &str = "xm";
+
+/// Codec id for the IT (Impulse Tracker) playback decoder.
+pub const CODEC_ID_IT_STR: &str = "it";
 
 pub fn register_codecs(reg: &mut CodecRegistry) {
     decoder::register(reg);

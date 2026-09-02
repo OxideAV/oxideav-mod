@@ -15,6 +15,7 @@ use oxideav_core::{
 use oxideav_core::{ContainerRegistry, Demuxer, ReadSeek};
 
 use crate::header::parse_header;
+use crate::it;
 use crate::stm;
 use crate::xm;
 
@@ -42,6 +43,13 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("xm", open_xm);
     reg.register_extension("xm", "xm");
     reg.register_probe("xm", probe_xm);
+
+    // Impulse Tracker (.it) registration — single-packet demuxer
+    // guarded by the 4-byte `IMPM` magic at offset 0. The codec id is
+    // wired to the full playback decoder (`make_it_decoder`).
+    reg.register_demuxer("it", open_it);
+    reg.register_extension("it", "it");
+    reg.register_probe("it", probe_it);
 }
 
 /// ProTracker / Soundtracker family signature at offset 1080 — a 4-byte
@@ -462,9 +470,198 @@ impl Demuxer for XmDemuxer {
     }
 }
 
+/// Impulse Tracker probe: the `IMPM` magic at offset 0
+/// (`ImpulseTracker-it.txt` §"Impulse Header Layout"). Extension-only
+/// match is a weak fallback.
+fn probe_it(p: &oxideav_core::ProbeData) -> u8 {
+    if it::is_it(p.buf) {
+        return 100;
+    }
+    if p.ext == Some("it") && p.buf.len() >= it::IT_HEADER_FIXED_SIZE {
+        return 25;
+    }
+    0
+}
+
+fn open_it(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    let mut blob = Vec::new();
+    input.read_to_end(&mut blob)?;
+    if blob.len() < it::IT_HEADER_FIXED_SIZE {
+        return Err(Error::invalid("IT: file shorter than the 0xC0-byte header"));
+    }
+    let header = it::parse_header(&blob)?;
+
+    let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_IT_STR));
+    params.media_type = MediaType::Audio;
+    params.channels = Some(2);
+    params.sample_rate = Some(OUTPUT_SAMPLE_RATE);
+    params.sample_format = Some(SampleFormat::S16);
+    params.extradata = blob.clone();
+
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+
+    let patterns = it::parse_patterns(&header, &blob);
+    let duration_micros = it::estimate_duration_micros(&header, &patterns);
+    let num_channels = patterns
+        .iter()
+        .map(|p| p.num_channels)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let metadata = build_it_metadata(&header, &blob, num_channels);
+
+    Ok(Box::new(ItDemuxer {
+        streams: vec![stream],
+        blob,
+        consumed: false,
+        metadata,
+        duration_micros,
+        _header: header,
+    }))
+}
+
+fn build_it_metadata(h: &it::ItHeader, blob: &[u8], num_channels: u8) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if !h.song_name.is_empty() {
+        out.push(("title".into(), h.song_name.clone()));
+    }
+    if let Some(msg) = it::extract_message(h, blob) {
+        if !msg.trim().is_empty() {
+            out.push(("comment".into(), msg));
+        }
+    }
+    let (maj, min) = h.created_with_version();
+    out.push((
+        "tracker".into(),
+        format!(
+            "Impulse Tracker {maj}.{min:02X} (cmwt {:#06X})",
+            h.compatible_with
+        ),
+    ));
+    for &off in &h.sample_offsets {
+        if let Ok(s) = it::parse_sample_header(blob, off as usize) {
+            if !s.name.is_empty() {
+                out.push(("sample".into(), s.name));
+            }
+        }
+    }
+    out.push((
+        "extra_info".into(),
+        format!(
+            "{} channels, {} patterns, {} instruments, {} samples, {} orders, speed={}, tempo={}, {}, {} slides, gv={}, mv={}",
+            num_channels,
+            h.pattern_offsets.len(),
+            h.instrument_offsets.len(),
+            h.sample_offsets.len(),
+            h.playable_order_count(),
+            h.initial_speed,
+            h.initial_tempo,
+            if h.uses_instruments() { "instrument mode" } else { "sample mode" },
+            if h.linear_slides() { "linear" } else { "amiga" },
+            h.global_volume,
+            h.mix_volume,
+        ),
+    ));
+    out
+}
+
+struct ItDemuxer {
+    streams: Vec<StreamInfo>,
+    blob: Vec<u8>,
+    consumed: bool,
+    metadata: Vec<(String, String)>,
+    duration_micros: i64,
+    _header: it::ItHeader,
+}
+
+impl Demuxer for ItDemuxer {
+    fn format_name(&self) -> &str {
+        "it"
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        if self.consumed {
+            return Err(Error::Eof);
+        }
+        self.consumed = true;
+        let data = std::mem::take(&mut self.blob);
+        let stream = &self.streams[0];
+        let mut pkt = Packet::new(0, stream.time_base, data);
+        pkt.pts = Some(0);
+        pkt.dts = Some(0);
+        pkt.flags.keyframe = true;
+        Ok(pkt)
+    }
+
+    fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        if self.duration_micros > 0 {
+            Some(self.duration_micros)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_probe_and_metadata() {
+        use crate::it_writer::{square_sample, ItWriter, ItWriterPattern};
+        let mut w = ItWriter {
+            song_name: "probe me".into(),
+            message: Some("msg".into()),
+            ..ItWriter::default()
+        };
+        w.orders = vec![0, 0, 255];
+        w.samples.push(square_sample(32, 4, 10000));
+        let mut p = ItWriterPattern::new(8);
+        p.note(0, 3, 60, 1);
+        w.patterns.push(p);
+        let bytes = w.build();
+        let pd = oxideav_core::ProbeData {
+            buf: &bytes,
+            ext: None,
+        };
+        assert_eq!(probe_it(&pd), 100);
+        assert_eq!(probe_stm(&pd), 0);
+        assert_eq!(probe_xm(&pd), 0);
+        let none = oxideav_core::ProbeData {
+            buf: &[0u8; 300],
+            ext: Some("it"),
+        };
+        assert_eq!(probe_it(&none), 25);
+        let dm = open_it(
+            Box::new(std::io::Cursor::new(bytes.clone())),
+            &oxideav_core::CodecRegistry::new(),
+        )
+        .unwrap();
+        assert_eq!(dm.format_name(), "it");
+        let md = dm.metadata();
+        assert!(md.iter().any(|(k, v)| k == "title" && v == "probe me"));
+        assert!(md.iter().any(|(k, v)| k == "comment" && v == "msg"));
+        assert!(md.iter().any(|(k, v)| k == "sample" && v == "square"));
+        assert!(md
+            .iter()
+            .any(|(k, v)| k == "extra_info" && v.starts_with("4 channels, 1 patterns")));
+        // 16 rows × 6 × 2.5/125 = 1.92 s.
+        assert_eq!(dm.duration_micros(), Some(1_920_000));
+    }
 
     #[test]
     fn metadata_surfaces_live_restart_position_only() {
