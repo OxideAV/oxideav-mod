@@ -1094,6 +1094,364 @@ pub fn parse_instruments(header: &ItHeader, bytes: &[u8]) -> Vec<ItInstrument> {
         .collect()
 }
 
+// ============================================================================
+// Patterns — §"Impulse Pattern Format"
+// ============================================================================
+
+/// Cell mask bit: a note is present.
+pub const IT_CELL_NOTE: u8 = 1 << 0;
+/// Cell mask bit: an instrument is present.
+pub const IT_CELL_INSTRUMENT: u8 = 1 << 1;
+/// Cell mask bit: a volume / panning column value is present.
+pub const IT_CELL_VOLPAN: u8 = 1 << 2;
+/// Cell mask bit: a command + value is present.
+pub const IT_CELL_COMMAND: u8 = 1 << 3;
+/// Maximum row count per the format text ("Ranges from 32->200").
+pub const IT_MAX_PATTERN_ROWS: u16 = 200;
+
+/// One pattern cell. `mask` says which of the four columns carry a
+/// value on this row (a cell may be entirely empty).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItCell {
+    /// Which columns are set — `IT_CELL_*` bits.
+    pub mask: u8,
+    /// `0->119` (C-0 → B-9), [`IT_NOTE_OFF`] (255), [`IT_NOTE_CUT`]
+    /// (254); "Others = note fade".
+    pub note: u8,
+    /// `1->99`; 0 = none.
+    pub instrument: u8,
+    /// Raw volume / panning column byte: `0->64` volume, `65->124`
+    /// volume effects, `128->192` panning, `193->212` portamento /
+    /// vibrato (see [`ItVolumeColumn`]).
+    pub volpan: u8,
+    /// Command letter as `1->31` (`1 = A`, `2 = B`, …); 0 = no effect.
+    pub command: u8,
+    /// Command value byte.
+    pub param: u8,
+}
+
+/// Decoded volume-column meaning (`ItCell::volpan`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItVolumeColumn {
+    /// Nothing usable in the column.
+    None,
+    /// `0->64`.
+    Volume(u8),
+    /// `65->74` → `D0F..D9F` (x = 0..9).
+    FineVolumeUp(u8),
+    /// `75->84` → `DF0..DF9`.
+    FineVolumeDown(u8),
+    /// `85->94` → `D00..D90`.
+    VolumeSlideUp(u8),
+    /// `95->104` → `D00..D09`.
+    VolumeSlideDown(u8),
+    /// `105->114`: "equivalent to a normal slide by x*4".
+    PitchSlideDown(u8),
+    /// `115->124`.
+    PitchSlideUp(u8),
+    /// `128->192` → panning `0->64`.
+    Panning(u8),
+    /// `193->202`: portamento-to with the `SlideTable` speed index.
+    TonePortamento(u8),
+    /// `203->212`: vibrato depth (shares Hxx / Uxx memory).
+    Vibrato(u8),
+}
+
+/// `Portamento to (Gx)` speed table for the volume column: "SlideTable
+/// DB 1, 4, 8, 16, 32, 64, 96, 128, 255".
+pub const IT_VOLCOL_PORTA_SLIDE_TABLE: [u8; 10] = [0, 1, 4, 8, 16, 32, 64, 96, 128, 255];
+
+impl ItCell {
+    /// True when the note column names a playable note (`0..=119`).
+    pub fn has_note(&self) -> bool {
+        self.mask & IT_CELL_NOTE != 0 && self.note <= IT_MAX_NOTE
+    }
+    pub fn is_note_off(&self) -> bool {
+        self.mask & IT_CELL_NOTE != 0 && self.note == IT_NOTE_OFF
+    }
+    pub fn is_note_cut(&self) -> bool {
+        self.mask & IT_CELL_NOTE != 0 && self.note == IT_NOTE_CUT
+    }
+    /// "Others = note fade": a note value in `120..=253`.
+    pub fn is_note_fade(&self) -> bool {
+        self.mask & IT_CELL_NOTE != 0 && self.note > IT_MAX_NOTE && self.note < IT_NOTE_CUT
+    }
+    pub fn has_instrument(&self) -> bool {
+        self.mask & IT_CELL_INSTRUMENT != 0 && self.instrument != 0
+    }
+    pub fn has_command(&self) -> bool {
+        self.mask & IT_CELL_COMMAND != 0 && self.command != 0
+    }
+    /// Command letter (`'A'..='Z'`, `'?'` for 27..31, `' '` for none).
+    pub fn command_letter(&self) -> char {
+        match self.command {
+            0 => ' ',
+            1..=26 => (b'@' + self.command) as char,
+            _ => '?',
+        }
+    }
+    /// Decode the volume / panning column.
+    pub fn volume_column(&self) -> ItVolumeColumn {
+        if self.mask & IT_CELL_VOLPAN == 0 {
+            return ItVolumeColumn::None;
+        }
+        let v = self.volpan;
+        match v {
+            0..=64 => ItVolumeColumn::Volume(v),
+            65..=74 => ItVolumeColumn::FineVolumeUp(v - 65),
+            75..=84 => ItVolumeColumn::FineVolumeDown(v - 75),
+            85..=94 => ItVolumeColumn::VolumeSlideUp(v - 85),
+            95..=104 => ItVolumeColumn::VolumeSlideDown(v - 95),
+            105..=114 => ItVolumeColumn::PitchSlideDown(v - 105),
+            115..=124 => ItVolumeColumn::PitchSlideUp(v - 115),
+            128..=192 => ItVolumeColumn::Panning(v - 128),
+            193..=202 => ItVolumeColumn::TonePortamento(v - 193),
+            203..=212 => ItVolumeColumn::Vibrato(v - 203),
+            _ => ItVolumeColumn::None,
+        }
+    }
+}
+
+/// One unpacked pattern.
+#[derive(Clone, Debug, Default)]
+pub struct ItPattern {
+    /// `Rows` from the pattern header (or 64 for an absent pattern).
+    pub num_rows: u16,
+    /// Packed length as stored (0 for an absent pattern).
+    pub packed_length: u16,
+    /// `rows[row][channel]`. Each row is as wide as the highest
+    /// channel it touches (+1); rows the packed data never reached are
+    /// empty vectors. Use [`ItPattern::cell`] for a bounds-safe read.
+    pub rows: Vec<Vec<ItCell>>,
+    /// Highest channel index used in this pattern + 1.
+    pub num_channels: u8,
+    /// True when the packed data ended before `num_rows` rows were
+    /// terminated (the remainder is empty).
+    pub truncated: bool,
+}
+
+impl ItPattern {
+    /// Cell at `(row, channel)`, or an empty cell.
+    pub fn cell(&self, row: usize, channel: usize) -> ItCell {
+        self.rows
+            .get(row)
+            .and_then(|r| r.get(channel))
+            .copied()
+            .unwrap_or_default()
+    }
+    /// An all-empty pattern of `rows` rows.
+    pub fn empty(rows: u16) -> Self {
+        ItPattern {
+            num_rows: rows,
+            rows: vec![Vec::new(); rows as usize],
+            ..ItPattern::default()
+        }
+    }
+}
+
+/// Unpack one pattern at `off` (its 8-byte header followed by
+/// `Length` packed bytes). `off == 0` is the documented "empty 64-row
+/// pattern"; a header that runs past the file is treated the same way
+/// (an empty pattern of the stored row count when readable).
+pub fn parse_pattern(bytes: &[u8], off: usize) -> ItPattern {
+    if off == 0 || off.saturating_add(IT_PATTERN_HEADER_SIZE) > bytes.len() {
+        return ItPattern::empty(IT_EMPTY_PATTERN_ROWS);
+    }
+    let packed_length = read_u16_le(bytes, off);
+    let num_rows = read_u16_le(bytes, off + 2).clamp(1, IT_MAX_PATTERN_ROWS);
+    let data_start = off + IT_PATTERN_HEADER_SIZE;
+    let data_end = data_start
+        .saturating_add(packed_length as usize)
+        .min(bytes.len());
+    let data = &bytes[data_start..data_end];
+    let mut pat = ItPattern {
+        num_rows,
+        packed_length,
+        rows: Vec::with_capacity(num_rows as usize),
+        num_channels: 0,
+        truncated: false,
+    };
+
+    // Per-channel memories ("previousmaskvariable", "lastnote",
+    // "lastinstrument", "lastvolume/pan", "lastcommand[value]").
+    let mut last_mask = [0u8; IT_MAX_CHANNELS];
+    let mut last = [ItCell::default(); IT_MAX_CHANNELS];
+
+    let mut cur = 0usize;
+    let mut row: Vec<ItCell> = Vec::new();
+    let mut max_channels = 0usize;
+    while pat.rows.len() < num_rows as usize {
+        let Some(&marker) = data.get(cur) else {
+            pat.truncated = true;
+            break;
+        };
+        cur += 1;
+        if marker == 0 {
+            pat.rows.push(std::mem::take(&mut row));
+            continue;
+        }
+        let ch = ((marker - 1) & 63) as usize;
+        let mask = if marker & 128 != 0 {
+            let Some(&m) = data.get(cur) else {
+                pat.truncated = true;
+                break;
+            };
+            cur += 1;
+            last_mask[ch] = m;
+            m
+        } else {
+            last_mask[ch]
+        };
+
+        let mut cell = ItCell::default();
+        let mut need = 0usize;
+        if mask & 1 != 0 {
+            need += 1;
+        }
+        if mask & 2 != 0 {
+            need += 1;
+        }
+        if mask & 4 != 0 {
+            need += 1;
+        }
+        if mask & 8 != 0 {
+            need += 2;
+        }
+        if cur + need > data.len() {
+            pat.truncated = true;
+            break;
+        }
+        if mask & 1 != 0 {
+            cell.note = data[cur];
+            cur += 1;
+            cell.mask |= IT_CELL_NOTE;
+            last[ch].note = cell.note;
+        }
+        if mask & 2 != 0 {
+            cell.instrument = data[cur];
+            cur += 1;
+            cell.mask |= IT_CELL_INSTRUMENT;
+            last[ch].instrument = cell.instrument;
+        }
+        if mask & 4 != 0 {
+            cell.volpan = data[cur];
+            cur += 1;
+            cell.mask |= IT_CELL_VOLPAN;
+            last[ch].volpan = cell.volpan;
+        }
+        if mask & 8 != 0 {
+            cell.command = data[cur] & 31;
+            cell.param = data[cur + 1];
+            cur += 2;
+            cell.mask |= IT_CELL_COMMAND;
+            last[ch].command = cell.command;
+            last[ch].param = cell.param;
+        }
+        if mask & 16 != 0 {
+            cell.note = last[ch].note;
+            cell.mask |= IT_CELL_NOTE;
+        }
+        if mask & 32 != 0 {
+            cell.instrument = last[ch].instrument;
+            cell.mask |= IT_CELL_INSTRUMENT;
+        }
+        if mask & 64 != 0 {
+            cell.volpan = last[ch].volpan;
+            cell.mask |= IT_CELL_VOLPAN;
+        }
+        if mask & 128 != 0 {
+            cell.command = last[ch].command;
+            cell.param = last[ch].param;
+            cell.mask |= IT_CELL_COMMAND;
+        }
+
+        if row.len() <= ch {
+            row.resize(ch + 1, ItCell::default());
+        }
+        row[ch] = cell;
+        max_channels = max_channels.max(ch + 1);
+    }
+    if !row.is_empty() && pat.rows.len() < num_rows as usize {
+        pat.rows.push(row);
+    }
+    while pat.rows.len() < num_rows as usize {
+        pat.rows.push(Vec::new());
+    }
+    pat.num_channels = max_channels as u8;
+    pat
+}
+
+/// Unpack every pattern named by the header's offset table.
+pub fn parse_patterns(header: &ItHeader, bytes: &[u8]) -> Vec<ItPattern> {
+    header
+        .pattern_offsets
+        .iter()
+        .map(|&off| parse_pattern(bytes, off as usize))
+        .collect()
+}
+
+// ============================================================================
+// Whole-module convenience
+// ============================================================================
+
+/// Everything the player needs, parsed in one call.
+#[derive(Clone, Debug, Default)]
+pub struct ItModule {
+    pub header: ItHeader,
+    pub message: Option<String>,
+    pub instruments: Vec<ItInstrument>,
+    pub samples: Vec<ItSample>,
+    pub patterns: Vec<ItPattern>,
+    /// Highest channel index touched by any pattern + 1 (at least 1).
+    pub num_channels: u8,
+}
+
+/// Parse header, message, instruments, samples and patterns.
+pub fn parse_module(bytes: &[u8]) -> Result<ItModule> {
+    let header = parse_header(bytes)?;
+    let message = extract_message(&header, bytes);
+    let instruments = parse_instruments(&header, bytes);
+    let samples = parse_samples(&header, bytes);
+    let patterns = parse_patterns(&header, bytes);
+    let num_channels = patterns
+        .iter()
+        .map(|p| p.num_channels)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    Ok(ItModule {
+        header,
+        message,
+        instruments,
+        samples,
+        patterns,
+        num_channels,
+    })
+}
+
+/// Upper-bound duration at the initial speed / tempo: walks the order
+/// list once, summing each pattern's row count × speed ticks at
+/// `2.5 / tempo` seconds per tick. Loops, jumps and tempo changes are
+/// not simulated.
+pub fn estimate_duration_micros(header: &ItHeader, patterns: &[ItPattern]) -> i64 {
+    let speed = header.initial_speed.max(1) as i64;
+    let tempo = header.initial_tempo.max(31) as i64;
+    let mut rows: i64 = 0;
+    for &o in &header.orders {
+        if o == IT_ORDER_END {
+            break;
+        }
+        if o == IT_ORDER_SKIP {
+            continue;
+        }
+        rows += patterns
+            .get(o as usize)
+            .map_or(IT_EMPTY_PATTERN_ROWS as i64, |p| p.num_rows as i64);
+    }
+    // ticks × (2.5 / tempo) s = rows × speed × 2_500_000 / tempo µs.
+    rows.saturating_mul(speed).saturating_mul(2_500_000) / tempo
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1737,6 +2095,307 @@ pub(crate) mod tests {
         assert_eq!(ins[1].name, "real");
         assert_eq!(ins[1].nna, ItNna::Continue);
         assert_eq!(ins[2].name, "");
+    }
+
+    /// Serialise a pattern (header + packed bytes) from explicit cells.
+    /// Each entry is `(row, channel, cell)`; the packer always emits a
+    /// fresh mask byte (bit 7 of the channel marker set).
+    pub(crate) fn build_pattern(num_rows: u16, cells: &[(u16, u8, ItCell)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for row in 0..num_rows {
+            for &(r, ch, c) in cells.iter().filter(|(r, _, _)| *r == row) {
+                let _ = r;
+                data.push(0x80 | (ch + 1));
+                data.push(c.mask & 0x0F);
+                if c.mask & IT_CELL_NOTE != 0 {
+                    data.push(c.note);
+                }
+                if c.mask & IT_CELL_INSTRUMENT != 0 {
+                    data.push(c.instrument);
+                }
+                if c.mask & IT_CELL_VOLPAN != 0 {
+                    data.push(c.volpan);
+                }
+                if c.mask & IT_CELL_COMMAND != 0 {
+                    data.push(c.command);
+                    data.push(c.param);
+                }
+            }
+            data.push(0);
+        }
+        let mut out = vec![0u8; IT_PATTERN_HEADER_SIZE];
+        out[0..2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        out[2..4].copy_from_slice(&num_rows.to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    pub(crate) fn note_cell(note: u8, instrument: u8) -> ItCell {
+        ItCell {
+            mask: IT_CELL_NOTE | IT_CELL_INSTRUMENT,
+            note,
+            instrument,
+            ..ItCell::default()
+        }
+    }
+
+    pub(crate) fn cmd_cell(letter: char, param: u8) -> ItCell {
+        ItCell {
+            mask: IT_CELL_COMMAND,
+            command: (letter as u8) - b'@',
+            param,
+            ..ItCell::default()
+        }
+    }
+
+    #[test]
+    fn pattern_unpacks_explicit_masks() {
+        let mut c = note_cell(60, 1);
+        c.mask |= IT_CELL_VOLPAN | IT_CELL_COMMAND;
+        c.volpan = 40;
+        c.command = 4; // D
+        c.param = 0x0A;
+        let bytes = build_pattern(4, &[(0, 0, c), (2, 3, cmd_cell('B', 1))]);
+        let p = parse_pattern(&bytes, 0);
+        // The parser treats offset 0 as "empty pattern"; use a
+        // non-zero offset by prefixing a byte.
+        assert_eq!(p.num_rows, IT_EMPTY_PATTERN_ROWS);
+        let mut file = vec![0u8];
+        file.extend_from_slice(&bytes);
+        let p = parse_pattern(&file, 1);
+        assert_eq!(p.num_rows, 4);
+        assert_eq!(p.rows.len(), 4);
+        assert_eq!(p.num_channels, 4);
+        assert!(!p.truncated);
+        assert_eq!(p.cell(0, 0), c);
+        assert_eq!(p.cell(0, 0).command_letter(), 'D');
+        assert_eq!(p.cell(0, 0).volume_column(), ItVolumeColumn::Volume(40));
+        assert_eq!(p.cell(2, 3), cmd_cell('B', 1));
+        assert_eq!(p.cell(2, 3).command_letter(), 'B');
+        assert_eq!(p.cell(1, 0), ItCell::default());
+        assert_eq!(p.cell(99, 99), ItCell::default());
+    }
+
+    #[test]
+    fn pattern_previous_value_masks_replay_channel_memory() {
+        // Row 0: channel 1 writes note+inst+vol+cmd explicitly.
+        // Row 1: channel 1 marker WITHOUT bit 7 → reuses the previous
+        //        mask (all four explicit fields, so four new bytes).
+        // Row 2: channel 1 marker with a mask of 0xF0 → all four
+        //        columns come from memory, no bytes read.
+        // Row 3: channel 2 with mask 0x11: an explicit note byte AND
+        //        bit 4; the explicit read updates memory first, then
+        //        the bit-4 replay reads it back (same value).
+        let mut data = vec![
+            0x80 | 2,
+            0x0F,
+            48,
+            2,
+            30,
+            8,
+            0x40,
+            0, // row 0
+            2,
+            50,
+            3,
+            31,
+            9,
+            0x41,
+            0, // row 1: same mask, new bytes
+            0x80 | 2,
+            0xF0,
+            0, // row 2: all from memory
+            0x80 | 3,
+            0x11,
+            72,
+            0, // row 3: channel 2 explicit+memory note
+        ];
+        let mut file = vec![0u8; IT_PATTERN_HEADER_SIZE + 1];
+        file[1..3].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        file[3..5].copy_from_slice(&4u16.to_le_bytes());
+        file.append(&mut data);
+        let p = parse_pattern(&file, 1);
+        assert_eq!(p.num_channels, 3);
+        let r0 = p.cell(0, 1);
+        assert_eq!(
+            (r0.note, r0.instrument, r0.volpan, r0.command, r0.param),
+            (48, 2, 30, 8, 0x40)
+        );
+        let r1 = p.cell(1, 1);
+        assert_eq!(
+            (r1.note, r1.instrument, r1.volpan, r1.command, r1.param),
+            (50, 3, 31, 9, 0x41)
+        );
+        assert_eq!(r1.mask, 0x0F);
+        let r2 = p.cell(2, 1);
+        assert_eq!(r2, r1, "0xF0 mask replays the channel's last values");
+        let r3 = p.cell(3, 2);
+        assert_eq!(r3.note, 72);
+        assert_eq!(r3.mask, IT_CELL_NOTE);
+        assert_eq!(p.cell(3, 1), ItCell::default());
+    }
+
+    #[test]
+    fn pattern_truncated_data_leaves_remaining_rows_empty() {
+        let bytes = build_pattern(8, &[(0, 0, note_cell(60, 1)), (5, 0, note_cell(62, 1))]);
+        let mut file = vec![0u8];
+        file.extend_from_slice(&bytes);
+        // Cut inside row 5's cell: drop its note+instrument bytes and
+        // the three row terminators that follow, leaving marker+mask.
+        file.truncate(file.len() - 5);
+        let p = parse_pattern(&file, 1);
+        assert!(p.truncated);
+        assert_eq!(p.rows.len(), 8);
+        assert_eq!(p.cell(0, 0).note, 60);
+        assert_eq!(p.cell(5, 0), ItCell::default());
+        // Header past EOF → empty 64-row pattern.
+        let p = parse_pattern(&file, file.len() - 2);
+        assert_eq!(p.num_rows, IT_EMPTY_PATTERN_ROWS);
+        assert_eq!(p.rows.len(), 64);
+    }
+
+    #[test]
+    fn pattern_row_count_is_clamped() {
+        let mut file = vec![0u8; IT_PATTERN_HEADER_SIZE + 1];
+        file[3..5].copy_from_slice(&5000u16.to_le_bytes());
+        let p = parse_pattern(&file, 1);
+        assert_eq!(p.num_rows, IT_MAX_PATTERN_ROWS);
+        assert_eq!(p.rows.len(), 200);
+        file[3..5].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(parse_pattern(&file, 1).num_rows, 1);
+    }
+
+    #[test]
+    fn cell_predicates_and_volume_column_ranges() {
+        let mut c = ItCell {
+            mask: IT_CELL_NOTE,
+            note: IT_NOTE_OFF,
+            ..ItCell::default()
+        };
+        assert!(c.is_note_off() && !c.has_note() && !c.is_note_cut() && !c.is_note_fade());
+        c.note = IT_NOTE_CUT;
+        assert!(c.is_note_cut());
+        c.note = 130;
+        assert!(c.is_note_fade());
+        c.note = 119;
+        assert!(c.has_note());
+        c.mask = 0;
+        assert!(!c.has_note() && !c.is_note_off());
+        assert_eq!(c.volume_column(), ItVolumeColumn::None);
+        let vc = |v: u8| {
+            ItCell {
+                mask: IT_CELL_VOLPAN,
+                volpan: v,
+                ..ItCell::default()
+            }
+            .volume_column()
+        };
+        assert_eq!(vc(64), ItVolumeColumn::Volume(64));
+        assert_eq!(vc(65), ItVolumeColumn::FineVolumeUp(0));
+        assert_eq!(vc(74), ItVolumeColumn::FineVolumeUp(9));
+        assert_eq!(vc(75), ItVolumeColumn::FineVolumeDown(0));
+        assert_eq!(vc(85), ItVolumeColumn::VolumeSlideUp(0));
+        assert_eq!(vc(104), ItVolumeColumn::VolumeSlideDown(9));
+        assert_eq!(vc(105), ItVolumeColumn::PitchSlideDown(0));
+        assert_eq!(vc(124), ItVolumeColumn::PitchSlideUp(9));
+        assert_eq!(vc(125), ItVolumeColumn::None);
+        assert_eq!(vc(128), ItVolumeColumn::Panning(0));
+        assert_eq!(vc(192), ItVolumeColumn::Panning(64));
+        assert_eq!(vc(193), ItVolumeColumn::TonePortamento(0));
+        assert_eq!(vc(202), ItVolumeColumn::TonePortamento(9));
+        assert_eq!(vc(203), ItVolumeColumn::Vibrato(0));
+        assert_eq!(vc(212), ItVolumeColumn::Vibrato(9));
+        assert_eq!(vc(213), ItVolumeColumn::None);
+        assert_eq!(IT_VOLCOL_PORTA_SLIDE_TABLE[9], 255);
+        assert_eq!(cmd_cell('Z', 0).command_letter(), 'Z');
+        assert_eq!(
+            ItCell {
+                command: 27,
+                ..ItCell::default()
+            }
+            .command_letter(),
+            '?'
+        );
+    }
+
+    /// Assemble a complete module: header + instruments + samples +
+    /// patterns (each `(rows, cells)`) with the offset tables patched.
+    pub(crate) fn build_module(
+        orders: &[u8],
+        flags: u16,
+        instruments: &[Vec<u8>],
+        samples: &[(Vec<u8>, Vec<u8>)],
+        patterns: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut file = build_header(
+            "synth",
+            orders,
+            instruments.len(),
+            samples.len(),
+            patterns.len(),
+            flags,
+        );
+        let ins_base = IT_HEADER_FIXED_SIZE + orders.len();
+        let smp_base = ins_base + 4 * instruments.len();
+        let pat_base = smp_base + 4 * samples.len();
+        for (i, ins) in instruments.iter().enumerate() {
+            let at = file.len() as u32;
+            set_offset(&mut file, ins_base, i, at);
+            file.extend_from_slice(ins);
+        }
+        for (i, (hdr, body)) in samples.iter().enumerate() {
+            let hdr_off = file.len();
+            set_offset(&mut file, smp_base, i, hdr_off as u32);
+            file.extend_from_slice(hdr);
+            let body_off = file.len() as u32;
+            file[hdr_off + 0x48..hdr_off + 0x4C].copy_from_slice(&body_off.to_le_bytes());
+            file.extend_from_slice(body);
+        }
+        for (i, pat) in patterns.iter().enumerate() {
+            let at = file.len() as u32;
+            set_offset(&mut file, pat_base, i, at);
+            file.extend_from_slice(pat);
+        }
+        file
+    }
+
+    #[test]
+    fn parse_module_bundles_everything_and_counts_channels() {
+        let smp_hdr = build_sample_header(
+            "sq",
+            IT_SMP_HAS_SAMPLE,
+            IT_CVT_SIGNED,
+            4,
+            (0, 0, 0, 0),
+            8363,
+            0,
+        );
+        let pat0 = build_pattern(16, &[(0, 0, note_cell(60, 1)), (4, 5, note_cell(64, 1))]);
+        let pat1 = build_pattern(8, &[(0, 1, note_cell(60, 1))]);
+        let file = build_module(
+            &[0, 1, IT_ORDER_SKIP, 0, IT_ORDER_END, 1],
+            IT_FLAG_LINEAR_SLIDES,
+            &[build_new_instrument("i", (0, 0, 0), 0, &[], [NO_ENV; 3])],
+            &[(smp_hdr, vec![0x40, 0x40, 0xC0, 0xC0])],
+            &[pat0, pat1],
+        );
+        let m = parse_module(&file).unwrap();
+        assert_eq!(m.header.song_name, "synth");
+        assert_eq!(m.instruments.len(), 1);
+        assert_eq!(m.samples.len(), 1);
+        assert_eq!(
+            m.samples[0].pcm,
+            [0x40 << 8, 0x40 << 8, -0x40 << 8, -0x40 << 8]
+        );
+        assert_eq!(m.patterns.len(), 2);
+        assert_eq!(m.patterns[0].num_channels, 6);
+        assert_eq!(m.patterns[1].num_channels, 2);
+        assert_eq!(m.num_channels, 6);
+        assert_eq!(m.message, None);
+        // Duration: orders 0,1,(skip),0 → 16+8+16 = 40 rows × 6 ticks ×
+        // 2.5/125 s = 4.8 s; the `---` stops the walk before the last 1.
+        assert_eq!(estimate_duration_micros(&m.header, &m.patterns), 4_800_000);
+        assert!(parse_module(&[0u8; 300]).is_err());
     }
 
     #[test]
