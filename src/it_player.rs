@@ -2927,4 +2927,363 @@ pub(crate) mod tests {
             "old effects doubles the depth"
         );
     }
+    #[test]
+    fn compat_gxx_retunes_on_sample_change_and_links_e_f_g_memory() {
+        // §"Impulse Header Layout" Flags bit 5: "Link Effect G's memory
+        // with Effect E/F. Also Gxx with an instrument present will
+        // cause the envelopes to be retriggered. If you change a sample
+        // on a row with Gxx, it'll adjust the frequency of the current
+        // note according to: NewFrequency = OldFrequency * NewC5 / OldC5".
+        use crate::it::{IT_ENV_ON, IT_FLAG_COMPAT_GXX};
+        let nodes: &[(i8, u16)] = &[(64, 0), (0, 40)];
+        let ins_a = build_new_instrument(
+            "a",
+            (0, 0, 0),
+            0,
+            &(0..120).map(|n| (n, 1)).collect::<Vec<_>>(),
+            [
+                (IT_ENV_ON, 0, 0, 0, 0, nodes),
+                (0, 0, 0, 0, 0, &[]),
+                (0, 0, 0, 0, 0, &[]),
+            ],
+        );
+        let ins_b = build_new_instrument(
+            "b",
+            (0, 0, 0),
+            0,
+            &(0..120).map(|n| (n, 2)).collect::<Vec<_>>(),
+            [
+                (IT_ENV_ON, 0, 0, 0, 0, nodes),
+                (0, 0, 0, 0, 0, &[]),
+                (0, 0, 0, 0, 0, &[]),
+            ],
+        );
+        let (mut hi_hdr, hi_body) = square_sample(0);
+        hi_hdr[0x3C..0x40].copy_from_slice(&16726u32.to_le_bytes());
+        let mut g = note_cell(60, 2);
+        g.mask |= IT_CELL_COMMAND;
+        g.command = FX_G;
+        g.param = 0x00;
+        let pat = build_pattern(
+            4,
+            &[
+                (0, 0, note_cell(60, 1)),
+                (0, 0, cmd_cell('F', 0x03)),
+                (1, 0, g),
+                (2, 0, cmd_cell('E', 0x00)),
+            ],
+        );
+        let m = build_module(
+            &[0],
+            IT_FLAG_LINEAR_SLIDES | IT_FLAG_INSTRUMENTS | IT_FLAG_COMPAT_GXX,
+            &[ins_a, ins_b],
+            &[square_sample(0), (hi_hdr, hi_body)],
+            &[pat],
+        );
+        let mut p = player(&m);
+        // Row 0: F03 (12 units/tick × 5 ticks).
+        render_all_frames(&mut p, 6 * 882);
+        let after_row0 = linear_slide(8363.0, 60.0);
+        assert!((p.channels[0].freq - after_row0).abs() < 1e-3);
+        // Row 1 tick 0: G00 with instrument 2 (C5 16726): retune ×2, the
+        // envelope restarts, and G00 inherits F's memory (03).
+        p.render(&mut [0i16; 2]);
+        let vi = p.channels[0].voice.unwrap();
+        assert_eq!(p.voices[vi].vol_env.tick, 1, "envelope retriggered");
+        assert!(
+            (p.channels[0].freq - after_row0 * 2.0).abs() < 1e-3,
+            "NewC5/OldC5 retune"
+        );
+        assert_eq!(p.channels[0].c5_speed, 16726);
+        assert_eq!(p.channels[0].mem_g, 0x03, "G shares E/F memory");
+        assert!((p.channels[0].porta_target - 16726.0).abs() < 1e-6);
+        // Row 2: E00 reuses the linked memory (03) → slides down 12/tick.
+        render_all_frames(&mut p, 6 * 882);
+        let at_row2 = p.channels[0].freq;
+        render_all_frames(&mut p, 882);
+        assert!((p.channels[0].freq - linear_slide(at_row2, -12.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn old_effects_vibrato_is_period_domain_and_holds_over_row_ticks() {
+        let mut c = note_cell(60, 1);
+        c.mask |= IT_CELL_COMMAND;
+        c.command = FX_H;
+        c.param = 0x28;
+        let pat = build_pattern(
+            4,
+            &[
+                (0, 0, c),
+                (1, 0, cmd_cell('H', 0)),
+                (2, 0, cmd_cell('H', 0)),
+            ],
+        );
+        let m = sample_mode_module(
+            IT_FLAG_LINEAR_SLIDES | crate::it::IT_FLAG_OLD_EFFECTS,
+            &[pat],
+            &[0],
+        );
+        let mut p = player(&m);
+        let mut freqs = Vec::new();
+        for _ in 0..13 {
+            p.render(&mut [0i16; 2]);
+            let vi = p.channels[0].voice.unwrap();
+            freqs.push(p.voices[vi].play_freq);
+            render_all_frames(&mut p, 881);
+        }
+        assert!(
+            (freqs[0] - 8363.0).abs() < 1e-6,
+            "no update on the note's row tick"
+        );
+        assert!(
+            freqs[1] < 8363.0,
+            "old effects: a positive table value lowers the pitch"
+        );
+        assert!(
+            (freqs[6] - freqs[5]).abs() < 1e-6,
+            "the row tick keeps the previous delta ({} vs {})",
+            freqs[5],
+            freqs[6]
+        );
+        assert!(
+            freqs[7] < freqs[6],
+            "and the slide resumes on the next non-row tick"
+        );
+    }
+
+    #[test]
+    fn panbrello_cycle_is_256_over_speed_ticks() {
+        // Y4F: speed 4 → one cycle every 64 ticks; peak (+30 at pos 64)
+        // on tick 16; depth 15 × 64 / 32 = 30.
+        let mut c = note_cell(60, 1);
+        c.mask |= IT_CELL_COMMAND | IT_CELL_VOLPAN;
+        c.volpan = 128 + 32;
+        c.command = FX_Y;
+        c.param = 0x4F;
+        let cells: Vec<(u16, u8, ItCell)> = std::iter::once((0u16, 0u8, c))
+            .chain((1..12u16).map(|r| (r, 0u8, cmd_cell('Y', 0))))
+            .collect();
+        let pat = build_pattern(12, &cells);
+        let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[pat], &[0]);
+        let mut p = player(&m);
+        let mut pans = Vec::new();
+        for _ in 0..33 {
+            p.render(&mut [0i16; 2]);
+            let vi = p.channels[0].voice.unwrap();
+            pans.push(p.voices[vi].final_pan);
+            render_all_frames(&mut p, 881);
+        }
+        assert_eq!(pans[0], 32, "tick 0 reads position 0");
+        assert_eq!(pans[16], 62, "peak +30 at tick 16");
+        assert_eq!(pans[32], 32, "back to centre at tick 32");
+        assert!(pans[8] > 32 && pans[8] < 62);
+    }
+
+    #[test]
+    fn s00_reuses_the_last_sxx_and_s6x_extends_the_row() {
+        let mut cut = note_cell(60, 1);
+        cut.mask |= IT_CELL_COMMAND;
+        cut.command = FX_S;
+        cut.param = 0xC1;
+        let mut again = note_cell(60, 1);
+        again.mask |= IT_CELL_COMMAND;
+        again.command = FX_S;
+        again.param = 0x00;
+        let pat = build_pattern(
+            4,
+            &[
+                (0, 0, cut),
+                (1, 0, again),
+                (2, 0, cmd_cell('S', 0x62)),
+                (3, 0, note_cell(60, 1)),
+            ],
+        );
+        let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[pat], &[0]);
+        let mut p = player(&m);
+        render_all_frames(&mut p, 6 * 882 + 2 * 882);
+        assert_eq!(p.row, 1);
+        assert_eq!(p.active_voices(), 0, "S00 repeated the SC1 cut");
+        // Row 2 has S62: the row lasts 6 + 2 ticks.
+        render_all_frames(&mut p, 4 * 882);
+        assert_eq!(p.row, 2);
+        render_all_frames(&mut p, 7 * 882);
+        assert_eq!(p.row, 2, "still row 2 after 7 ticks");
+        render_all_frames(&mut p, 882);
+        assert_eq!(p.row, 3);
+        assert_eq!(p.tick_delay, 0, "the extension is consumed");
+    }
+
+    #[test]
+    fn tempo_slides_t0x_t1x_move_the_tempo_per_tick() {
+        let pat = build_pattern(
+            3,
+            &[
+                (0, 0, note_cell(60, 1)),
+                (0, 0, cmd_cell('T', 0x02)),
+                (1, 0, cmd_cell('T', 0x13)),
+                (2, 0, cmd_cell('T', 0x00)),
+            ],
+        );
+        let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[pat], &[0]);
+        let mut p = player(&m);
+        // Each tick's length follows the tempo set at its start: enter
+        // the tick with one frame, then finish it.
+        let tick = |p: &mut ItPlayerState| {
+            p.render(&mut [0i16; 2]);
+            let spt = p.samples_per_tick() as usize;
+            render_all_frames(p, spt - 1);
+        };
+        tick(&mut p);
+        assert_eq!(p.tempo, 125, "T0x does nothing on the row tick");
+        for _ in 0..5 {
+            tick(&mut p);
+        }
+        assert_eq!(p.tempo, 115);
+        tick(&mut p);
+        assert_eq!(p.row, 1);
+        for _ in 0..5 {
+            tick(&mut p);
+        }
+        assert_eq!(p.tempo, 130, "T13: +3 per tick");
+        for _ in 0..6 {
+            tick(&mut p);
+        }
+        assert_eq!(p.tempo, 145, "T00 reuses the last parameter");
+    }
+
+    #[test]
+    fn note_fade_cell_and_s7x_past_note_controls() {
+        use crate::it::IT_ENV_ON;
+        let nodes: &[(i8, u16)] = &[(64, 0), (64, 100)];
+        let ins = build_new_instrument(
+            "cont",
+            (1, 0, 0),
+            64,
+            &[],
+            [
+                (IT_ENV_ON | crate::it::IT_ENV_LOOP, 0, 1, 0, 0, nodes),
+                (0, 0, 0, 0, 0, &[]),
+                (0, 0, 0, 0, 0, &[]),
+            ],
+        );
+        let fade_cell = ItCell {
+            mask: IT_CELL_NOTE,
+            note: 200,
+            ..ItCell::default()
+        };
+        let pat = build_pattern(
+            8,
+            &[
+                (0, 0, note_cell(60, 1)),
+                (1, 0, fade_cell),
+                (0, 1, note_cell(60, 1)),
+                (1, 1, note_cell(64, 1)),
+                (2, 1, cmd_cell('S', 0x70)),
+                (0, 2, note_cell(60, 1)),
+                (1, 2, note_cell(64, 1)),
+                (2, 2, cmd_cell('S', 0x72)),
+                (0, 3, note_cell(60, 1)),
+                (1, 3, cmd_cell('S', 0x73)),
+                (2, 3, note_cell(64, 1)),
+            ],
+        );
+        let m = build_module(
+            &[0],
+            IT_FLAG_LINEAR_SLIDES | IT_FLAG_INSTRUMENTS,
+            &[ins],
+            &[square_sample(0)],
+            &[pat],
+        );
+        let mut p = player(&m);
+        render_all_frames(&mut p, 2 * 6 * 882 + 1);
+        // ch0: "Others = note fade" — the voice fades without release.
+        let v0 = p.channels[0].voice.unwrap();
+        assert!(p.voices[v0].fading && !p.voices[v0].released);
+        // ch1: S70 cut the background voice; only the foreground is left.
+        let bg1 = p
+            .voices
+            .iter()
+            .filter(|v| v.active && v.host == 1 && v.background)
+            .count();
+        assert_eq!(bg1, 0, "S70 = past note cut");
+        // ch2: S72 fades the background voice.
+        let bg2: Vec<&ItVoice> = p
+            .voices
+            .iter()
+            .filter(|v| v.active && v.host == 2 && v.background)
+            .collect();
+        assert_eq!(bg2.len(), 1);
+        assert!(bg2[0].fading, "S72 = past note fade");
+        // ch3: S73 set the current note's NNA to cut, so the row-2 note
+        // did not leave a background voice.
+        let bg3 = p
+            .voices
+            .iter()
+            .filter(|v| v.active && v.host == 3 && v.background)
+            .count();
+        assert_eq!(bg3, 0, "S73 = NNA cut for the next note");
+    }
+
+    #[test]
+    fn instrument_column_alone_reloads_volume_and_pan_envelope_scales() {
+        use crate::it::IT_ENV_ON;
+        let pan_nodes: &[(i8, u16)] = &[(32, 0), (32, 100)];
+        let ins = build_new_instrument(
+            "pe",
+            (0, 0, 0),
+            0,
+            &[],
+            [
+                (0, 0, 0, 0, 0, &[]),
+                (IT_ENV_ON, 0, 0, 0, 0, pan_nodes),
+                (0, 0, 0, 0, 0, &[]),
+            ],
+        );
+        let mut vol = note_cell(60, 1);
+        vol.mask |= IT_CELL_VOLPAN;
+        vol.volpan = 10;
+        let inst_only = ItCell {
+            mask: crate::it::IT_CELL_INSTRUMENT,
+            instrument: 1,
+            ..ItCell::default()
+        };
+        let mut left = note_cell(60, 1);
+        left.mask |= IT_CELL_COMMAND;
+        left.command = FX_X;
+        left.param = 0x00;
+        let pat = build_pattern(
+            4,
+            &[
+                (0, 0, vol),
+                (1, 0, inst_only),
+                (0, 1, note_cell(60, 1)),
+                (0, 2, left),
+            ],
+        );
+        let m = build_module(
+            &[0],
+            IT_FLAG_LINEAR_SLIDES | IT_FLAG_INSTRUMENTS,
+            &[ins],
+            &[square_sample(0)],
+            &[pat],
+        );
+        let mut p = player(&m);
+        p.render(&mut [0i16; 2]);
+        assert_eq!(p.channels[0].volume, 10);
+        let v1 = p.channels[1].voice.unwrap();
+        assert_eq!(
+            p.voices[v1].final_pan, 64,
+            "centre pan + full envelope = hard right"
+        );
+        let v2 = p.channels[2].voice.unwrap();
+        assert_eq!(
+            p.voices[v2].final_pan, 0,
+            "hard-left pan leaves no room: stays left"
+        );
+        render_all_frames(&mut p, 6 * 882);
+        assert_eq!(
+            p.channels[0].volume, 64,
+            "instrument alone reloads the default volume"
+        );
+    }
 }

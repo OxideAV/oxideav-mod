@@ -2106,6 +2106,30 @@ pub(crate) mod tests {
     /// Each entry is `(row, channel, cell)`; the packer always emits a
     /// fresh mask byte (bit 7 of the channel marker set).
     pub(crate) fn build_pattern(num_rows: u16, cells: &[(u16, u8, ItCell)]) -> Vec<u8> {
+        // Entries naming the same (row, channel) merge: masks OR
+        // together and each column comes from the entry that set it.
+        let mut merged: Vec<(u16, u8, ItCell)> = Vec::new();
+        for &(r, ch, c) in cells {
+            if let Some(m) = merged.iter_mut().find(|(mr, mc, _)| *mr == r && *mc == ch) {
+                if c.mask & IT_CELL_NOTE != 0 {
+                    m.2.note = c.note;
+                }
+                if c.mask & IT_CELL_INSTRUMENT != 0 {
+                    m.2.instrument = c.instrument;
+                }
+                if c.mask & IT_CELL_VOLPAN != 0 {
+                    m.2.volpan = c.volpan;
+                }
+                if c.mask & IT_CELL_COMMAND != 0 {
+                    m.2.command = c.command;
+                    m.2.param = c.param;
+                }
+                m.2.mask |= c.mask;
+            } else {
+                merged.push((r, ch, c));
+            }
+        }
+        let cells = &merged;
         let mut data = Vec::new();
         for row in 0..num_rows {
             for &(r, ch, c) in cells.iter().filter(|(r, _, _)| *r == row) {
