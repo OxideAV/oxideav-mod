@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Impulse Tracker (`.it`) `IMPM` header parser (`it::parse_header`): counts, flags (stereo / instruments / linear slides / old effects / compatible Gxx), special bits, global + mix volume, speed / tempo, pan separation, per-channel pan + volume, order list, instrument / sample / pattern offset tables, song message (`it::extract_message`).
 - IT sample headers + bodies (`it::parse_samples`): 8/16-bit, signed/unsigned, Intel/Motorola byte order, delta storage, normal + sustain loops (forward / ping-pong) validated against the decoded body, sample vibrato fields, `ItLoopView` mixer source that swaps sustain → normal loop on release. Compressed bodies (flag bit 3) are recognised and left empty — the staged text names the flag only.
+- IT instruments (`it::parse_instruments`): old 1.x layout (flag byte, node-number loop points, per-tick table + node pairs, fadeout 0-64/512 rescaled) and 2.x layout (NNA / DCT / DCA, fadeout, pitch-pan separation + centre, global volume, default pan, random volume / pan, filter + MIDI bytes, 120-entry note→sample keymap, volume / panning / pitch envelopes with loop + sustain-loop node points); `ItEnvelope::value_at_x256` linear interpolation.
 
 ## [0.0.10](https://github.com/OxideAV/oxideav-mod/compare/v0.0.9...v0.0.10) - 2026-08-24
 

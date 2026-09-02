@@ -705,6 +705,395 @@ pub fn parse_samples(header: &ItHeader, bytes: &[u8]) -> Vec<ItSample> {
         .collect()
 }
 
+// ============================================================================
+// Instruments — §"Old Impulse Instrument Format" / §"Impulse Instrument
+// Format" / §"Envelope layout"
+// ============================================================================
+
+/// Number of note → (note, sample) keyboard-table entries.
+pub const IT_KEYMAP_ENTRIES: usize = 120;
+/// Maximum node count per envelope ("Node points, 25 sets").
+pub const IT_ENVELOPE_MAX_NODES: usize = 25;
+/// Envelope tick positions past this are "end of envelope" in the
+/// old per-tick table ("position >= 200").
+pub const IT_OLD_ENVELOPE_TICKS: usize = 200;
+/// Fadeout count the note-fade component starts from ("NFC should be
+/// initialised to 1024 when a note is played").
+pub const IT_FADEOUT_COUNT: u16 = 1024;
+
+/// New Note Action (`NNA`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ItNna {
+    #[default]
+    Cut = 0,
+    Continue = 1,
+    NoteOff = 2,
+    NoteFade = 3,
+}
+
+impl ItNna {
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => ItNna::Continue,
+            2 => ItNna::NoteOff,
+            3 => ItNna::NoteFade,
+            _ => ItNna::Cut,
+        }
+    }
+}
+
+/// Duplicate Check Type (`DCT`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ItDct {
+    #[default]
+    Off = 0,
+    Note = 1,
+    Sample = 2,
+    Instrument = 3,
+}
+
+impl ItDct {
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => ItDct::Note,
+            2 => ItDct::Sample,
+            3 => ItDct::Instrument,
+            _ => ItDct::Off,
+        }
+    }
+}
+
+/// Duplicate Check Action (`DCA`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ItDca {
+    #[default]
+    Cut = 0,
+    NoteOff = 1,
+    NoteFade = 2,
+}
+
+impl ItDca {
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => ItDca::NoteOff,
+            2 => ItDca::NoteFade,
+            _ => ItDca::Cut,
+        }
+    }
+}
+
+/// Envelope `Flg` bit 0: envelope on.
+pub const IT_ENV_ON: u8 = 1 << 0;
+/// Envelope `Flg` bit 1: loop on.
+pub const IT_ENV_LOOP: u8 = 1 << 1;
+/// Envelope `Flg` bit 2: sustain loop on.
+pub const IT_ENV_SUSTAIN_LOOP: u8 = 1 << 2;
+
+/// One instrument envelope (volume, panning or pitch), in the 2.x node
+/// model. Old-format volume envelopes are converted into this model at
+/// parse time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItEnvelope {
+    /// Raw `Flg` byte — see `IT_ENV_*`.
+    pub flags: u8,
+    /// Node points `(y, tick)`: y is `0->64` for volume, `-32->+32` for
+    /// panning / pitch; tick `0->9999`.
+    pub nodes: Vec<(i8, u16)>,
+    /// `LpB` / `LpE`: loop node indices.
+    pub loop_begin: u8,
+    pub loop_end: u8,
+    /// `SLB` / `SLE`: sustain-loop node indices.
+    pub sustain_begin: u8,
+    pub sustain_end: u8,
+}
+
+impl ItEnvelope {
+    pub fn is_on(&self) -> bool {
+        self.flags & IT_ENV_ON != 0 && !self.nodes.is_empty()
+    }
+    pub fn has_loop(&self) -> bool {
+        self.flags & IT_ENV_LOOP != 0
+    }
+    pub fn has_sustain_loop(&self) -> bool {
+        self.flags & IT_ENV_SUSTAIN_LOOP != 0
+    }
+    /// Tick of the last node (the envelope "end").
+    pub fn end_tick(&self) -> u16 {
+        self.nodes.last().map_or(0, |n| n.1)
+    }
+    /// Linear interpolation of the envelope at `tick`. Before the first
+    /// node the first value holds; after the last node the last value
+    /// holds. Returns `y * 256` (8 fractional bits) so integer callers
+    /// keep the interpolation precision.
+    pub fn value_at_x256(&self, tick: u16) -> i32 {
+        let Some(&(first_y, first_t)) = self.nodes.first() else {
+            return 0;
+        };
+        if tick <= first_t {
+            return first_y as i32 * 256;
+        }
+        for pair in self.nodes.windows(2) {
+            let (y0, t0) = (pair[0].0 as i32, pair[0].1);
+            let (y1, t1) = (pair[1].0 as i32, pair[1].1);
+            if tick >= t0 && tick < t1 {
+                let span = (t1 - t0) as i32;
+                return y0 * 256 + (y1 - y0) * 256 * (tick - t0) as i32 / span;
+            }
+        }
+        self.nodes.last().map_or(0, |n| n.0 as i32 * 256)
+    }
+}
+
+/// One `IMPI` instrument, either layout.
+#[derive(Clone, Debug)]
+pub struct ItInstrument {
+    /// DOS filename (12 bytes).
+    pub filename: String,
+    /// Instrument name (26 bytes).
+    pub name: String,
+    /// True when parsed from the old (`cmwt < 200h`) layout.
+    pub old_format: bool,
+    pub nna: ItNna,
+    pub dct: ItDct,
+    pub dca: ItDca,
+    /// Fadeout on the 2.x scale (`0->128`, count 1024). Old-format
+    /// values (`0->64`, count 512) are doubled so both count down the
+    /// same [`IT_FADEOUT_COUNT`].
+    pub fadeout: u16,
+    /// `PPS`: pitch-pan separation `-32->+32`.
+    pub pitch_pan_separation: i8,
+    /// `PPC`: pitch-pan centre note `0->119`.
+    pub pitch_pan_center: u8,
+    /// `GbV`: instrument global volume `0->128`.
+    pub global_volume: u8,
+    /// Raw `DfP`: `0->64`, `&128` = don't use.
+    pub default_pan: u8,
+    /// `RV`: random volume variation (percentage).
+    pub random_volume: u8,
+    /// `RP`: random panning variation.
+    pub random_pan: u8,
+    /// `TrkVers` (instrument files only).
+    pub tracker_version: u16,
+    /// `NoS` (instrument files only).
+    pub num_samples: u8,
+    /// `IFC` / `IFR` bytes of the 2.x layout (present in the layout
+    /// table; no semantics are given in the staged text).
+    pub filter_cutoff: u8,
+    pub filter_resonance: u8,
+    /// `MCh` / `MPr` / `MIDIBnk`.
+    pub midi_channel: u8,
+    pub midi_program: u8,
+    pub midi_bank: u16,
+    /// Note-Sample/Keyboard Table: `(note, sample)` per input note,
+    /// note `0->119`, sample `1-99` (`0` = no sample).
+    pub keymap: [(u8, u8); IT_KEYMAP_ENTRIES],
+    pub volume_envelope: ItEnvelope,
+    pub panning_envelope: ItEnvelope,
+    pub pitch_envelope: ItEnvelope,
+}
+
+impl Default for ItInstrument {
+    fn default() -> Self {
+        let mut keymap = [(0u8, 0u8); IT_KEYMAP_ENTRIES];
+        for (i, e) in keymap.iter_mut().enumerate() {
+            *e = (i as u8, 0);
+        }
+        ItInstrument {
+            filename: String::new(),
+            name: String::new(),
+            old_format: false,
+            nna: ItNna::Cut,
+            dct: ItDct::Off,
+            dca: ItDca::Cut,
+            fadeout: 0,
+            pitch_pan_separation: 0,
+            pitch_pan_center: 60,
+            global_volume: 128,
+            default_pan: 0x80 | 32,
+            random_volume: 0,
+            random_pan: 0,
+            tracker_version: 0,
+            num_samples: 0,
+            filter_cutoff: 0,
+            filter_resonance: 0,
+            midi_channel: 0,
+            midi_program: 0,
+            midi_bank: 0,
+            keymap,
+            volume_envelope: ItEnvelope::default(),
+            panning_envelope: ItEnvelope::default(),
+            pitch_envelope: ItEnvelope::default(),
+        }
+    }
+}
+
+impl ItInstrument {
+    /// Instrument default pan, `Some(0..=64)` unless bit 7 ("Don't
+    /// use") is set.
+    pub fn pan(&self) -> Option<u8> {
+        if self.default_pan & 0x80 != 0 {
+            None
+        } else {
+            Some(self.default_pan.min(64))
+        }
+    }
+    /// Keyboard-table lookup for pattern note `note` (`0..=119`):
+    /// `(sounding_note, sample_number)`; `sample_number == 0` means no
+    /// sample.
+    pub fn map_note(&self, note: u8) -> (u8, u8) {
+        self.keymap.get(note as usize).copied().unwrap_or((note, 0))
+    }
+}
+
+fn parse_keymap(bytes: &[u8]) -> [(u8, u8); IT_KEYMAP_ENTRIES] {
+    let mut keymap = [(0u8, 0u8); IT_KEYMAP_ENTRIES];
+    for (i, e) in keymap.iter_mut().enumerate() {
+        *e = (bytes[2 * i].min(IT_MAX_NOTE), bytes[2 * i + 1]);
+    }
+    keymap
+}
+
+/// Parse one 2.x envelope block (`Flg Num LpB LpE SLB SLE` + 25 × `(y,
+/// tick)`), 82 bytes.
+fn parse_new_envelope(e: &[u8]) -> ItEnvelope {
+    let num = (e[1] as usize).min(IT_ENVELOPE_MAX_NODES);
+    let mut nodes = Vec::with_capacity(num);
+    for i in 0..num {
+        let y = e[6 + 3 * i] as i8;
+        let tick = read_u16_le(e, 7 + 3 * i);
+        // Ticks must be non-decreasing for the segment walk to
+        // terminate; a hostile out-of-order node ends the list.
+        if let Some(&(_, prev)) = nodes.last() {
+            if tick < prev {
+                break;
+            }
+        }
+        nodes.push((y, tick));
+    }
+    let clamp = |v: u8| -> u8 { v.min(nodes.len().saturating_sub(1) as u8) };
+    ItEnvelope {
+        flags: e[0],
+        loop_begin: clamp(e[2]),
+        loop_end: clamp(e[3]),
+        sustain_begin: clamp(e[4]),
+        sustain_end: clamp(e[5]),
+        nodes,
+    }
+}
+
+/// Old-format volume envelope: 200 per-tick values (`0->64`, `0FFh`
+/// end) at `0x130`, then 25 `(tick, magnitude)` node pairs at `0x1F8`.
+/// The node list is preferred (it carries the loop-point numbering);
+/// when it is empty the per-tick table is turned into one node per
+/// tick.
+fn parse_old_volume_envelope(ins: &[u8], flg: u8, loops: [u8; 4]) -> ItEnvelope {
+    let mut nodes: Vec<(i8, u16)> = Vec::new();
+    for i in 0..IT_ENVELOPE_MAX_NODES {
+        let tick = ins[0x1F8 + 2 * i];
+        let mag = ins[0x1F9 + 2 * i];
+        if tick == 0xFF || mag == 0xFF {
+            break;
+        }
+        if let Some(&(_, prev)) = nodes.last() {
+            if (tick as u16) < prev {
+                break;
+            }
+        }
+        nodes.push((mag.min(64) as i8, tick as u16));
+    }
+    if nodes.is_empty() {
+        for (t, &v) in ins[0x130..0x130 + IT_OLD_ENVELOPE_TICKS].iter().enumerate() {
+            if v == 0xFF {
+                break;
+            }
+            nodes.push((v.min(64) as i8, t as u16));
+        }
+    }
+    let clamp = |v: u8| -> u8 { v.min(nodes.len().saturating_sub(1) as u8) };
+    ItEnvelope {
+        flags: flg & (IT_ENV_ON | IT_ENV_LOOP | IT_ENV_SUSTAIN_LOOP),
+        loop_begin: clamp(loops[0]),
+        loop_end: clamp(loops[1]),
+        sustain_begin: clamp(loops[2]),
+        sustain_end: clamp(loops[3]),
+        nodes,
+    }
+}
+
+/// Parse one instrument at `off` in the layout selected by
+/// `old_format` (see [`ItHeader::old_instrument_format`]).
+pub fn parse_instrument(bytes: &[u8], off: usize, old_format: bool) -> Result<ItInstrument> {
+    let end = off.checked_add(IT_INSTRUMENT_SIZE);
+    let Some(end) = end.filter(|&e| e <= bytes.len()) else {
+        return Err(Error::invalid("IT: instrument header past end of file"));
+    };
+    let ins = &bytes[off..end];
+    if &ins[0..4] != IT_INSTRUMENT_MAGIC {
+        return Err(Error::invalid("IT: instrument header missing 'IMPI' magic"));
+    }
+    let mut out = ItInstrument {
+        filename: trim_fixed_string(&ins[4..0x10]),
+        name: trim_fixed_string(&ins[0x20..0x3A]),
+        old_format,
+        tracker_version: read_u16_le(ins, 0x1C),
+        num_samples: ins[0x1E],
+        keymap: parse_keymap(&ins[0x40..0x130]),
+        ..ItInstrument::default()
+    };
+    if old_format {
+        let flg = ins[0x11];
+        let loops = [ins[0x12], ins[0x13], ins[0x14], ins[0x15]];
+        // "Ranges between 0 and 64, but the fadeout 'Count' is 512" →
+        // doubled onto the 0->128 / 1024 scale.
+        out.fadeout = (read_u16_le(ins, 0x18).min(64)) * 2;
+        out.nna = ItNna::from_byte(ins[0x1A]);
+        // DNC: "Duplicate note check (0 = Off, 1 = On)" — the 1.x
+        // check is by note, and a duplicate is cut.
+        if ins[0x1B] != 0 {
+            out.dct = ItDct::Note;
+            out.dca = ItDca::Cut;
+        }
+        out.volume_envelope = parse_old_volume_envelope(ins, flg, loops);
+    } else {
+        out.nna = ItNna::from_byte(ins[0x11]);
+        out.dct = ItDct::from_byte(ins[0x12]);
+        out.dca = ItDca::from_byte(ins[0x13]);
+        out.fadeout = read_u16_le(ins, 0x14).min(128);
+        out.pitch_pan_separation = (ins[0x16] as i8).clamp(-32, 32);
+        out.pitch_pan_center = ins[0x17].min(IT_MAX_NOTE);
+        out.global_volume = ins[0x18].min(128);
+        out.default_pan = ins[0x19];
+        out.random_volume = ins[0x1A];
+        out.random_pan = ins[0x1B];
+        out.filter_cutoff = ins[0x3A];
+        out.filter_resonance = ins[0x3B];
+        out.midi_channel = ins[0x3C];
+        out.midi_program = ins[0x3D];
+        out.midi_bank = read_u16_le(ins, 0x3E);
+        out.volume_envelope = parse_new_envelope(&ins[0x130..0x182]);
+        out.panning_envelope = parse_new_envelope(&ins[0x182..0x1D4]);
+        out.pitch_envelope = parse_new_envelope(&ins[0x1D4..0x226]);
+    }
+    Ok(out)
+}
+
+/// Parse every instrument named by the header's offset table. Bad or
+/// zero offsets yield a default (silent, identity-keymap) placeholder so
+/// 1-based instrument numbering stays aligned.
+pub fn parse_instruments(header: &ItHeader, bytes: &[u8]) -> Vec<ItInstrument> {
+    let old = header.old_instrument_format();
+    header
+        .instrument_offsets
+        .iter()
+        .map(|&off| {
+            if off == 0 {
+                return ItInstrument::default();
+            }
+            parse_instrument(bytes, off as usize, old).unwrap_or_default()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1056,6 +1445,298 @@ pub(crate) mod tests {
         assert_eq!(samples[0].pcm, [1 << 8, 2 << 8, 3 << 8]);
         assert!(!samples[1].has_sample() && samples[1].pcm.is_empty());
         assert!(!samples[2].has_sample() && samples[2].pcm.is_empty());
+    }
+
+    /// Serialise a 2.x instrument with the given envelopes
+    /// (`(flags, loop_b, loop_e, sus_b, sus_e, nodes)`).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn build_new_instrument(
+        name: &str,
+        nna_dct_dca: (u8, u8, u8),
+        fadeout: u16,
+        keymap: &[(u8, u8)],
+        envs: [(u8, u8, u8, u8, u8, &[(i8, u16)]); 3],
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; IT_INSTRUMENT_SIZE];
+        b[0..4].copy_from_slice(IT_INSTRUMENT_MAGIC);
+        b[4..12].copy_from_slice(b"INS00000");
+        b[0x11] = nna_dct_dca.0;
+        b[0x12] = nna_dct_dca.1;
+        b[0x13] = nna_dct_dca.2;
+        b[0x14..0x16].copy_from_slice(&fadeout.to_le_bytes());
+        b[0x16] = 0; // PPS
+        b[0x17] = 60; // PPC
+        b[0x18] = 128; // GbV
+        b[0x19] = 0x80; // DfP: don't use
+        let n = name.as_bytes();
+        b[0x20..0x20 + n.len().min(25)].copy_from_slice(&n[..n.len().min(25)]);
+        for i in 0..IT_KEYMAP_ENTRIES {
+            let (note, smp) = keymap.get(i).copied().unwrap_or((i as u8, 1));
+            b[0x40 + 2 * i] = note;
+            b[0x41 + 2 * i] = smp;
+        }
+        for (k, base) in [0x130usize, 0x182, 0x1D4].into_iter().enumerate() {
+            let (flg, lb, le, sb, se, nodes) = envs[k];
+            b[base] = flg;
+            b[base + 1] = nodes.len() as u8;
+            b[base + 2] = lb;
+            b[base + 3] = le;
+            b[base + 4] = sb;
+            b[base + 5] = se;
+            for (i, &(y, t)) in nodes.iter().enumerate().take(IT_ENVELOPE_MAX_NODES) {
+                b[base + 6 + 3 * i] = y as u8;
+                b[base + 7 + 3 * i..base + 9 + 3 * i].copy_from_slice(&t.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    const NO_ENV: (u8, u8, u8, u8, u8, &[(i8, u16)]) = (0, 0, 0, 0, 0, &[]);
+
+    #[test]
+    fn new_instrument_fields_and_envelopes() {
+        let vol_nodes: &[(i8, u16)] = &[(64, 0), (32, 10), (0, 30)];
+        let pan_nodes: &[(i8, u16)] = &[(-32, 0), (32, 100)];
+        let mut b = build_new_instrument(
+            "lead",
+            (3, 2, 1),
+            77,
+            &[(60, 2), (61, 3)],
+            [
+                (IT_ENV_ON | IT_ENV_LOOP, 0, 1, 1, 2, vol_nodes),
+                (IT_ENV_ON | IT_ENV_SUSTAIN_LOOP, 0, 0, 0, 1, pan_nodes),
+                NO_ENV,
+            ],
+        );
+        b[0x16] = (-8i8) as u8;
+        b[0x17] = 48;
+        b[0x18] = 100;
+        b[0x19] = 20;
+        b[0x1A] = 15;
+        b[0x1B] = 7;
+        b[0x1C..0x1E].copy_from_slice(&0x0214u16.to_le_bytes());
+        b[0x1E] = 2;
+        b[0x3A] = 0x7F;
+        b[0x3B] = 0x10;
+        b[0x3C] = 3;
+        b[0x3D] = 4;
+        b[0x3E..0x40].copy_from_slice(&0x0102u16.to_le_bytes());
+        let i = parse_instrument(&b, 0, false).unwrap();
+        assert_eq!(i.name, "lead");
+        assert_eq!(i.filename, "INS00000");
+        assert!(!i.old_format);
+        assert_eq!(
+            (i.nna, i.dct, i.dca),
+            (ItNna::NoteFade, ItDct::Sample, ItDca::NoteOff)
+        );
+        assert_eq!(i.fadeout, 77);
+        assert_eq!(i.pitch_pan_separation, -8);
+        assert_eq!(i.pitch_pan_center, 48);
+        assert_eq!(i.global_volume, 100);
+        assert_eq!(i.pan(), Some(20));
+        assert_eq!((i.random_volume, i.random_pan), (15, 7));
+        assert_eq!((i.tracker_version, i.num_samples), (0x0214, 2));
+        assert_eq!((i.filter_cutoff, i.filter_resonance), (0x7F, 0x10));
+        assert_eq!(
+            (i.midi_channel, i.midi_program, i.midi_bank),
+            (3, 4, 0x0102)
+        );
+        assert_eq!(i.map_note(0), (60, 2));
+        assert_eq!(i.map_note(1), (61, 3));
+        assert_eq!(i.map_note(5), (5, 1));
+        assert_eq!(i.map_note(200), (200, 0), "out-of-range note → no sample");
+        let v = &i.volume_envelope;
+        assert!(v.is_on() && v.has_loop() && !v.has_sustain_loop());
+        assert_eq!(v.nodes, vol_nodes);
+        assert_eq!(
+            (v.loop_begin, v.loop_end, v.sustain_begin, v.sustain_end),
+            (0, 1, 1, 2)
+        );
+        assert_eq!(v.end_tick(), 30);
+        let p = &i.panning_envelope;
+        assert!(p.is_on() && p.has_sustain_loop());
+        assert_eq!(p.nodes, pan_nodes);
+        assert!(!i.pitch_envelope.is_on());
+    }
+
+    #[test]
+    fn envelope_interpolation_holds_ends_and_is_linear() {
+        let e = ItEnvelope {
+            flags: IT_ENV_ON,
+            nodes: vec![(64, 0), (0, 16), (32, 24)],
+            ..ItEnvelope::default()
+        };
+        assert_eq!(e.value_at_x256(0), 64 * 256);
+        assert_eq!(e.value_at_x256(8), 32 * 256);
+        assert_eq!(e.value_at_x256(4), 48 * 256);
+        assert_eq!(e.value_at_x256(16), 0);
+        assert_eq!(e.value_at_x256(20), 16 * 256);
+        assert_eq!(e.value_at_x256(24), 32 * 256);
+        assert_eq!(
+            e.value_at_x256(999),
+            32 * 256,
+            "past the end the last value holds"
+        );
+        let late = ItEnvelope {
+            flags: IT_ENV_ON,
+            nodes: vec![(10, 5), (20, 9)],
+            ..ItEnvelope::default()
+        };
+        assert_eq!(
+            late.value_at_x256(0),
+            10 * 256,
+            "before the first node the first value holds"
+        );
+        assert_eq!(ItEnvelope::default().value_at_x256(3), 0);
+        assert!(!ItEnvelope {
+            flags: IT_ENV_ON,
+            ..ItEnvelope::default()
+        }
+        .is_on());
+    }
+
+    #[test]
+    fn hostile_envelope_nodes_are_clamped() {
+        // Out-of-order ticks end the node list; loop indices clamp to
+        // the surviving node count.
+        let nodes: &[(i8, u16)] = &[(0, 0), (10, 10), (20, 5), (30, 30)];
+        let mut b = build_new_instrument(
+            "h",
+            (0, 0, 0),
+            0,
+            &[],
+            [
+                (IT_ENV_ON | IT_ENV_LOOP, 3, 200, 0, 250, nodes),
+                NO_ENV,
+                NO_ENV,
+            ],
+        );
+        b[0x130 + 1] = 200; // Num far above 25
+        let i = parse_instrument(&b, 0, false).unwrap();
+        assert_eq!(i.volume_envelope.nodes, vec![(0, 0), (10, 10)]);
+        assert_eq!(i.volume_envelope.loop_begin, 1);
+        assert_eq!(i.volume_envelope.loop_end, 1);
+        assert_eq!(i.volume_envelope.sustain_end, 1);
+    }
+
+    /// Serialise an old (1.x) instrument.
+    pub(crate) fn build_old_instrument(
+        flg: u8,
+        loops: [u8; 4],
+        fadeout: u16,
+        nna: u8,
+        dnc: u8,
+        table: &[u8],
+        nodes: &[(u8, u8)],
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; IT_INSTRUMENT_SIZE];
+        b[0..4].copy_from_slice(IT_INSTRUMENT_MAGIC);
+        b[0x11] = flg;
+        b[0x12..0x16].copy_from_slice(&loops);
+        b[0x18..0x1A].copy_from_slice(&fadeout.to_le_bytes());
+        b[0x1A] = nna;
+        b[0x1B] = dnc;
+        b[0x20..0x23].copy_from_slice(b"old");
+        for i in 0..IT_KEYMAP_ENTRIES {
+            b[0x40 + 2 * i] = i as u8;
+            b[0x41 + 2 * i] = 1;
+        }
+        for v in b[0x130..0x1F8].iter_mut() {
+            *v = 0xFF;
+        }
+        b[0x130..0x130 + table.len()].copy_from_slice(table);
+        for v in b[0x1F8..0x1F8 + 50].iter_mut() {
+            *v = 0xFF;
+        }
+        for (i, &(t, m)) in nodes.iter().enumerate() {
+            b[0x1F8 + 2 * i] = t;
+            b[0x1F9 + 2 * i] = m;
+        }
+        b
+    }
+
+    #[test]
+    fn old_instrument_converts_to_the_new_model() {
+        let b = build_old_instrument(
+            IT_ENV_ON | IT_ENV_SUSTAIN_LOOP,
+            [0, 2, 1, 1],
+            40,
+            2,
+            1,
+            &[64, 60, 56],
+            &[(0, 64), (4, 48), (8, 0)],
+        );
+        let i = parse_instrument(&b, 0, true).unwrap();
+        assert!(i.old_format);
+        assert_eq!(i.name, "old");
+        assert_eq!(
+            i.fadeout, 80,
+            "old 0->64/512 fadeout doubles onto 0->128/1024"
+        );
+        assert_eq!(i.nna, ItNna::NoteOff);
+        assert_eq!((i.dct, i.dca), (ItDct::Note, ItDca::Cut));
+        assert_eq!(i.global_volume, 128);
+        assert_eq!(i.pan(), None);
+        let v = &i.volume_envelope;
+        assert!(v.is_on() && v.has_sustain_loop() && !v.has_loop());
+        assert_eq!(v.nodes, vec![(64, 0), (48, 4), (0, 8)]);
+        assert_eq!(
+            (v.loop_begin, v.loop_end, v.sustain_begin, v.sustain_end),
+            (0, 2, 1, 1)
+        );
+        assert!(!i.panning_envelope.is_on() && !i.pitch_envelope.is_on());
+        assert_eq!(i.map_note(7), (7, 1));
+    }
+
+    #[test]
+    fn old_instrument_falls_back_to_the_per_tick_table() {
+        // No node pairs (all 0xFF) — the 200-byte per-tick table becomes
+        // one node per tick up to the 0FFh terminator.
+        let b = build_old_instrument(IT_ENV_ON, [0, 0, 0, 0], 64, 0, 0, &[64, 32, 16, 8], &[]);
+        let i = parse_instrument(&b, 0, true).unwrap();
+        assert_eq!(i.fadeout, 128);
+        assert_eq!(
+            i.volume_envelope.nodes,
+            vec![(64, 0), (32, 1), (16, 2), (8, 3)]
+        );
+        assert_eq!(i.volume_envelope.value_at_x256(2), 16 * 256);
+    }
+
+    #[test]
+    fn instrument_rejects_bad_magic_and_short_buffer() {
+        let mut b = build_new_instrument("x", (0, 0, 0), 0, &[], [NO_ENV; 3]);
+        assert!(parse_instrument(&b[..IT_INSTRUMENT_SIZE - 1], 0, false).is_err());
+        assert!(parse_instrument(&b, usize::MAX - 10, false).is_err());
+        b[1] = b'X';
+        assert!(parse_instrument(&b, 0, false).is_err());
+    }
+
+    #[test]
+    fn parse_instruments_follows_offsets_with_placeholders() {
+        let mut file = build_header("i", &[0], 3, 0, 1, IT_FLAG_INSTRUMENTS);
+        let ins_base = IT_HEADER_FIXED_SIZE + 1;
+        let off = file.len() as u32;
+        file.extend_from_slice(&build_new_instrument(
+            "real",
+            (1, 0, 0),
+            5,
+            &[],
+            [NO_ENV; 3],
+        ));
+        set_offset(&mut file, ins_base, 1, off);
+        set_offset(&mut file, ins_base, 2, 0xFFFF_0000);
+        let h = parse_header(&file).unwrap();
+        let ins = parse_instruments(&h, &file);
+        assert_eq!(ins.len(), 3);
+        assert_eq!(ins[0].name, "");
+        assert_eq!(
+            ins[0].map_note(12),
+            (12, 0),
+            "placeholder keymap has no samples"
+        );
+        assert_eq!(ins[1].name, "real");
+        assert_eq!(ins[1].nna, ItNna::Continue);
+        assert_eq!(ins[2].name, "");
     }
 
     #[test]
