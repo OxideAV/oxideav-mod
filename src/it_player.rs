@@ -403,8 +403,8 @@ pub struct ItChannel {
     pub param: u8,
     /// Volume column in force for this row.
     pub volcol: ItVolumeColumn,
-    /// Tremor on/off counter.
-    pub tremor_count: u8,
+    /// Tremor position within the on+off cycle (advances every tick).
+    pub tremor_pos: u8,
     pub tremor_off: bool,
     pub retrig_count: u8,
     pub glissando: bool,
@@ -427,6 +427,9 @@ pub struct ItChannel {
     /// Set when a cell on this row started a tone portamento (note not
     /// retriggered).
     pub porta_this_row: bool,
+    /// A note was triggered on the current tick (suppresses the retrig
+    /// counter on that tick).
+    pub note_triggered: bool,
 }
 
 impl ItChannel {
@@ -725,17 +728,11 @@ impl ItPlayerState {
             if !env_on || env_loops {
                 v.fading = true;
             }
-        } else {
-            // Sample mode: a note off releases the sustain loop; a sample
-            // with no sustain loop has nothing to release into and is cut.
-            let has_sustain = module
-                .samples
-                .get(v.sample as usize - 1)
-                .is_some_and(|s| s.sustain_loop().is_some());
-            if !has_sustain {
-                v.active = false;
-            }
         }
+        // Sample mode: a note off only opens the sustain loop; a sample
+        // without one keeps playing (verified against the black-box
+        // oracle — the note is neither cut nor faded).
+        let _ = module;
     }
 
     /// Duplicate check (`DCT`) against every voice on host channel `ch`
@@ -857,8 +854,10 @@ impl ItPlayerState {
         chan.vib_pos = 0;
         chan.trem_pos = 0;
         chan.panb_pos = 0;
-        chan.tremor_count = 0;
+        chan.tremor_pos = 0;
         chan.tremor_off = false;
+        chan.retrig_count = 0;
+        chan.note_triggered = true;
 
         let v = &mut self.voices[vi];
         *v = ItVoice {
@@ -1272,21 +1271,22 @@ impl ItPlayerState {
                 }
             }
             FX_P => {
+                // Panning slide: Px0 slides LEFT by x per tick, P0y slides
+                // RIGHT by y; PxF / PFy are the fine (tick-0) forms.
                 let c = &mut self.channels[ch];
                 let p = Self::mem(&mut c.mem_p, param);
                 let (px, py) = (p >> 4, p & 0x0F);
                 if c.pan != IT_PAN_SURROUND {
                     if py == 0xF && px != 0 {
-                        c.pan = (c.pan + px).min(64);
+                        c.pan = c.pan.saturating_sub(px);
                     } else if px == 0xF && py != 0 {
-                        c.pan = c.pan.saturating_sub(py);
+                        c.pan = (c.pan + py).min(64);
                     }
                 }
             }
             FX_Q => {
                 let c = &mut self.channels[ch];
                 Self::mem(&mut c.mem_q, param);
-                c.retrig_count = 0;
             }
             FX_R => {
                 let c = &mut self.channels[ch];
@@ -1507,12 +1507,15 @@ impl ItPlayerState {
             let rnd = self.rand_wave();
             let c = &mut self.channels[ch];
             let depth = c.mem_h_depth as i32;
+            // The position advances BEFORE the table read (the row tick
+            // already sounds at `speed`, verified against the black-box
+            // oracle tick by tick).
+            c.vib_pos = c.vib_pos.wrapping_add(c.mem_h_speed);
             let w = waveform(c.vib_wave, c.vib_pos, rnd);
             // Vibrato depth is expressed in the fine-slide units of the
             // slide mode: `table(±64) * depth / 64` → ±depth units
             // (linear 1/64-semitone steps, or Amiga period units).
             c.vib_delta = (w * depth) as f64 / 64.0;
-            c.vib_pos = c.vib_pos.wrapping_add(c.mem_h_speed);
         } else {
             self.channels[ch].vib_delta = 0.0;
         }
@@ -1525,7 +1528,7 @@ impl ItPlayerState {
                 let speed = (c.mem_r >> 4) * 4;
                 let depth = (c.mem_r & 0x0F) as i32;
                 let w = waveform(c.trem_wave, c.trem_pos, rnd);
-                c.trem_delta = w * depth / 16;
+                c.trem_delta = w * depth / 32;
                 c.trem_pos = c.trem_pos.wrapping_add(speed);
             }
         } else {
@@ -1555,6 +1558,34 @@ impl ItPlayerState {
             }
         } else {
             self.channels[ch].panb_delta = 0;
+        }
+
+        // ---- tremor (Ixy): every tick, on for x then off for y ----
+        if cmd == FX_I {
+            let c = &mut self.channels[ch];
+            let p = c.mem_i;
+            let mut on = p >> 4;
+            let mut off = p & 0x0F;
+            if self.old_effects {
+                on += 1;
+                off += 1;
+            }
+            let period = (on as u16 + off as u16).max(1);
+            c.tremor_off = (c.tremor_pos as u16) >= on as u16;
+            c.tremor_pos = ((c.tremor_pos as u16 + 1) % period) as u8;
+        } else {
+            self.channels[ch].tremor_off = false;
+        }
+
+        // ---- retrig (Qxy): the counter runs every tick, across rows ----
+        if cmd == FX_Q {
+            if self.channels[ch].note_triggered {
+                self.channels[ch].note_triggered = false;
+            } else {
+                self.retrig_tick(ch);
+            }
+        } else {
+            self.channels[ch].note_triggered = false;
         }
 
         if first_tick {
@@ -1607,23 +1638,6 @@ impl ItPlayerState {
                 }
             }
             FX_G => self.tone_porta_step(ch),
-            FX_I => {
-                // Tremor: on for x ticks, off for y ticks (+1 each under
-                // old effects).
-                let c = &mut self.channels[ch];
-                let p = c.mem_i;
-                let mut on = p >> 4;
-                let mut off = p & 0x0F;
-                if self.old_effects {
-                    on += 1;
-                    off += 1;
-                }
-                if c.tremor_count == 0 {
-                    c.tremor_off = !c.tremor_off;
-                    c.tremor_count = if c.tremor_off { off } else { on };
-                }
-                c.tremor_count = c.tremor_count.saturating_sub(1);
-            }
             FX_J => {
                 let c = &mut self.channels[ch];
                 let p = c.mem_j;
@@ -1649,13 +1663,12 @@ impl ItPlayerState {
                 let (px, py) = (p >> 4, p & 0x0F);
                 if c.pan != IT_PAN_SURROUND {
                     if py == 0 {
-                        c.pan = (c.pan + px).min(64);
+                        c.pan = c.pan.saturating_sub(px);
                     } else if px == 0 {
-                        c.pan = c.pan.saturating_sub(py);
+                        c.pan = (c.pan + py).min(64);
                     }
                 }
             }
-            FX_Q => self.retrig_tick(ch),
             FX_T => {
                 let p = self.channels[ch].mem_t;
                 // T0x tempo slide down, T1x tempo slide up, per tick.
@@ -1819,10 +1832,13 @@ impl ItPlayerState {
                     * vev.clamp(0, 64) as i64
                     * v.fade as i64)
                     >> 41;
-                // Panning envelope: -32..+32 added to the note pan.
+                // Panning envelope: -32..+32, scaled by the room left
+                // toward the nearer edge so a full-swing envelope never
+                // overshoots: `pan + env * (32 - |pan - 32|) / 32`.
                 if v.pan_env.enabled && pan != IT_PAN_SURROUND as i32 {
                     let pe = v.pan_env.step(&ins.panning_envelope, !v.released) / 256;
-                    pan = (pan + pe).clamp(0, 64);
+                    let room = 32 - (pan - 32).abs();
+                    pan = (pan + pe * room / 32).clamp(0, 64);
                 }
                 // Pitch envelope: each unit is a half semitone — 32
                 // fine-slide units under the 768/octave linear system.
@@ -2451,8 +2467,11 @@ pub(crate) mod tests {
         assert_eq!(p.active_voices(), 2);
         render_all_frames(&mut p, 6 * 882);
         assert_eq!(p.row, 1);
-        // Both cut: the sample has no sustain loop, so note off cuts too.
-        assert_eq!(p.active_voices(), 0);
+        // The cut voice is gone; the note-off voice keeps playing (no
+        // sustain loop to release, nothing to fade in sample mode).
+        assert_eq!(p.active_voices(), 1);
+        let vi = p.channels[1].voice.unwrap();
+        assert!(p.voices[vi].active && p.voices[vi].released);
     }
 
     #[test]
@@ -2660,7 +2679,7 @@ pub(crate) mod tests {
         p.render(&mut [0i16; 2]);
         assert_eq!(p.channels[0].pan, 32);
         render_all_frames(&mut p, 6 * 882 + 2 * 882);
-        assert_eq!(p.channels[0].pan, 36, "P20 slides right 2 per tick");
+        assert_eq!(p.channels[0].pan, 28, "P20 slides LEFT 2 per tick");
     }
 
     #[test]

@@ -603,9 +603,13 @@ pub fn parse_sample_header(bytes: &[u8], off: usize) -> Result<ItSample> {
         sustain_begin: read_u32_le(h, 0x40),
         sustain_end: read_u32_le(h, 0x44),
         sample_pointer: read_u32_le(h, 0x48),
-        vibrato_speed: h[0x4C].min(64),
-        vibrato_depth: h[0x4D].min(64),
-        vibrato_rate: h[0x4E].min(64),
+        // "ViS / ViD / ViR range from 0->64" describes the editor's
+        // range; the `Add AL, Rate / AdC AH, 0` sweep arithmetic takes
+        // a full byte and files do carry larger rates, so none of the
+        // three is clamped.
+        vibrato_speed: h[0x4C],
+        vibrato_depth: h[0x4D],
+        vibrato_rate: h[0x4E],
         vibrato_wave: ItVibratoWave::from_byte(h[0x4F]),
         pcm: Vec::new(),
         truncated: false,
