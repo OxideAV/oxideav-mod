@@ -100,6 +100,22 @@ cargo-fuzz = true
 #                  Each of those is a separate over-allocation /
 #                  index-past-slice trap to verify is clamped.
 #
+#  * `it_decode` — feed arbitrary bytes to the Impulse Tracker parsing
+#                  + playback pipeline (`it::parse_module` →
+#                  `it_player::ItPlayerState::new` → a short render
+#                  burst) and assert it always returns. IT is the most
+#                  offset-driven layout in the crate: three u32 offset
+#                  tables (instruments / sample headers / patterns)
+#                  plus a per-sample body pointer, each free to point
+#                  anywhere; 554-byte instrument blocks in two
+#                  layouts with three 25-node envelopes; 8/16-bit
+#                  bodies with two loop pairs; and packed patterns
+#                  whose channel-marker / mask walk keeps per-channel
+#                  memories. The player adds NNA virtual channels (a
+#                  64-channel module with NNA continue can grow the
+#                  voice pool), envelope loops and the full Axx..Zxx
+#                  effect set to the surface.
+#
 # No external library worth dlopen-ing as a cross-decode oracle: the
 # clean-room wall bars external tracker-renderer source-reading; the
 # existing `tests/tracker_reference_compare.rs` uses a runtime-loaded
@@ -141,5 +157,11 @@ doc = false
 [[bin]]
 name = "xm_decode"
 path = "fuzz_targets/xm_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "it_decode"
+path = "fuzz_targets/it_decode.rs"
 test = false
 doc = false

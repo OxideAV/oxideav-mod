@@ -37,6 +37,8 @@ Three decoder implementations are registered with distinct codec IDs:
 | `mod`        | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Drop-in playback                       |
 | `mod_planar` | Planar `S16P` at 44.1 kHz, one plane per MOD tracker channel   | Per-channel mixing, analysis, DAW export |
 | `stm`        | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Scream Tracker v1 playback             |
+| `xm`         | Mixed stereo, interleaved `S16` at 44.1 kHz                    | FastTracker 2 playback                 |
+| `it`         | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Impulse Tracker playback               |
 
 The mixed mode applies the Amiga hard-pan convention (channels 0 & 3 left,
 1 & 2 right; the pattern repeats every 4 for >4-channel files) and a
@@ -676,6 +678,119 @@ compound across the delay (per `Protracker-effects-MODFIL12.txt` EE —
 underneath, which is what gives EE its characteristic
 held-note-with-LFO-still-running texture on real-world rips.
 
+## Impulse Tracker (.it) playback coverage
+
+`oxideav-mod` also plays Impulse Tracker modules (`it_player::ItPlayerState`),
+wired through the codec registry as codec id `"it"` (and reachable
+directly via `decoder::make_it_decoder`). The `it` container probes the
+`IMPM` magic at offset 0, surfaces title / song message / tracker
+version / sample names / a structural `extra_info` line and a duration
+estimate, and hands the whole file to the decoder as one packet; the
+decoder emits interleaved S16 stereo at 44.1 kHz — the same output
+shape as `"mod"`, `"stm"` and `"xm"`. Structural callers use
+`it::parse_module` (or `it::parse_header` / `it::parse_instruments` /
+`it::parse_samples` / `it::parse_patterns` individually).
+
+Every layout, table and formula comes from
+[`docs/audio/trackers/it/ImpulseTracker-it.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/it)
+(the tracker author's format text; the `.html` mirror is the same
+document); the effect letters IT shares with Scream Tracker 3 are read
+from
+[`docs/audio/trackers/s3m/ScreamTracker-v3.20-effects.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/s3m).
+
+### Format surface
+
+| Block | Coverage |
+| ----- | -------- |
+| Header | counts, `Cwt` / `Cmwt`, flags (stereo, instruments-vs-samples, linear-vs-Amiga slides, old effects, compatible `Gxx`, MIDI bits), `Special` (message), global / mix volume, speed / tempo, pan separation, 64 channel pans (incl. surround `100` and the `+128` disabled bit) + volumes, order list (`254` skip / `255` end), the three offset tables, song message (`0Dh` → `\n`) |
+| Samples | 8/16-bit, signed / unsigned (`Cvt` bit 0), Intel / Motorola order, delta storage, global + default volume, default pan (bit 7 = use), `C5Speed`, normal + sustain loops (forward / ping-pong) validated against the decoded body, sample vibrato (speed / depth / rate / waveform), truncation tolerance. **Compressed bodies (flag bit 3) are recognised and left silent** — the staged text names the flag but not the scheme. Stereo bodies (flag bit 2, "not supported yet" in the text) decode their first `Length` frames. |
+| Instruments | old 1.x layout (flag byte, node-number loop points, 200-byte per-tick table + node pairs, fadeout 0–64/512 rescaled to the 2.x count) and 2.x layout (NNA / DCT / DCA, fadeout, pitch-pan separation + centre, global volume, default pan, random volume / pan, filter + MIDI bytes, 120-entry note→sample keymap, volume / panning / pitch envelopes with 25 `(y, tick)` nodes, loop + sustain-loop points) |
+| Patterns | channel-marker / mask-byte walk with the per-channel previous-mask and last-note / instrument / volume / command memories; `Rows` clamped to `1..=200`; truncated data leaves the rest empty; offset `0` = empty 64-row pattern |
+
+### Player semantics
+
+- **Volume**: `FV = Vol*SV*CV*GV / 2^18` (sample mode) and
+  `Vol*SV*IV*CV*GV*VEV*NFC / 2^41` (instrument mode) exactly as
+  §"Mathematics" states, with `NFC` counting down from 1024 by the
+  instrument fadeout; output = `FV/128 × MV/128`. Fade starts on
+  envelope end, on note-off without a volume envelope (or with a looping
+  one), on NNA fade and on the "other note values = note fade" cells.
+- **Pitch**: `Hz = C5Speed × PitchTable[note] / 65536` (the 16.16 table
+  from §"Internal Tables"); linear slides multiply by `2^(n/768)`, Amiga
+  slides add `n` to the ST3 period `14317056 / Hz`. `Exx`/`Fxx` = 4·xx
+  per tick, `EFx`/`FFx` = 4·x once, `EEx`/`FEx` = x once; `E`/`F`/`G`
+  share memory under compatible `Gxx`; `Gxx` with an instrument under
+  that flag retunes by `NewC5/OldC5` and retriggers envelopes.
+- **Envelopes**: linear node interpolation, sustain loop while the note
+  is held, normal loop otherwise, end → hold + fade. Pitch envelope units
+  are **half a semitone** (32 linear-slide units), the panning envelope
+  scales by the room toward the nearer edge
+  (`pan + env × (32 − |pan − 32|) / 32`), `S7x` toggles each envelope
+  per voice.
+- **NNA virtual channels** (§"General Info"): a new note in instrument
+  mode applies the old voice's NNA (cut reuses the slot; continue /
+  note-off / fade push it to the background), runs `DCT` (note / sample /
+  instrument) with `DCA` (cut / off / fade) over the host channel's
+  voices, then allocates a free voice — the pool grows to
+  `IT_MAX_VOICES` (256), beyond which the quietest background voice is
+  stolen. `S70`–`S72` act on the background voices, `S73`–`S76` set the
+  current note's NNA.
+- **Effects**: `Axx` speed (0 ignored), `Bxx` / `Cxx` (hex row) with
+  the row-from-break / order-from-jump merge, `Dxy` in all four forms
+  (`Dx0`/`D0x` per tick with the `x = F` "straight away" S3M compat,
+  `DxF`/`DFx` fine), `Exx`/`Fxx`/`Gxx`, `Hxy` (depth ×4, table position
+  advanced every tick incl. tick 0) / `Uxy` (depth ×1) with the shared
+  vibrato memory, `Ixy` tremor (counter runs every tick, across rows),
+  `Jxy`, `Kxy`, `Lxy`, `Mxx` / `Nxy` channel volume, `Oxx` (+ `SAy` high
+  offset; past-the-end ignored, or "from the end" under old effects),
+  `Pxy` (x = left, y = right; fine forms), `Qxy` (S3M volume table;
+  the retrig counter persists across rows), `Rxy` tremolo
+  (`table × depth / 32`), every `Sxx` (`S1x` glissando, `S2x` finetune
+  via the ST3 C-speed table, `S3x`/`S4x`/`S5x` waveforms, `S6x` tick
+  delay, `S7x`, `S8x` pan, `S9x` surround, `SAy`, `SBx` loop, `SCx` cut
+  (`SC0` immediately), `SDx` delay, `SEx` row delay; `S00` reuses the
+  last `Sxx`), `Txx` (`T0x`/`T1x` tempo slides per tick), `Vxx` /
+  `Wxy` global volume, `Xxx` pan (0–255 → 0–64), `Yxy` panbrello
+  (4× table, random-shape delay), `Zxx` MIDI macro = documented no-op
+  (the text pins no macro semantics). Volume column: volume, pan
+  (`128–192`), fine / normal volume slides with their own shared memory,
+  pitch slides (`x×4` into the `E`/`F` memory), portamento via the
+  `SlideTable` into the `G` memory, vibrato depth into the `H` memory.
+- **Old Effects** flag: vibrato / tremolo skip the row tick and vibrato
+  depth doubles; `Oxx` past the end plays from the end. Muted channels
+  process effects but stay silent. Sample vibrato follows the
+  `Add AL, Rate / AdC AH, 0` sweep with the 256-entry fine tables.
+
+### Black-box oracle gates
+
+`tests/it_oracle_compare.rs` renders 18 synthetic fixtures (built with
+the crate's own writer) through this engine and through an installed
+command-line player — `openmpt123 --render` or `xmp -o`, invoked as
+opaque binaries whose PCM alone is read — and asserts per-row dominant
+pitch (cents), normalised RMS profiles, stereo balance and length. All
+18 pass locally against `openmpt123`: pitch table and slides within
+1 cent, vibrato depth + phase tick-exact, pitch-envelope units,
+pan-envelope scaling, `Pxy` direction, retrig continuity, NNA / DCT
+behaviour, sample vibrato sweep, `Sxx` memory and the absolute mix level
+(within 2%) were each *fixed* by these gates during round 455. The
+residual RMS deltas (2–7%, growing toward silence) are the oracle's
+half-tick volume ramp, not an engine difference. The tests print a
+clean SKIP when no oracle binary is on `PATH`, so CI stays green.
+
+### Known gaps (docs asks filed by the round parent)
+
+- IT 2.14/2.15 **compressed samples**: the staged text has only the flag
+  bit; bodies stay silent until the decompression scheme is staged.
+- **Stereo sample layout**: the text says "not supported yet".
+- **Resonant filter** (`IFC` / `IFR`, filter envelopes): fields parsed,
+  no filter is applied — no cutoff / resonance formula is staged.
+- **Envelope carry flags**, `S9x` values other than 0/1, `Zxx` macros
+  and MIDI configuration: no staged semantics; parsed / no-op.
+- The staged `LinearSlideUpTable` / `LinearSlideDownTable` listings
+  carry three transcription typos (entries 35, 243 and the duplicated
+  `65359` at fine-down index 7); the engine uses the `2^(n/768)` formula
+  the text gives instead of the tables.
+
 ## Reference-compare conformance gates
 
 Two integration harnesses drive this crate's engines side-by-side with a
@@ -706,8 +821,8 @@ against ours — the tests skip cleanly when the dylib is absent):
 
 ## Fuzz harness
 
-A `cargo-fuzz` harness under `fuzz/` drives the three parser
-pipelines (MOD / STM / XM) against arbitrary attacker-controlled
+A `cargo-fuzz` harness under `fuzz/` drives the four parser
+pipelines (MOD / STM / XM / IT) against arbitrary attacker-controlled
 bytes and asserts the call always returns rather than panicking /
 aborting / OOMing.
 
@@ -716,10 +831,12 @@ aborting / OOMing.
 | `mod_decode` | `header::parse_header` → `player::parse_patterns` → `samples::extract_samples` → `player::PlayerState::new` → 2048-frame `render` |
 | `stm_decode` | `stm::parse_header` → `stm::parse_patterns` → `stm::extract_samples` → `stm_player::StmPlayerState::new` → 2048-frame `render` |
 | `xm_decode`  | `xm::parse_header` → `xm::parse_patterns` → `xm::parse_instruments` → `xm::extract_sample_bodies` → `xm_player::XmPlayerState::new` → 2048-frame `render` |
+| `it_decode`  | `it::parse_module` (header + message + instruments + samples + patterns) → `it_player::ItPlayerState::new` → 2048-frame `render` |
 
 Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`.
 Each target has a minimal valid-header seed under
-`fuzz/corpus/<target>/minimal.{mod,stm,xm}` so libfuzzer's coverage
+`fuzz/corpus/<target>/minimal.{mod,stm,xm,it}` (IT also seeds an
+instrument-mode and an effect-heavy module) so libfuzzer's coverage
 hill-climb starts from a parser-accepting input. A previously-found
 `xm::parse_patterns` slice-index panic (a hostile `header_length`
 pushing the packed-data slice's start past EOF) is fixed and pinned by
