@@ -1131,9 +1131,10 @@ pub struct ItCell {
 }
 
 /// Decoded volume-column meaning (`ItCell::volpan`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ItVolumeColumn {
     /// Nothing usable in the column.
+    #[default]
     None,
     /// `0->64`.
     Volume(u8),
