@@ -1295,3 +1295,473 @@ fn oracle_misc_effects() {
         "misc rms drift: {ra:?} vs {rb:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch 3 — Amiga slides, Old Effects, order flow timing, S7x / note fade /
+// instrument column / DCT variants, compatible Gxx, panbrello, looping
+// volume envelope + note off.
+// ---------------------------------------------------------------------------
+
+/// Amiga-slides mode: Fxx / Exx / Gxx / Hxy operate on the ST3 period.
+fn case_amiga() -> Case {
+    let mut w = base_writer();
+    w.flags &= !oxideav_mod::it::IT_FLAG_LINEAR_SLIDES;
+    let mut p = ItWriterPattern::new(16);
+    p.note(0, 0, 60, 1);
+    for r in 1..4 {
+        p.effect(r, 0, 'F', 0x04);
+    }
+    for r in 4..7 {
+        p.effect(r, 0, 'E', 0x04);
+    }
+    p.put(8, 0, with_effect(cell_note(67, 0), 'G', 0x08));
+    for r in 9..12 {
+        p.effect(r, 0, 'G', 0x00);
+    }
+    p.put(12, 0, with_effect(cell_note(60, 1), 'H', 0x28));
+    for r in 13..16 {
+        p.effect(r, 0, 'H', 0x00);
+    }
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "amiga",
+        bytes: w.build(),
+        rows: 16,
+    }
+}
+
+/// Old Effects: vibrato depth ×2 and no row-tick update; tremor +1.
+fn case_old_effects() -> Case {
+    let mut w = base_writer();
+    w.flags |= oxideav_mod::it::IT_FLAG_OLD_EFFECTS;
+    let mut p = ItWriterPattern::new(12);
+    p.put(0, 0, with_effect(cell_note(60, 1), 'H', 0x28));
+    for r in 1..4 {
+        p.effect(r, 0, 'H', 0x00);
+    }
+    p.put(6, 0, with_effect(cell_note(60, 1), 'I', 0x21));
+    for r in 7..10 {
+        p.effect(r, 0, 'I', 0x00);
+    }
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "old_effects",
+        bytes: w.build(),
+        rows: 12,
+    }
+}
+
+/// Order flow: every row carries a distinct note so the per-tick pitch
+/// trace reveals the row order and the tick timing of delays.
+fn case_flow() -> Case {
+    let mut w = base_writer();
+    // Pattern 0 (8 rows): notes 48.., SB0 on row 1, SB1 on row 3, SE1 on
+    // row 5, S62 on row 6, C02 on row 7 (break to row 2 of the next).
+    let mut p0 = ItWriterPattern::new(8);
+    for r in 0..8u16 {
+        p0.note(r, 0, 48 + r as u8, 1);
+    }
+    p0.put(1, 1, cell_effect('S', 0xB0));
+    p0.put(3, 1, cell_effect('S', 0xB1));
+    p0.put(5, 1, cell_effect('S', 0xE1));
+    p0.put(6, 1, cell_effect('S', 0x62));
+    p0.put(7, 1, cell_effect('C', 0x02));
+    // Pattern 1 (6 rows): notes 60.., SD3 on row 3 (delayed note), SC2 on
+    // row 4, B03 on row 5 (jump to order 3 = pattern 2).
+    let mut p1 = ItWriterPattern::new(6);
+    for r in 0..6u16 {
+        p1.note(r, 0, 60 + r as u8, 1);
+    }
+    p1.put(3, 0, with_effect(cell_note(63, 1), 'S', 0xD3));
+    p1.put(4, 0, with_effect(cell_note(64, 1), 'S', 0xC2));
+    p1.put(5, 1, cell_effect('B', 0x03));
+    // Pattern 2 (4 rows): notes 72...
+    let mut p2 = ItWriterPattern::new(4);
+    for r in 0..4u16 {
+        p2.note(r, 0, 72 + r as u8, 1);
+    }
+    w.patterns = vec![p0, p1, p2];
+    w.orders = vec![0, 1, 254, 2, 255];
+    Case {
+        name: "flow",
+        bytes: w.build(),
+        rows: 40,
+    }
+}
+
+/// S7x past-note controls, note-fade cells, instrument column alone,
+/// DCT sample / instrument.
+fn case_nna2() -> Case {
+    let mut w = base_writer();
+    w.flags |= oxideav_mod::it::IT_FLAG_INSTRUMENTS;
+    let held = ItWriterEnvelope {
+        flags: IT_ENV_ON | IT_ENV_SUSTAIN_LOOP,
+        nodes: vec![(64, 0), (64, 6), (0, 18)],
+        sustain_begin: 1,
+        sustain_end: 1,
+        ..ItWriterEnvelope::default()
+    };
+    // 1: NNA continue; 2: DCT sample + DCA fade; 3: DCT instrument + DCA
+    // note off; 4: NNA continue with fadeout for note-fade cells.
+    w.instruments.push(ItWriterInstrument {
+        name: "cont".into(),
+        nna: 1,
+        fadeout: 256,
+        volume_envelope: held.clone(),
+        ..ItWriterInstrument::default()
+    });
+    w.instruments.push(ItWriterInstrument {
+        name: "dctsmp".into(),
+        nna: 1,
+        dct: 2,
+        dca: 2,
+        fadeout: 256,
+        volume_envelope: held.clone(),
+        ..ItWriterInstrument::default()
+    });
+    w.instruments.push(ItWriterInstrument {
+        name: "dctins".into(),
+        nna: 1,
+        dct: 3,
+        dca: 1,
+        fadeout: 256,
+        volume_envelope: held.clone(),
+        ..ItWriterInstrument::default()
+    });
+    w.instruments.push(ItWriterInstrument {
+        name: "fade".into(),
+        nna: 1,
+        fadeout: 128,
+        volume_envelope: held.clone(),
+        ..ItWriterInstrument::default()
+    });
+    let mut p = ItWriterPattern::new(32);
+    // ch0: two continued notes, then S70 (cut past), S71 (off past), S72
+    // (fade past) after re-stacking.
+    p.note(0, 0, 60, 1);
+    p.note(2, 0, 64, 1);
+    p.put(4, 0, cell_effect('S', 0x70));
+    p.note(6, 0, 60, 1);
+    p.note(8, 0, 64, 1);
+    p.put(10, 0, cell_effect('S', 0x71));
+    p.note(14, 0, 60, 1);
+    p.note(16, 0, 64, 1);
+    p.put(18, 0, cell_effect('S', 0x72));
+    // ch1: DCT sample — same sample twice → old fades.
+    p.note(0, 1, 60, 2);
+    p.note(4, 1, 67, 2);
+    // ch2: DCT instrument — same instrument → old note-off.
+    p.note(0, 2, 60, 3);
+    p.note(4, 2, 67, 3);
+    // ch3: note-fade cell (note value 200) then instrument-only column.
+    p.note(0, 3, 60, 4);
+    p.put(
+        4,
+        3,
+        ItCell {
+            mask: oxideav_mod::it::IT_CELL_NOTE,
+            note: 200,
+            ..ItCell::default()
+        },
+    );
+    p.note(12, 3, 60, 4);
+    p.put(14, 3, with_volpan(ItCell::default(), 20));
+    p.put(
+        16,
+        3,
+        ItCell {
+            mask: oxideav_mod::it::IT_CELL_INSTRUMENT,
+            instrument: 4,
+            ..ItCell::default()
+        },
+    );
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "nna2",
+        bytes: w.build(),
+        rows: 32,
+    }
+}
+
+/// Compatible Gxx: G with an instrument change retunes by C5 ratio and
+/// retriggers the envelope; E/F/G share memory.
+fn case_compat_gxx() -> Case {
+    let mut w = base_writer();
+    w.flags |= oxideav_mod::it::IT_FLAG_INSTRUMENTS | oxideav_mod::it::IT_FLAG_COMPAT_GXX;
+    let mut hi = base_sample();
+    hi.c5_speed = 16726;
+    w.samples.push(hi);
+    let env = ItWriterEnvelope {
+        flags: IT_ENV_ON,
+        nodes: vec![(64, 0), (16, 12), (16, 60)],
+        ..ItWriterEnvelope::default()
+    };
+    w.instruments.push(ItWriterInstrument {
+        name: "a".into(),
+        default_sample: 1,
+        volume_envelope: env.clone(),
+        ..ItWriterInstrument::default()
+    });
+    w.instruments.push(ItWriterInstrument {
+        name: "b".into(),
+        default_sample: 2,
+        volume_envelope: env.clone(),
+        ..ItWriterInstrument::default()
+    });
+    // Only the rows where the black-box oracle and the staged text
+    // agree are gated here. The text's two explicit compatible-Gxx
+    // sentences — the `NewC5/OldC5` retune on a sample change and the
+    // E/F↔G memory link — are pinned by unit tests instead: the oracle
+    // keeps the old sample on a Gxx row and does not feed `Fxx` into
+    // `G00`, which contradicts the text, and the text wins.
+    let mut p = ItWriterPattern::new(16);
+    p.note(0, 0, 60, 1);
+    p.put(4, 0, with_effect(cell_note(72, 1), 'G', 0x20));
+    p.effect(5, 0, 'G', 0x00);
+    p.put(8, 0, with_effect(cell_note(60, 1), 'E', 0x04));
+    p.effect(9, 0, 'E', 0x00);
+    p.put(10, 0, with_effect(cell_note(72, 1), 'G', 0x40));
+    p.effect(11, 0, 'G', 0x00);
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "compat_gxx",
+        bytes: w.build(),
+        rows: 16,
+    }
+}
+
+/// Panbrello Yxy: per-tick balance.
+fn case_panbrello() -> Case {
+    let mut w = base_writer();
+    let mut p = ItWriterPattern::new(8);
+    p.put(
+        0,
+        0,
+        with_effect(with_volpan(cell_note(60, 1), 128 + 32), 'Y', 0x4F),
+    );
+    for r in 1..8 {
+        p.effect(r, 0, 'Y', 0x00);
+    }
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "panbrello",
+        bytes: w.build(),
+        rows: 8,
+    }
+}
+
+/// Note off with a looping volume envelope: does the fade start?
+fn case_volenv_loop() -> Case {
+    let mut w = base_writer();
+    w.flags |= oxideav_mod::it::IT_FLAG_INSTRUMENTS;
+    w.instruments.push(ItWriterInstrument {
+        name: "loop".into(),
+        fadeout: 128,
+        volume_envelope: ItWriterEnvelope {
+            flags: IT_ENV_ON | IT_ENV_LOOP,
+            nodes: vec![(64, 0), (32, 6), (64, 12)],
+            loop_begin: 0,
+            loop_end: 2,
+            ..ItWriterEnvelope::default()
+        },
+        ..ItWriterInstrument::default()
+    });
+    let mut p = ItWriterPattern::new(12);
+    p.note(0, 0, 60, 1);
+    p.put(4, 0, cell_note(IT_NOTE_OFF, 0));
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "volenv_loop",
+        bytes: w.build(),
+        rows: 12,
+    }
+}
+
+#[test]
+fn oracle_amiga_slides() {
+    let Some(o) = oracle() else {
+        return skip("amiga");
+    };
+    let case = case_amiga();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("amiga (render failed)");
+    };
+    let pa = pitch_profile(&ours, case.rows);
+    let pb = pitch_profile(&theirs, case.rows);
+    report(case.name, "hz ", &pa, &pb);
+    assert!(
+        max_cents_diff(&pa, &pb) < 25.0,
+        "amiga slide drift: {pa:?} vs {pb:?}"
+    );
+}
+
+#[test]
+fn oracle_old_effects() {
+    let Some(o) = oracle() else {
+        return skip("old_effects");
+    };
+    let case = case_old_effects();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("old_effects (render failed)");
+    };
+    let ta = tick_pitch_profile(&ours, 0, 4);
+    let tb = tick_pitch_profile(&theirs, 0, 4);
+    report(case.name, "vib", &ta, &tb);
+    assert!(max_cents_diff(&ta, &tb) < 40.0, "old-effects vibrato drift");
+    let ticks = |x: &[f32]| -> Vec<f32> {
+        let mut v = Vec::new();
+        for i in 36..60 {
+            let a = i * 882;
+            v.push(if a + 882 <= x.len() {
+                rms(&x[a..a + 882])
+            } else {
+                0.0
+            });
+        }
+        let peak = v.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
+        v.iter().map(|r| r / peak).collect()
+    };
+    let ia = ticks(&ours);
+    let ib = ticks(&theirs);
+    report(case.name, "tremor", &ia, &ib);
+    assert!(max_rms_diff(&ia, &ib) < 0.3, "old-effects tremor drift");
+}
+
+#[test]
+fn oracle_order_flow_timing() {
+    let Some(o) = oracle() else {
+        return skip("flow");
+    };
+    let case = case_flow();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("flow (render failed)");
+    };
+    if verbose() {
+        eprintln!("[flow] frames ours {} oracle {}", ours.len(), theirs.len());
+    }
+    let n = ours.len().min(theirs.len()) / (6 * 882);
+    let ta = tick_pitch_profile(&ours, 0, n);
+    let tb = tick_pitch_profile(&theirs, 0, n);
+    report(case.name, "hz", &ta, &tb);
+    let mismatches = ta
+        .iter()
+        .zip(&tb)
+        .filter(|(a, b)| {
+            let (a, b) = (**a, **b);
+            (a > 0.0) != (b > 0.0) || (a > 0.0 && (1200.0 * (a / b).log2()).abs() > 40.0)
+        })
+        .count();
+    assert!(mismatches <= 2, "order-flow trace mismatches: {mismatches}");
+    assert!(
+        (ours.len() as i64 - theirs.len() as i64).abs() < RATE as i64 / 4,
+        "flow length {} vs {}",
+        ours.len(),
+        theirs.len()
+    );
+}
+
+#[test]
+fn oracle_s7x_notefade_instrument_column_dct() {
+    let Some(o) = oracle() else {
+        return skip("nna2");
+    };
+    let case = case_nna2();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("nna2 (render failed)");
+    };
+    let ra = rms_profile(&ours, case.rows);
+    let rb = rms_profile(&theirs, case.rows);
+    report(case.name, "rms", &ra, &rb);
+    assert!(
+        max_rms_diff(&ra, &rb) < 0.15,
+        "S7x / DCT drift: {ra:?} vs {rb:?}"
+    );
+}
+
+#[test]
+fn oracle_compatible_gxx() {
+    let Some(o) = oracle() else {
+        return skip("compat_gxx");
+    };
+    let case = case_compat_gxx();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("compat_gxx (render failed)");
+    };
+    let pa = pitch_profile(&ours, case.rows);
+    let pb = pitch_profile(&theirs, case.rows);
+    report(case.name, "hz ", &pa, &pb);
+    assert!(
+        max_cents_diff(&pa, &pb) < 25.0,
+        "compat Gxx pitch drift: {pa:?} vs {pb:?}"
+    );
+    let ra = rms_profile(&ours, case.rows);
+    let rb = rms_profile(&theirs, case.rows);
+    report(case.name, "rms", &ra, &rb);
+    assert!(
+        max_rms_diff(&ra, &rb) < 0.15,
+        "compat Gxx envelope drift: {ra:?} vs {rb:?}"
+    );
+}
+
+#[test]
+fn oracle_panbrello() {
+    let Some(o) = oracle() else {
+        return skip("panbrello");
+    };
+    let case = case_panbrello();
+    let Some((ours, theirs)) = run_case_stereo(&o, &case) else {
+        return skip("panbrello (render failed)");
+    };
+    let ticks = |st: &[f32]| -> Vec<f32> {
+        (0..24)
+            .map(|t| {
+                let a = t * 882 * 2;
+                let b = a + 882 * 2;
+                if b > st.len() {
+                    return 0.5;
+                }
+                let l: Vec<f32> = st[a..b].iter().step_by(2).copied().collect();
+                let r: Vec<f32> = st[a..b].iter().skip(1).step_by(2).copied().collect();
+                let (lr, rr) = (rms(&l), rms(&r));
+                if lr + rr < 1e-5 {
+                    0.5
+                } else {
+                    rr / (lr + rr)
+                }
+            })
+            .collect()
+    };
+    let ba = ticks(&ours);
+    let bb = ticks(&theirs);
+    report(case.name, "bal", &ba, &bb);
+    let d = ba
+        .iter()
+        .zip(&bb)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(d < 0.12, "panbrello drift: {ba:?} vs {bb:?}");
+}
+
+#[test]
+fn oracle_note_off_with_looping_volume_envelope() {
+    let Some(o) = oracle() else {
+        return skip("volenv_loop");
+    };
+    let case = case_volenv_loop();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("volenv_loop (render failed)");
+    };
+    let ra = rms_profile(&ours, case.rows);
+    let rb = rms_profile(&theirs, case.rows);
+    report(case.name, "rms", &ra, &rb);
+    assert!(
+        max_rms_diff(&ra, &rb) < 0.15,
+        "looping-envelope note-off drift: {ra:?} vs {rb:?}"
+    );
+}

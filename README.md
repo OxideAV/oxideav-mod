@@ -786,6 +786,11 @@ clean SKIP when no oracle binary is on `PATH`, so CI stays green.
   no filter is applied — no cutoff / resonance formula is staged.
 - **Envelope carry flags**, `S9x` values other than 0/1, `Zxx` macros
   and MIDI configuration: no staged semantics; parsed / no-op.
+- **Compatible `Gxx` observation**: the black-box oracle keeps the old
+  sample on a `Gxx` row with a new instrument and does not feed `Fxx`
+  into `G00`; the staged text states both the `NewC5/OldC5` retune and
+  the E/F↔G memory link explicitly, so the engine follows the text
+  (unit-pinned) and the oracle gate covers only the rows both agree on.
 - The staged `LinearSlideUpTable` / `LinearSlideDownTable` listings
   carry three transcription typos (entries 35, 243 and the duplicated
   `65359` at fine-down index 7); the engine uses the `2^(n/768)` formula

@@ -1505,6 +1505,7 @@ impl ItPlayerState {
             matches!(cmd, FX_H | FX_U | FX_K) || matches!(volcol, ItVolumeColumn::Vibrato(_));
         if vib_active && (!first_tick || !self.old_effects) {
             let rnd = self.rand_wave();
+            let old = self.old_effects;
             let c = &mut self.channels[ch];
             let depth = c.mem_h_depth as i32;
             // The position advances BEFORE the table read (the row tick
@@ -1514,9 +1515,16 @@ impl ItPlayerState {
             let w = waveform(c.vib_wave, c.vib_pos, rnd);
             // Vibrato depth is expressed in the fine-slide units of the
             // slide mode: `table(±64) * depth / 64` → ±depth units
-            // (linear 1/64-semitone steps, or Amiga period units).
-            c.vib_delta = (w * depth) as f64 / 64.0;
-        } else {
+            // (linear 1/64-semitone steps, or Amiga period units). Under
+            // "Old Effects" the vibrato is "played in the normal manner"
+            // — the other trackers' period-domain manner, where a
+            // positive table value raises the period and lowers the
+            // pitch — so the sign flips.
+            let d = (w * depth) as f64 / 64.0;
+            c.vib_delta = if old { -d } else { d };
+        } else if !(vib_active && first_tick) {
+            // Old Effects keep the last delta across the row tick ("it
+            // is updated every non-row frame"); otherwise no vibrato.
             self.channels[ch].vib_delta = 0.0;
         }
 
@@ -1550,10 +1558,17 @@ impl ItPlayerState {
                 } else {
                     c.panb_delay -= 1;
                 }
-                c.panb_delta = c.panb_random as i32 * depth / 16;
+                c.panb_delta = c.panb_random as i32 * depth / 32;
             } else {
-                let w = waveform(c.panb_wave, (c.panb_pos >> 2) as u8, rnd);
-                c.panb_delta = w * depth / 16;
+                // "This uses a table 4 times larger (hence 4 times
+                // slower) than vibrato": the position steps by `x` per
+                // tick where vibrato steps by `4x`, so one cycle takes
+                // 256/x ticks. Depth scales like tremolo.
+                // Unlike vibrato, the table is read at the current
+                // position and advanced afterwards (tick 0 of a new
+                // note sits at the channel pan).
+                let w = waveform(c.panb_wave, c.panb_pos as u8, rnd);
+                c.panb_delta = w * depth / 32;
                 c.panb_pos = c.panb_pos.wrapping_add(speed);
             }
         } else {
