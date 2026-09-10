@@ -105,6 +105,8 @@ pub mod stm;
 pub mod stm_player;
 pub mod xm;
 pub mod xm_player;
+#[doc(hidden)]
+pub mod xm_writer;
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::ContainerRegistry;
