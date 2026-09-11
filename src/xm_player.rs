@@ -277,8 +277,6 @@ pub struct XmChannel {
     pub auto_vib_sweep_cnt: u16,
     /// Last non-zero Axy volume slide parameter (memory).
     pub vol_slide_mem: u8,
-    /// Last non-zero vol-col +/- parameter (separate memory per FT2).
-    pub vol_slide_col_mem: u8,
     /// Last non-zero 1xy/2xy portamento parameter (memory — shared).
     pub porta_updown_mem: u8,
     /// Pending note-delay tick — if >0, the cell's note is triggered on
@@ -792,11 +790,14 @@ impl XmPlayerState {
                 continue;
             }
 
-            // Volume-column slide memories are latched at row entry.
-            if let XmVolume::VolumeSlideUp(p) | XmVolume::VolumeSlideDown(p) = cell.volume_kind() {
-                if p != 0 {
-                    ch.vol_slide_col_mem = p;
-                }
+            // A volume-column slide seeds the `Axy` memory (an `A00`
+            // on a later row keeps sliding at the column's rate) but
+            // never reads it: `+0` / `-0` are no-ops. Black-box pinned
+            // (round 458 `vol_column_slides` gate).
+            match cell.volume_kind() {
+                XmVolume::VolumeSlideUp(p) if p != 0 => ch.vol_slide_mem = p << 4,
+                XmVolume::VolumeSlideDown(p) if p != 0 => ch.vol_slide_mem = p,
+                _ => {}
             }
 
             // Memorize effect parameters (for "zero nibble = use last").
@@ -1773,14 +1774,13 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume, table: XmPitchTable
 
     // Volume-column per-tick slides.
     match vol_col {
+        // No memory: a zero amount slides by nothing (see `enter_row`).
         XmVolume::VolumeSlideUp(p) => {
-            let amt = if p != 0 { p } else { ch.vol_slide_col_mem };
-            ch.volume = (ch.volume as u16 + amt as u16).min(64) as u8;
+            ch.volume = (ch.volume as u16 + p as u16).min(64) as u8;
             ch.base_volume = ch.volume;
         }
         XmVolume::VolumeSlideDown(p) => {
-            let amt = if p != 0 { p } else { ch.vol_slide_col_mem };
-            ch.volume = ch.volume.saturating_sub(amt);
+            ch.volume = ch.volume.saturating_sub(p);
             ch.base_volume = ch.volume;
         }
         XmVolume::TonePorta(_) => {
@@ -2142,6 +2142,29 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn vol_column_slide_seeds_axy_memory_but_has_none_of_its_own() {
+        // Row 0: note, vol-col -2 per tick; row 1: A00 keeps sliding
+        // by 2; row 2: vol-col -0 does nothing.
+        let mut st = make_multi_row_xm_state(vec![(49, 0x00, 0x00), (0, 0x0A, 0x00), (0, 0, 0)]);
+        st.patterns[0].rows[0][0].volume = 0x62;
+        st.patterns[0].rows[2][0].volume = 0x60;
+        walk_row(&mut st);
+        assert_eq!(
+            st.channels[0].volume,
+            64 - 2 * 2,
+            "speed 3: two slide ticks"
+        );
+        walk_row(&mut st);
+        assert_eq!(
+            st.channels[0].volume,
+            64 - 4 * 2,
+            "A00 reuses the column's rate"
+        );
+        walk_row(&mut st);
+        assert_eq!(st.channels[0].volume, 64 - 4 * 2, "-0 is a no-op");
     }
 
     #[test]

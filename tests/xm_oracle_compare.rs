@@ -951,6 +951,35 @@ fn case_autovib_depth() -> Case {
     one_pattern("autovib_depth", w, p)
 }
 
+/// Volume-column slides and fine slides with zero parameters, plus
+/// `Cxx` overriding the column.
+fn case_vol_column_slides() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_volume(cell_note(C4, 1), 0x20));
+    p.put(1, 0, with_volume(empty(), 0x74)); // +4 per tick
+    p.put(2, 0, with_volume(empty(), 0x70)); // zero
+    p.put(3, 0, with_volume(empty(), 0x68)); // -8 per tick
+    p.put(4, 0, with_volume(empty(), 0x60)); // zero
+    p.put(5, 0, with_volume(cell_note(C4, 1), 0x9F)); // fine up F
+    p.put(6, 0, with_volume(empty(), 0x88)); // fine down 8
+    p.put(7, 0, with_volume(empty(), 0x80)); // zero
+    p.put(8, 0, with_volume(empty(), 0x90)); // zero
+    p.put(
+        10,
+        0,
+        with_volume(with_effect(cell_note(C4, 1), FX_VOLUME, 0x10), 0x50),
+    );
+    p.put(12, 0, with_volume(cell_note(C4, 1), 0x62));
+    p.put(
+        13,
+        0,
+        with_effect(cell_effect(FX_VOL_SLIDE, 0x00), FX_VOL_SLIDE, 0x00),
+    );
+    p.put(14, 0, with_volume(empty(), 0x62));
+    one_pattern("vol_column_slides", w, p)
+}
+
 /// Note delay with a volume column and with an instrument-less note;
 /// `EDx` with x ≥ speed.
 fn case_note_delay() -> Case {
@@ -1291,6 +1320,12 @@ fn oracle_autovib_shapes() {
 fn oracle_autovib_depth() {
     oracle_run!(r, case_autovib_depth());
     r.tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_vol_column_slides() {
+    oracle_run!(r, case_vol_column_slides());
+    r.pitch(6.0).tick_rms(0.12).finish();
 }
 
 #[test]
