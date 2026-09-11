@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-mod/compare/v0.0.10...v0.0.11) - 2026-09-11
+
+### Other
+
+- steered XM/IT player targets + daily Fuzz workflow; README: XM oracle-gate table, LFO/autovibrato/Lxy bullets, fuzz table
+- per-tick voice/pan resolution in the XM and IT renders + frozen IT loop view — byte-identical PCM, IT 256-voice render 35% faster
+- 9xx at or past the sample end silences the voice, even on loops — oracle-pinned offset gate; 38 XM oracle gates enabled
+- ping-pong loops play as a 2×span mirrored waveform (end frames doubled at the turns) — oracle-pinned XM loops gate, IT battery unchanged
+- out-of-range keymap entries play sample 0 and tone-porta targets keep the playing sample — oracle-pinned keymap gate
+- FT2 order flow — jump/break beat a same-row loop, Dxx past the pattern lands on row 0, F00 ignored, pattern-loop latch + exhausted-loop break state machine — oracle-pinned flow gates
+- volume-column slides have no memory of their own but seed the Axy memory — oracle-pinned vol_column_slides gate
+- Rxy never fires on tick 0 of a note row, continuing rows do — oracle-pinned retrig gate
+- arpeggio counts down from the row end — tick 0 base, then (speed - tick) % 3 selects x / y — oracle-pinned across speeds
+- tremor evaluates on ticks > 0 only and latches its gate past the effect's end — oracle-pinned tremor gate
+- fadeout subtracts twice the header word per tick from the key-off tick — oracle-pinned fadeout + keyoff gates
+- drop needless mut on unmodified XM oracle writers (clippy unused_mut)
+- collapse the vol-column tone-porta latch arm (clippy 1.97 collapsible_match)
+- envelope advance-before-read with in-place trigger/Lxx reads and key-off-tick hold; EDx defers the whole cell through a shared fire path — oracle-pinned envelope + note-delay gates
+- instrument autovibrato — advance-then-read, wave×depth period units, negative-first sine/square, type 1 = square / 2 = ramp — oracle-pinned autovib gates
+- vibrato/tremolo advance by speed per tick with depth/16 and depth/32 scales, FT2 ramp shape rises from zero — oracle-pinned vibrato, vibrato_depth, tremolo gates
+- E5x finetune nibble is an unsigned offset from 8 (E58 = 0, E50 = -128) — oracle-pinned tuning gates on both frequency tables
+- Amiga frequency table addressed as (note+1)*8 + finetune/16 with the *32 scale — C-4 = period 1712 = 8363 Hz (oracle-pinned scale + slides gates)
+- hidden fixture writer + black-box oracle render harness (7 gates: slides, envelope loop, global volume, volume effects, panning, timing, glissando)
+- unit pins — compat-Gxx text rules, old-effects hold, panbrello period, S00/S6x/T0x/T1x, note fade, S7x, instrument column, pan-envelope scaling
+- oracle batch 3 — old-effects period-domain vibrato + row-tick hold, panbrello 256-step/4x-slower table, compat-Gxx gate scoped to text-agreeing rows
+- it_decode fuzz target + corpus seeds; README Impulse Tracker coverage section
+- black-box oracle harness + fixes — Pxy direction, pan-envelope scaling, Qxy counter continuity, vibrato phase, sample-mode note-off, ViR unclamped
+- framework registration — IMPM probe, demuxer + metadata, "it" playback decoder, writer helper, smoke test
+- row/tick engine, sample + instrument modes, NNA voices, envelopes, linear/Amiga slides, Axx..Zxx
+- packed pattern rows — channel masks, previous-value memories, volume column, module bundle
+- instruments — old + new headers, keymap, vol/pan/pitch envelopes, NNA/DCT/DCA, fadeout
+- sample headers + bodies — 8/16-bit, signed/unsigned, byte order, delta, normal + sustain loops
+- IMPM header — counts, flags, channel pan/vol, orders, offset tables, song message
+
 ### Added
 
 - Fuzz: structure-aware `xm_player_steered` / `it_player_steered` targets (fuzz bytes read as a recipe for the hidden writers, so the players' state machines get the budget the raw-parser targets reject) and a daily `Fuzz` workflow (`.github/workflows/fuzz.yml`, six targets, 30-minute budget). Round 458 foreground runs: steered 3.4 M / 6.4 M executions in 420 s, raw `xm_decode` / `it_decode` 3.7 M / 4.5 M in 300 s, all clean.
