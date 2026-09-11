@@ -72,6 +72,7 @@ const FX_GLOBAL_SLIDE: u8 = 0x11;
 const FX_KEY_OFF: u8 = 0x14;
 const FX_ENV_POS: u8 = 0x15;
 const FX_PAN_SLIDE: u8 = 0x19;
+const FX_TREMOR: u8 = 0x1D;
 const FX_X: u8 = 0x21;
 
 fn verbose() -> bool {
@@ -1079,6 +1080,26 @@ fn case_tremolo() -> Case {
     one_pattern("tremolo", w, p)
 }
 
+/// Tremor with memory, and the gate latch when the effect ends inside
+/// its "off" phase: `Cxx` and a volume-column value do not re-open the
+/// channel, a new note does.
+fn case_tremor() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_TREMOR, 0x21));
+    for r in 1..5 {
+        p.effect(r, 0, FX_TREMOR, 0x00);
+    }
+    p.effect(6, 0, FX_VOLUME, 0x40);
+    p.put(8, 0, with_effect(cell_note(C4, 1), FX_TREMOR, 0x13));
+    p.effect(9, 0, FX_TREMOR, 0x00);
+    p.effect(10, 0, FX_TREMOR, 0x00);
+    p.put(11, 0, with_volume(empty(), 0x40));
+    p.effect(13, 0, FX_VOLUME, 0x30);
+    p.note(14, 0, C4, 1);
+    one_pattern("tremor", w, p)
+}
+
 /// `Lxx` set envelope position.
 fn case_envpos() -> Case {
     let mut w = base_writer();
@@ -1270,6 +1291,12 @@ fn oracle_vibrato_depth() {
 #[test]
 fn oracle_tremolo() {
     oracle_run!(r, case_tremolo());
+    r.tick_rms(0.15).finish();
+}
+
+#[test]
+fn oracle_tremor() {
+    oracle_run!(r, case_tremor());
     r.tick_rms(0.15).finish();
 }
 

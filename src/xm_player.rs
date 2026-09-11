@@ -58,7 +58,7 @@
 //!  - **Multi-retrig (Rxy)** — counter-based retrig with 16 volume
 //!    modifier modes.
 //!  - **Tremor (Txy)** — duty-cycle volume gating: on for `x+1` ticks,
-//!    off for `y+1` ticks.
+//!    off for `y+1` ticks, evaluated on ticks > 0; the gate latches.
 //!  - **Pattern delay (EEx)** — repeats the current row `x` extra times.
 //!  - **Pattern loop (E6x)** — `E60` marks loop start; `E6n` (n>0) loops
 //!    back `n` times. Per-channel state.
@@ -322,8 +322,12 @@ pub struct XmChannel {
     /// on this channel. Spec: `y = 0` reuses this value rather than
     /// disabling the retrig.
     pub multi_retrig_y_mem: u8,
-    /// Tremor (Txy) tick counter, increments every tick.
+    /// Tremor (Txy) tick counter, advanced on ticks > 0 while the effect
+    /// runs (wraps at on + off).
     pub tremor_counter: u8,
+    /// Tremor gate latch: true while the "off" phase mutes the channel.
+    /// Persists after the effect ends; only a note trigger clears it.
+    pub tremor_gate: bool,
     /// Tremor parameter memory: `x` = on-ticks - 1, `y` = off-ticks - 1.
     pub tremor_mem: u8,
     /// Pattern-loop start row (set by E60); per-channel.
@@ -697,6 +701,7 @@ impl XmPlayerState {
                 // instrument byte is none of those, so its trigger
                 // leaves the counter running.
                 ch.tremor_counter = 0;
+                ch.tremor_gate = false;
             }
         } else if cell.is_note_off() {
             // XM note 97 = key-off. Don't stop the voice; release
@@ -1226,11 +1231,14 @@ impl XmPlayerState {
                 }
             }
 
-            // Tremor (Txy): on for x+1 ticks, off for y+1 ticks.
-            // We compute a gate value here so the volume scalar below
-            // can mask out the off-cycle.
-            let mut tremor_off = false;
-            if ch.effect == 0x1D {
+            // Tremor (Txy): on for x+1 ticks, off for y+1 ticks. The
+            // counter is evaluated-then-advanced on ticks > 0 only —
+            // tick 0 of a row leaves the gate where the previous tick
+            // put it — and the gate is a latch: when the effect ends
+            // mid-"off", the channel stays silent until a new note
+            // re-opens it — `Cxx` and the volume column do not.
+            // Black-box pinned (round 458 `tremor` gate).
+            if ch.effect == 0x1D && cur_tick > 0 {
                 let mem = if ch.effect_param != 0 {
                     ch.effect_param
                 } else {
@@ -1240,9 +1248,10 @@ impl XmPlayerState {
                 let off_n = (mem & 0x0F) + 1;
                 let total = on_n + off_n;
                 let phase = ch.tremor_counter % total;
-                tremor_off = phase >= on_n;
-                ch.tremor_counter = ch.tremor_counter.wrapping_add(1);
+                ch.tremor_gate = phase >= on_n;
+                ch.tremor_counter = (ch.tremor_counter + 1) % total;
             }
+            let tremor_off = ch.tremor_gate;
 
             // Combine base volume * envelope * fadeout * tremolo *
             // global_volume into the voice volume scalar. Base volume
