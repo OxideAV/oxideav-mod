@@ -26,9 +26,9 @@
 //! `ScreamTracker-v3.20-s3m.txt` §"What is C2SPD?").
 
 use crate::it::{
-    ItCell, ItDca, ItDct, ItEnvelope, ItInstrument, ItLoopView, ItModule, ItNna, ItPattern,
-    ItSample, ItVibratoWave, ItVolumeColumn, IT_FADEOUT_COUNT, IT_MAX_NOTE, IT_ORDER_END,
-    IT_ORDER_SKIP, IT_PAN_SURROUND, IT_VOLCOL_PORTA_SLIDE_TABLE,
+    ItCell, ItDca, ItDct, ItEnvelope, ItFrozenView, ItInstrument, ItLoopView, ItModule, ItNna,
+    ItPattern, ItSample, ItVibratoWave, ItVolumeColumn, IT_FADEOUT_COUNT, IT_MAX_NOTE,
+    IT_ORDER_END, IT_ORDER_SKIP, IT_PAN_SURROUND, IT_VOLCOL_PORTA_SLIDE_TABLE,
 };
 use crate::mixer::MixerVoice;
 
@@ -1964,33 +1964,47 @@ impl ItPlayerState {
             let remaining = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining as usize);
 
+            // Voice state (sample, sustain, amplitude, pan) only changes
+            // in `advance_tick`, so resolve it once per tick block and
+            // walk only the sounding voices per frame. The per-voice
+            // arithmetic and the summation order are unchanged, so the
+            // output is byte-identical to the per-frame form.
+            let mut slots: Vec<(usize, f32, ItFrozenView<'_>)> = Vec::new();
+            for (idx, v) in self.voices.iter_mut().enumerate() {
+                if !v.active {
+                    continue;
+                }
+                let Some(sample) = self.module.samples.get(v.sample as usize - 1) else {
+                    v.active = false;
+                    continue;
+                };
+                let pan = if v.final_pan == IT_PAN_SURROUND {
+                    32
+                } else {
+                    32 + (v.final_pan as i32 - 32) * sep / 128
+                };
+                let pf = pan.clamp(0, 64) as f32 / 64.0;
+                let view = ItLoopView {
+                    sample,
+                    sustain: !v.released,
+                }
+                .frozen();
+                slots.push((idx, pf, view));
+            }
             for _ in 0..want {
                 let mut l = 0.0f32;
                 let mut r = 0.0f32;
-                for v in self.voices.iter_mut() {
+                for (idx, pf, view) in &slots {
+                    let v = &mut self.voices[*idx];
                     if !v.active {
                         continue;
                     }
-                    let Some(sample) = self.module.samples.get(v.sample as usize - 1) else {
-                        v.active = false;
-                        continue;
-                    };
-                    let view = ItLoopView {
-                        sample,
-                        sustain: !v.released,
-                    };
-                    let s = v.mixer.render_one(&view, out_rate) * v.amp;
+                    let s = v.mixer.render_one(view, out_rate) * v.amp;
                     if !v.mixer.active {
                         v.active = false;
                     }
-                    let pan = if v.final_pan == IT_PAN_SURROUND {
-                        32
-                    } else {
-                        32 + (v.final_pan as i32 - 32) * sep / 128
-                    };
-                    let pf = pan.clamp(0, 64) as f32 / 64.0;
-                    l += s * (1.0 - pf);
-                    r += s * pf;
+                    l += s * (1.0 - *pf);
+                    r += s * *pf;
                 }
                 let l = (l * mix_vol).clamp(-1.0, 1.0);
                 let r = (r * mix_vol).clamp(-1.0, 1.0);

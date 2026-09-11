@@ -449,10 +449,13 @@ pub struct XmPlayerState {
     /// replays — suppresses the tick-0 `enter_row` retrigger on the
     /// replay passes.
     pub in_pattern_delay_replay: bool,
-    /// Set by a Bxy/Dxy + pattern-loop (E6x) collision — pattern loop
-    /// takes precedence over the row advance, signalled by a non-None
-    /// `pending_pat_loop_row` on the channel that fired E6n.
+    /// Pattern-loop jump armed for this row by an `E6n` (the loop-start
+    /// row); dropped when a `Bxx` / `Dxx` shares the row.
     pub pending_pat_loop_row: Option<u16>,
+    /// Per-tick scratch: `(channel, instrument index, sample index,
+    /// right-share)` of the channels with a sample, rebuilt at each tick
+    /// block by `render`.
+    render_slots: Vec<(usize, usize, usize, f32)>,
 }
 
 impl XmPlayerState {
@@ -498,6 +501,7 @@ impl XmPlayerState {
             pattern_delay: 0,
             in_pattern_delay_replay: false,
             pending_pat_loop_row: None,
+            render_slots: Vec::new(),
         }
     }
 
@@ -1584,30 +1588,45 @@ impl XmPlayerState {
             let remaining = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining as usize);
 
+            // Sample routing and panning only change in `advance_tick`,
+            // so resolve them once per tick block: `(channel, sample
+            // (instrument, index), right-share)` for every channel with
+            // a sample. The per-frame arithmetic and summation order are
+            // unchanged, so the output is byte-identical to the
+            // per-frame form.
+            self.render_slots.clear();
+            for (i, ch) in self.channels.iter().enumerate() {
+                if ch.instrument == 0 {
+                    continue;
+                }
+                let Some(inst) = self.instruments.get(ch.instrument as usize - 1) else {
+                    continue;
+                };
+                if inst.samples.get(ch.sample_in_instr as usize).is_none() {
+                    continue;
+                }
+                // XM's FinalPan formula:
+                //   FinalPan = Pan + (EnvelopePan - 32) *
+                //              (128 - |Pan - 128|) / 32
+                // EnvelopePan is 0..=64 (32 = centre). Pan is 0..=255.
+                let pan_base = ch.base_panning as i32;
+                let env_pan = ch.pan_env_value as i32; // 0..=64
+                let range = 128 - (pan_base - 128).abs();
+                let final_pan = pan_base + (env_pan - 32) * range / 32;
+                let final_pan = final_pan.clamp(0, 255) as f32 / 255.0;
+                self.render_slots.push((
+                    i,
+                    ch.instrument as usize - 1,
+                    ch.sample_in_instr as usize,
+                    final_pan,
+                ));
+            }
             for _ in 0..want {
                 let mut l = 0.0f32;
                 let mut r = 0.0f32;
-                for (i, ch) in self.channels.iter_mut().enumerate() {
-                    if ch.instrument == 0 {
-                        continue;
-                    }
-                    let Some(inst) = self.instruments.get(ch.instrument as usize - 1) else {
-                        continue;
-                    };
-                    let Some(sample) = inst.samples.get(ch.sample_in_instr as usize) else {
-                        continue;
-                    };
-                    let s = ch.voice.render_one(sample, out_rate);
-                    // XM's FinalPan formula:
-                    //   FinalPan = Pan + (EnvelopePan - 32) *
-                    //              (128 - |Pan - 128|) / 32
-                    // EnvelopePan is 0..=64 (32 = centre). Pan is 0..=255.
-                    let pan_base = ch.base_panning as i32;
-                    let env_pan = ch.pan_env_value as i32; // 0..=64
-                    let range = 128 - (pan_base - 128).abs();
-                    let final_pan = pan_base + (env_pan - 32) * range / 32;
-                    let final_pan = final_pan.clamp(0, 255) as f32 / 255.0;
-                    let _ = i; // file-channel index not used for panning
+                for &(i, inst_idx, smp_idx, final_pan) in &self.render_slots {
+                    let sample = &self.instruments[inst_idx].samples[smp_idx];
+                    let s = self.channels[i].voice.render_one(sample, out_rate);
                     l += s * (1.0 - final_pan);
                     r += s * final_pan;
                 }

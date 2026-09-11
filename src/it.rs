@@ -560,6 +560,55 @@ impl ItLoopView<'_> {
     }
 }
 
+impl<'a> ItLoopView<'a> {
+    /// Resolve the loop once for a render block: the same
+    /// `(start, end, kind)` this view's `SampleSource` methods return,
+    /// frozen into an O(1) source so the per-frame mixer does not walk
+    /// the sustain / normal loop selection three times per frame.
+    pub fn frozen(self) -> ItFrozenView<'a> {
+        let (start, end, kind) = self.resolved();
+        ItFrozenView {
+            pcm: &self.sample.pcm,
+            start,
+            end,
+            kind,
+        }
+    }
+}
+
+/// [`ItLoopView`] with the loop selection pre-resolved (see
+/// [`ItLoopView::frozen`]). Reads and loop bounds are identical.
+#[doc(hidden)]
+pub struct ItFrozenView<'a> {
+    pcm: &'a [i16],
+    start: usize,
+    end: usize,
+    kind: crate::mixer::LoopKind,
+}
+
+impl crate::mixer::SampleSource for ItFrozenView<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.pcm.len()
+    }
+    #[inline]
+    fn loop_start(&self) -> usize {
+        self.start
+    }
+    #[inline]
+    fn loop_end(&self) -> usize {
+        self.end
+    }
+    #[inline]
+    fn loop_kind(&self) -> crate::mixer::LoopKind {
+        self.kind
+    }
+    #[inline]
+    fn at(&self, idx: usize) -> f32 {
+        self.pcm.get(idx).copied().unwrap_or(0) as f32 / 32768.0
+    }
+}
+
 impl crate::mixer::SampleSource for ItLoopView<'_> {
     fn len(&self) -> usize {
         self.sample.pcm.len()
