@@ -155,6 +155,38 @@ pub(crate) fn waveform_lfo(shape: u8, pos: u8) -> i32 {
 }
 
 /// Per-channel playback state for XM.
+/// FT2 channel-LFO value for the `E4x` / `E7x` shape at 64-step
+/// position `pos`, on the ±127 scale.
+///
+/// Shapes: 0 sine, 1 ramp, 2 square, 3 (undefined in FT2) → sine.
+/// The ramp is the black-box-pinned FT2 shape (round 458 `vibrato` /
+/// `tremolo` gates): it starts at 0, rises to +124 at position 31,
+/// jumps to -128 and rises back to -4 — for vibrato that is a period
+/// ramp *up*, i.e. the manual's "ramp down" in pitch. The square is
+/// +127 for the first half-cycle. Ticks 1.. of a row advance the
+/// position by `speed` (a 64-step cycle spans `64 / speed` effect
+/// ticks; tick 0 evaluates without advancing).
+fn ft2_lfo(shape: u8, pos: u8) -> i32 {
+    let p = (pos & 0x3F) as i32;
+    match shape & 0x03 {
+        1 => {
+            if p < 32 {
+                p * 4
+            } else {
+                p * 4 - 256
+            }
+        }
+        2 => {
+            if p < 32 {
+                127
+            } else {
+                -127
+            }
+        }
+        _ => SINE_TABLE[p as usize] as i32,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct XmChannel {
     /// 1-based instrument index (0 = none).
@@ -1192,15 +1224,17 @@ impl XmPlayerState {
             };
             let fade_scalar = ch.fadeout as f32 / FADEOUT_MAX as f32;
 
-            // Tremolo (7xy): sine LFO on volume. Position advances by
-            // speed*4 per tick > 0 (matches the vibrato cadence). The
-            // resulting offset is `lfo * depth / 64` per FT2 — depth=15
-            // and lfo=±127 give roughly ±30 of the 0..=64 volume range.
+            // Tremolo (7xy): LFO on volume. Position advances by
+            // `speed` per tick > 0 (the same cadence as vibrato) and
+            // the offset is `lfo * depth / 32`: depth 8 at the sine
+            // peak is ±31.75, so a depth-8 tremolo on volume 32 spans
+            // the whole 0..=64 range. Both constants are black-box
+            // pinned (round 458 `tremolo` gate).
             let trem_offset = if ch.effect == 0x07 && ch.trem_depth > 0 {
-                let lfo = waveform_lfo(ch.trem_waveform, ch.trem_pos);
-                let off = (lfo * ch.trem_depth as i32) / 64;
+                let lfo = ft2_lfo(ch.trem_waveform, ch.trem_pos);
+                let off = (lfo * ch.trem_depth as i32) / 32;
                 if cur_tick > 0 {
-                    ch.trem_pos = ch.trem_pos.wrapping_add(ch.trem_speed * 4) & 0x3F;
+                    ch.trem_pos = ch.trem_pos.wrapping_add(ch.trem_speed) & 0x3F;
                 }
                 off
             } else {
@@ -1248,29 +1282,24 @@ impl XmPlayerState {
                 }
             }
 
-            // 4xy / 6xy vibrato: sine LFO on period.
-            //   offset = SINE_TABLE[vib_pos] * depth / 32 (units of 1
-            //   period unit; FT2 uses `* depth / 32` which at max depth
-            //   15 and max sine 127 gives ~59 period units ≈ ~7/8 of a
-            //   semitone).
-            // The LFO position advances by `vib_speed` per tick (not on
-            // tick 0 per FT2). The first tick 0 seeds position 0 so the
-            // cell's vibrato renders as a pair of sidebands.
+            // 4xy / 6xy vibrato: LFO on period (shape from E4x).
             if (ch.effect == 0x04
                 || ch.effect == 0x06
                 || matches!(vol_col_kind, XmVolume::Vibrato(_)))
                 && ch.vib_depth > 0
             {
-                let lfo = waveform_lfo(ch.vib_waveform, ch.vib_pos);
-                // Period offset (FT2: * depth * 4 / 16 = depth / 4, but
-                // classically "depth * 2" of period at max sine). We use
-                // `lfo * depth / 32` which yields +/- ~4 * depth units
-                // at max — gives a musically-obvious sideband pair in
-                // the FFT.
-                let offset = (lfo * ch.vib_depth as i32) / 32;
+                let lfo = ft2_lfo(ch.vib_waveform, ch.vib_pos);
+                // Period offset `lfo * depth / 16`: depth 15 at the
+                // sine peak is ±119 linear period units (≈ ±1.86
+                // semitones), positive first (pitch dips first). The
+                // position advances by `speed` on ticks > 0, so a full
+                // cycle is `64 / speed` effect ticks. Both constants
+                // are black-box pinned (round 458 `vibrato` /
+                // `vibrato_depth` gates).
+                let offset = (lfo * ch.vib_depth as i32) / 16;
                 period += offset as f32;
                 if cur_tick > 0 {
-                    ch.vib_pos = ch.vib_pos.wrapping_add(ch.vib_speed * 4) & 0x3F;
+                    ch.vib_pos = ch.vib_pos.wrapping_add(ch.vib_speed) & 0x3F;
                 }
             }
 
@@ -2076,6 +2105,18 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn ft2_ramp_rises_from_zero_and_wraps_at_half_cycle() {
+        assert_eq!(ft2_lfo(1, 0), 0);
+        assert_eq!(ft2_lfo(1, 31), 124);
+        assert_eq!(ft2_lfo(1, 32), -128);
+        assert_eq!(ft2_lfo(1, 63), -4);
+        assert_eq!(ft2_lfo(2, 0), 127);
+        assert_eq!(ft2_lfo(2, 32), -127);
+        assert_eq!(ft2_lfo(0, 16), 127);
+        assert_eq!(ft2_lfo(3, 16), 127);
     }
 
     #[test]

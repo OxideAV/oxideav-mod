@@ -60,6 +60,8 @@ const KEY_OFF: u8 = 97;
 const FX_PORTA_UP: u8 = 0x01;
 const FX_PORTA_DOWN: u8 = 0x02;
 const FX_TONE_PORTA: u8 = 0x03;
+const FX_VIBRATO: u8 = 0x04;
+const FX_TREMOLO: u8 = 0x07;
 const FX_PAN: u8 = 0x08;
 const FX_VOL_SLIDE: u8 = 0x0A;
 const FX_VOLUME: u8 = 0x0C;
@@ -604,11 +606,30 @@ impl Run {
         self
     }
 
+    /// Per-tick level. The oracle ramps volume changes across the
+    /// tick, so its window reads as the mean of the previous and the
+    /// current tick's level; each tick is accepted if it matches ours
+    /// either raw or as that two-tick mean.
     fn tick_rms(&mut self, tol: f32) -> &mut Self {
         let ra = tick_rms_profile(&self.ours_mono, self.rows());
         let rb = tick_rms_profile(&self.theirs_mono, self.rows());
         report(self.case.name, "trms", &ra, &rb);
-        let d = max_rms_diff(&ra, &rb);
+        let ramped: Vec<f32> = (0..ra.len())
+            .map(|t| {
+                if t == 0 {
+                    ra[0]
+                } else {
+                    (ra[t - 1] + ra[t]) / 2.0
+                }
+            })
+            .collect();
+        let d = ra
+            .iter()
+            .zip(&ramped)
+            .zip(&rb)
+            .filter(|((a, m), b)| **a > 0.02 || **m > 0.02 || **b > 0.02)
+            .map(|((a, m), b)| (a - b).abs().min((m - b).abs()))
+            .fold(0.0f32, f32::max);
         if d >= tol {
             self.failures
                 .push(format!("tick level drift {d:.3}: {ra:?} vs {rb:?}"));
@@ -822,6 +843,70 @@ fn case_volume_effects() -> Case {
     one_pattern("volume_effects", w, p)
 }
 
+/// Vibrato depth / rate with memory and the vol-column vibrato forms.
+fn case_vibrato() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_VIBRATO, 0x2F));
+    for r in 1..6 {
+        p.effect(r, 0, FX_VIBRATO, 0x00);
+    }
+    p.put(8, 0, with_volume(cell_note(C4, 1), 0xA4)); // vibrato speed 4
+    p.put(9, 0, with_volume(empty(), 0xBF)); // vibrato depth F
+    p.put(10, 0, with_volume(empty(), 0xB0));
+    p.put(11, 0, with_volume(empty(), 0xB0));
+    p.put(13, 0, with_effect(cell_note(C4, 1), FX_E, 0x41)); // ramp
+    p.effect(14, 0, FX_VIBRATO, 0x4F);
+    one_pattern("vibrato", w, p)
+}
+
+/// Vibrato depth scale across the nibble range.
+fn case_vibrato_depth() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_VIBRATO, 0x21));
+    p.effect(1, 0, FX_VIBRATO, 0x00);
+    p.put(3, 0, with_effect(cell_note(C4, 1), FX_VIBRATO, 0x24));
+    p.effect(4, 0, FX_VIBRATO, 0x00);
+    p.put(6, 0, with_effect(cell_note(C4, 1), FX_VIBRATO, 0x28));
+    p.effect(7, 0, FX_VIBRATO, 0x00);
+    p.put(9, 0, with_effect(cell_note(C4, 1), FX_VIBRATO, 0x1F));
+    p.effect(10, 0, FX_VIBRATO, 0x00);
+    p.put(12, 0, with_effect(cell_note(C4, 1), FX_VIBRATO, 0x82));
+    p.effect(13, 0, FX_VIBRATO, 0x00);
+    one_pattern("vibrato_depth", w, p)
+}
+
+/// Tremolo shapes and depth.
+fn case_tremolo() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(
+        0,
+        0,
+        with_volume(with_effect(cell_note(C4, 1), FX_TREMOLO, 0x28), 0x30),
+    );
+    for r in 1..4 {
+        p.effect(r, 0, FX_TREMOLO, 0x00);
+    }
+    p.put(
+        5,
+        0,
+        with_volume(with_effect(cell_note(C4, 1), FX_E, 0x71), 0x30),
+    );
+    p.effect(6, 0, FX_TREMOLO, 0x2F);
+    p.effect(7, 0, FX_TREMOLO, 0x00);
+    p.put(
+        9,
+        0,
+        with_volume(with_effect(cell_note(C4, 1), FX_E, 0x72), 0x30),
+    );
+    p.effect(10, 0, FX_TREMOLO, 0x4F);
+    p.effect(11, 0, FX_TREMOLO, 0x00);
+    p.put(13, 0, with_volume(cell_note(C4, 1), 0x30));
+    one_pattern("tremolo", w, p)
+}
+
 /// Panning: `8xx`, `Pxy` with memory, volume-column pan + pan slides,
 /// sample default pan.
 fn case_panning() -> Case {
@@ -931,6 +1016,24 @@ fn oracle_global_volume() {
 fn oracle_volume_effects() {
     oracle_run!(r, case_volume_effects());
     r.pitch(6.0).tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_vibrato() {
+    oracle_run!(r, case_vibrato());
+    r.tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_vibrato_depth() {
+    oracle_run!(r, case_vibrato_depth());
+    r.tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_tremolo() {
+    oracle_run!(r, case_tremolo());
+    r.tick_rms(0.15).finish();
 }
 
 #[test]
