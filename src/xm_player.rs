@@ -674,12 +674,20 @@ impl XmPlayerState {
                 // 9xy — Sample offset. Applied at trigger. The
                 // memory byte is the *value to use* when 9 is
                 // hit; FT2 stores the last non-zero param.
+                // An offset at or past the sample's end plays nothing
+                // at all — even on a looped sample (the manual's
+                // "9FF -> Nothing!"; black-box pinned, round 458
+                // `offset` gate).
                 if let Some(param) = sample_offset {
                     if param != 0 {
                         ch.sample_offset_mem = param;
                     }
-                    let off = (ch.sample_offset_mem as f32) * 256.0;
-                    ch.voice.pos = off;
+                    let off = ch.sample_offset_mem as usize * 256;
+                    if off >= crate::mixer::SampleSource::len(sample) {
+                        ch.voice.active = false;
+                    } else {
+                        ch.voice.pos = off as f32;
+                    }
                 }
 
                 // Fresh note: envelopes read position 0 on this
@@ -2254,6 +2262,26 @@ pub mod tests {
                 pos
             })
             .collect()
+    }
+
+    #[test]
+    fn sample_offset_past_the_end_plays_nothing() {
+        // The helper's sample is 256 frames: 901 lands on frame 256 =
+        // the end → silent voice; 900 (memory) too; a fresh note plays.
+        let mut st = make_multi_row_xm_state(vec![(49, 0x09, 0x01), (49, 0x09, 0x00), (49, 0, 0)]);
+        st.advance_tick();
+        assert!(!st.channels[0].voice.active, "offset 256 of 256 frames");
+        walk_row(&mut st);
+        st.advance_tick();
+        assert!(
+            !st.channels[0].voice.active,
+            "900 reuses the past-the-end offset"
+        );
+        st.tick = 0;
+        st.next_row();
+        st.advance_tick();
+        assert!(st.channels[0].voice.active);
+        assert_eq!(st.channels[0].voice.pos, 0.0);
     }
 
     #[test]

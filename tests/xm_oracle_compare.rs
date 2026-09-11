@@ -64,6 +64,7 @@ const FX_TONE_PORTA: u8 = 0x03;
 const FX_VIBRATO: u8 = 0x04;
 const FX_TREMOLO: u8 = 0x07;
 const FX_PAN: u8 = 0x08;
+const FX_OFFSET: u8 = 0x09;
 const FX_VOL_SLIDE: u8 = 0x0A;
 const FX_JUMP: u8 = 0x0B;
 const FX_VOLUME: u8 = 0x0C;
@@ -1333,6 +1334,36 @@ fn case_retrig() -> Case {
     one_pattern("retrig", w, p)
 }
 
+/// Sample offset on a one-shot sample whose first 2048 frames are
+/// silent: the offset lands audibly or not at all.
+fn case_offset() -> Case {
+    let mut w = base_writer();
+    let long = XmWriterSample {
+        pcm: (0..6144)
+            .map(|i| {
+                if i < 2048 {
+                    0
+                } else if (i / 16) % 2 == 0 {
+                    12000
+                } else {
+                    -12000
+                }
+            })
+            .collect(),
+        ..XmWriterSample::default()
+    };
+    w.instruments = vec![single_sample_instrument(long)];
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.put(2, 0, with_effect(cell_note(C4, 1), FX_OFFSET, 0x08));
+    p.put(4, 0, with_effect(cell_note(C4, 1), FX_OFFSET, 0x00));
+    p.put(6, 0, with_effect(cell_note(C4, 1), FX_OFFSET, 0x10));
+    p.put(8, 0, with_effect(cell_note(C4, 1), FX_OFFSET, 0x20));
+    p.put(10, 0, with_effect(cell_note(C4, 1), FX_OFFSET, 0x18));
+    p.put(12, 0, cell_effect(FX_OFFSET, 0x0A));
+    one_pattern("offset", w, p)
+}
+
 /// `Lxx` set envelope position.
 fn case_envpos() -> Case {
     let mut w = base_writer();
@@ -1428,6 +1459,14 @@ fn case_glissando() -> Case {
 // ---------------------------------------------------------------------------
 // Gates
 // ---------------------------------------------------------------------------
+
+#[test]
+fn oracle_scale_linear() {
+    oracle_run!(r, case_scale(true));
+    // No absolute-level gate: the v2.04 volume formula ends in an
+    // unspecified `Scale` factor, so only the relative profile is pinned.
+    r.pitch(6.0).rms(0.12).finish();
+}
 
 #[test]
 fn oracle_scale_amiga() {
@@ -1613,6 +1652,12 @@ fn oracle_arpeggio() {
 fn oracle_retrig() {
     oracle_run!(r, case_retrig());
     r.tick_rms(0.15).tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_offset() {
+    oracle_run!(r, case_offset());
+    r.tick_rms(0.12).finish();
 }
 
 #[test]

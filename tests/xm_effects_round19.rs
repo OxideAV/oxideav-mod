@@ -318,27 +318,21 @@ fn panning_slide_pxy_walks_pan() {
 // ---------------- Sample offset ----------------
 
 #[test]
-fn sample_offset_9xy_shifts_voice_position() {
-    // 9x80 with our 256-frame sample → start at offset 0x80 * 256 = 32768
-    // frames, which exceeds the sample length so the voice immediately
-    // wraps via the sample loop. The audible signal still plays (looped
-    // sample); we assert RMS > 0 to confirm the trigger applied without
-    // silencing the voice on overflow.
+fn sample_offset_9xy_past_the_end_is_silent() {
+    // 910 with our 256-frame sample → offset 0x10 * 256 = 4096 frames,
+    // past the end. FT2 plays nothing at all in that case, looped
+    // sample or not (the manual's "9FF -> Nothing!", oracle-pinned in
+    // round 458): the voice is dropped, not wrapped into the loop.
     let bytes = build_xm(2, &[(0, 0, 0x09, 0x10, 61)]);
     let (mut p, _) = render(&bytes, 0);
     let mut buf = vec![0i16; 4410 * 2];
     p.render(&mut buf);
-    // Sample length is 256, offset 0x10*256 = 4096 → past end → loops.
-    // The voice's pos should be > 0 (looped within the sample).
     assert!(
-        p.channels[0].voice.pos >= 0.0,
-        "voice should remain in the sample loop after offset"
+        !p.channels[0].voice.active,
+        "a past-the-end offset must silence the voice"
     );
     let r = rms(&buf);
-    assert!(
-        r > 100.0,
-        "9x10 should still produce audible signal, got rms={r}"
-    );
+    assert!(r == 0.0, "910 past the end must be silent, got rms={r}");
 }
 
 // ---------------- Set global volume + Global volume slide ----------------
