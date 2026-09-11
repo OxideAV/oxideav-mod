@@ -200,38 +200,40 @@ fn right(buf: &[i16]) -> Vec<i16> {
 
 #[test]
 fn arpeggio_modulates_period_via_3tick_cycle() {
-    // Note C-5 + arpeggio 037 = base / +3 semis / +7 semis.
-    // The arpeggio shift is applied to the voice frequency (NOT the
-    // base period — that's preserved so subsequent ticks rotate around
-    // the original pitch, matching the round-14 MOD invariant).
+    // Note C-5 + arpeggio 037 at speed 6. FT2 counts the arpeggio down
+    // from the row end (`(speed - tick) % 3`: 1 → +x, 2 → +y, 0 →
+    // base; tick 0 always base), so the row plays base, +7, +3, base,
+    // +7, +3 — oracle-pinned in round 458. The shift is applied to the
+    // voice frequency (NOT the base period — that's preserved so
+    // subsequent ticks rotate around the original pitch).
     // We assert on `ch.voice.freq`. After 1 tick + 1 sample we're in
-    // tick 1's processing window (+3 semis = ×2^(3/12) ≈ ×1.189 freq).
+    // tick 1's processing window (+7 semis).
     let bytes = build_xm(2, &[(0, 0, 0x00, 0x37, 61)]);
     let (mut p, _buf) = render(&bytes, 0);
     // Tick 0 is processed within the first sample block. After ~882
     // frames we're at the boundary; +1 frame puts us past tick 1's
-    // pitch update. Voice freq should be the +3-semi shift of base.
+    // pitch update. Voice freq should be the +7-semi shift of base.
     let mut buf = vec![0i16; (882 + 1) * 2];
     p.render(&mut buf);
     let f_tick1 = p.channels[0].voice.freq;
-    // After another tick we should be at +7 semis.
+    // After another tick we should be at +3 semis.
     let mut buf = vec![0i16; 882 * 2];
     p.render(&mut buf);
     let f_tick2 = p.channels[0].voice.freq;
-    // After another tick we should be back to base (tick 3 → 3%3==0).
+    // After another tick we should be back to base ((6 - 3) % 3 == 0).
     let mut buf = vec![0i16; 882 * 2];
     p.render(&mut buf);
     let f_tick3 = p.channels[0].voice.freq;
 
-    let ratio12 = f_tick2 / f_tick1; // +7 vs +3 = 4 semis = 2^(4/12) ≈ 1.260
-    let ratio31 = f_tick3 / f_tick1; // base vs +3 = -3 semis = 2^(-3/12) ≈ 0.840
+    let ratio12 = f_tick2 / f_tick1; // +3 vs +7 = -4 semis = 2^(-4/12) ≈ 0.794
+    let ratio31 = f_tick3 / f_tick1; // base vs +7 = -7 semis = 2^(-7/12) ≈ 0.667
     assert!(
-        (ratio12 - 1.260).abs() < 0.02,
-        "arpeggio tick 2/tick 1 ratio expected ~1.260, got {ratio12} (f1={f_tick1}, f2={f_tick2})"
+        (ratio12 - 0.794).abs() < 0.02,
+        "arpeggio tick 2/tick 1 ratio expected ~0.794, got {ratio12} (f1={f_tick1}, f2={f_tick2})"
     );
     assert!(
-        (ratio31 - 0.840).abs() < 0.02,
-        "arpeggio tick 3/tick 1 ratio expected ~0.840, got {ratio31} (f1={f_tick1}, f3={f_tick3})"
+        (ratio31 - 0.667).abs() < 0.02,
+        "arpeggio tick 3/tick 1 ratio expected ~0.667, got {ratio31} (f1={f_tick1}, f3={f_tick3})"
     );
 }
 

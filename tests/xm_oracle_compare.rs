@@ -57,6 +57,7 @@ const C3: u8 = 37;
 const KEY_OFF: u8 = 97;
 
 /// Effect bytes.
+const FX_ARP: u8 = 0x00;
 const FX_PORTA_UP: u8 = 0x01;
 const FX_PORTA_DOWN: u8 = 0x02;
 const FX_TONE_PORTA: u8 = 0x03;
@@ -1100,6 +1101,22 @@ fn case_tremor() -> Case {
     one_pattern("tremor", w, p)
 }
 
+/// Arpeggio (with memory-less zero param) and the tick-0 semantics.
+fn case_arpeggio() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_ARP, 0x47));
+    p.effect(1, 0, FX_ARP, 0x47);
+    p.effect(2, 0, FX_ARP, 0x30);
+    p.put(4, 0, with_effect(cell_note(C4, 1), FX_ARP, 0x0C));
+    p.effect(5, 0, FX_ARP, 0x00);
+    p.put(7, 0, with_effect(cell_note(C4, 1), FX_SPEED, 0x04));
+    p.effect(8, 0, FX_ARP, 0x47);
+    p.effect(9, 0, FX_ARP, 0x47);
+    p.effect(10, 0, FX_SPEED, 0x06);
+    one_pattern("arpeggio", w, p)
+}
+
 /// `Lxx` set envelope position.
 fn case_envpos() -> Case {
     let mut w = base_writer();
@@ -1298,6 +1315,12 @@ fn oracle_tremolo() {
 fn oracle_tremor() {
     oracle_run!(r, case_tremor());
     r.tick_rms(0.15).finish();
+}
+
+#[test]
+fn oracle_arpeggio() {
+    oracle_run!(r, case_arpeggio());
+    r.tick_pitch(15.0).finish();
 }
 
 #[test]

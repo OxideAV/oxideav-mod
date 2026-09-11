@@ -1129,6 +1129,7 @@ impl XmPlayerState {
                 .unwrap_or(XmVolume::Empty);
             let table = self.pitch.table;
             let global_volume = self.global_volume;
+            let speed = self.speed;
 
             let ch = &mut self.channels[ch_idx];
             // Apply envelope state.
@@ -1291,22 +1292,28 @@ impl XmPlayerState {
             // arpeggio override / vibrato / autovibrato modify it.
             let mut period = ch.period;
 
-            // Arpeggio (0xy). Cycles through 0 / +x / +y semitones on
-            // ticks (n%3 == 0/1/2). The base period is captured at
+            // Arpeggio (0xy). The base period is captured at
             // note-trigger so subsequent rows without a fresh note
-            // continue to arpeggiate around the original pitch (the
-            // round-14 MOD fix; the same invariant matters here).
-            // FT2 quirk: "tick 0 = 0 semis, 1 = +x, 2 = +y" runs from
-            // the *first* tick of each row. Using `cur_tick % 3` lines
-            // up with the MOD player and the multimedia-cx description.
+            // continue to arpeggiate around the original pitch.
+            // FT2 counts the arpeggio from the END of the row: tick 0
+            // is always the base note and every later tick selects by
+            // `(speed - tick) % 3` — 1 → +x, 2 → +y, 0 → base — so at
+            // speed 6 a row plays base, +y, +x, base, +y, +x and at
+            // speed 4 base, base, +y, +x. Black-box pinned across
+            // speeds 3..=9 (round 458 `arpeggio` gate); the manual's
+            // "tick 1 … tick 2 … tick 3" example (§3.1) is the speed-3
+            // instance of the same rule read as base, +x, +y.
             if ch.effect == 0x00 && ch.effect_param != 0 {
                 let arp_x = (ch.effect_param >> 4) as i32;
                 let arp_y = (ch.effect_param & 0x0F) as i32;
-                let semis = match cur_tick % 3 {
-                    0 => 0,
-                    1 => arp_x,
-                    2 => arp_y,
-                    _ => 0,
+                let semis = if cur_tick == 0 {
+                    0
+                } else {
+                    match speed.wrapping_sub(cur_tick) % 3 {
+                        1 => arp_x,
+                        2 => arp_y,
+                        _ => 0,
+                    }
                 };
                 if semis == 0 {
                     period = ch.arp_base_period;
@@ -2129,6 +2136,34 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn arpeggio_counts_down_from_the_row_end() {
+        // 047 at speed 6: base, +7, +4, base, +7, +4. At speed 4: base,
+        // base, +7, +4.
+        let expect_semis = |st: &mut XmPlayerState, speed: u8, want: &[i32]| {
+            st.speed = speed;
+            for (tick, semis) in want.iter().enumerate() {
+                st.advance_tick();
+                let ch = &st.channels[0];
+                let want_freq = period_to_freq(
+                    XmPitchTable::Linear,
+                    ch.arp_base_period - *semis as f32 * 64.0,
+                );
+                assert!(
+                    (ch.voice.freq - want_freq).abs() < 0.5,
+                    "speed {speed} tick {tick}: freq {} want {want_freq} (+{semis})",
+                    ch.voice.freq
+                );
+                st.tick += 1;
+            }
+            st.tick = 0;
+            st.next_row();
+        };
+        let mut st = make_multi_row_xm_state(vec![(49, 0x00, 0x47), (0, 0x00, 0x47)]);
+        expect_semis(&mut st, 6, &[0, 7, 4, 0, 7, 4]);
+        expect_semis(&mut st, 4, &[0, 0, 7, 4]);
     }
 
     #[test]
