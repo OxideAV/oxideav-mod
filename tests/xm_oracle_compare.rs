@@ -899,7 +899,7 @@ fn case_autovib_depth() -> Case {
 /// Note delay with a volume column and with an instrument-less note;
 /// `EDx` with x ≥ speed.
 fn case_note_delay() -> Case {
-    let mut w = base_writer();
+    let w = base_writer();
     let mut p = XmWriterPattern::new(16);
     p.put(
         0,
