@@ -53,6 +53,7 @@ const C4: u8 = 49;
 const E4: u8 = 53;
 const G4: u8 = 56;
 const C5: u8 = 61;
+const C3: u8 = 37;
 const KEY_OFF: u8 = 97;
 
 /// Effect bytes.
@@ -676,6 +677,28 @@ macro_rules! oracle_run {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// A scale across the keyboard under one frequency table.
+fn case_scale(linear: bool) -> Case {
+    let mut w = base_writer();
+    w.linear = linear;
+    let mut p = XmWriterPattern::new(16);
+    for (i, note) in [C4, E4, G4, C5, C3, C4 + 19, C4 - 5, C4 + 1]
+        .iter()
+        .enumerate()
+    {
+        p.note(i as u16 * 2, 0, *note, 1);
+    }
+    one_pattern(
+        if linear {
+            "scale_linear"
+        } else {
+            "scale_amiga"
+        },
+        w,
+        p,
+    )
+}
+
 /// Portamento up / down + tone portamento + fine / extra-fine slides.
 fn case_slides(linear: bool) -> Case {
     let mut w = base_writer();
@@ -829,8 +852,20 @@ fn case_glissando() -> Case {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn oracle_scale_amiga() {
+    oracle_run!(r, case_scale(false));
+    r.pitch(6.0).rms(0.12).finish();
+}
+
+#[test]
 fn oracle_slides_linear() {
     oracle_run!(r, case_slides(true));
+    r.pitch(12.0).tick_pitch(25.0).finish();
+}
+
+#[test]
+fn oracle_slides_amiga() {
+    oracle_run!(r, case_slides(false));
     r.pitch(12.0).tick_pitch(25.0).finish();
 }
 

@@ -1729,28 +1729,14 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume, table: XmPitchTable
 /// producing values around 4608 for C-4 (48) at finetune 0. One
 /// semitone is 64 units; one "finetune step" is 1/2 a period unit.
 ///
-/// In Amiga mode we look up the 96-entry period table with the same
-/// indexing as `XmPitch::amiga_period` and keep it on the same `* 16`
-/// scale so vibrato depth (in units of 2) maps roughly to one semitone
-/// at depth=32, matching FT2.
+/// In Amiga mode the period comes from [`XmPitch::amiga_table_period`]
+/// (C-4 = 1712 so that `8363 * 1712 / period` is the frequency).
 fn note_to_period(table: XmPitchTable, real_note: i32, finetune: i32) -> f32 {
     match table {
         XmPitchTable::Linear => {
             10.0 * 12.0 * 16.0 * 4.0 - (real_note as f32) * 16.0 * 4.0 - (finetune as f32) / 2.0
         }
-        XmPitchTable::Amiga => {
-            let n_mod = real_note.rem_euclid(12) as usize;
-            let n_div = real_note.div_euclid(12) as f32;
-            let ft = finetune as f32 / 16.0;
-            let ft_floor = ft.floor();
-            let frac = ft - ft_floor;
-            let base_idx = ((n_mod as isize) * 8 + ft_floor as isize).clamp(0, 95) as usize;
-            let next_idx = (base_idx + 1).min(95);
-            let p0 = XmPitch::PERIOD_TAB_PUB[base_idx] as f32;
-            let p1 = XmPitch::PERIOD_TAB_PUB[next_idx] as f32;
-            let p = p0 * (1.0 - frac) + p1 * frac;
-            (p * 16.0) / 2.0f32.powf(n_div)
-        }
+        XmPitchTable::Amiga => XmPitch::amiga_table_period(real_note, finetune),
     }
 }
 
@@ -1815,20 +1801,17 @@ fn snap_to_semitone(period: f32, table: XmPitchTable) -> f32 {
             (ANCHOR - n * GRID).max(1.0)
         }
         XmPitchTable::Amiga => {
-            // Amiga period table is 96 entries (one per finetune-0
-            // semitone at the base octave) on the `* 16` scale.
-            // `note_to_period` divides by 2^(n_div) to drop octaves, so
-            // we walk the table at each octave shift and pick whichever
-            // candidate minimises `|period - candidate|`.
+            // Walk every finetune-0 semitone of the 10-octave range
+            // through the same table lookup `note_to_period` uses and
+            // pick whichever candidate minimises `|period - candidate|`.
             if period <= 1.0 {
                 return period.max(1.0);
             }
             let mut best = period;
             let mut best_err = f32::INFINITY;
-            for n_div in 0..10 {
-                let div = 2.0f32.powi(n_div);
-                for &p_raw in XmPitch::PERIOD_TAB_PUB.iter() {
-                    let cand = (p_raw as f32 * 16.0) / div;
+            for real_note in 0..120 {
+                {
+                    let cand = XmPitch::amiga_table_period(real_note, 0);
                     let err = (cand - period).abs();
                     if err < best_err {
                         best_err = err;
@@ -2095,18 +2078,18 @@ pub mod tests {
         // The published Amiga period table's finetune-0 column at
         // semitone 0 is XmPitch::PERIOD_TAB_PUB[0]; we recompute the
         // expected period for the base octave on the *16 scale.
-        let p0 = XmPitch::PERIOD_TAB_PUB[0] as f32 * 16.0;
+        let p0 = XmPitch::amiga_table_period(0, 0);
         // Off by +1 — snap should still pick p0.
         let snapped = snap_to_semitone(p0 + 1.0, XmPitchTable::Amiga);
         assert!((snapped - p0).abs() < 0.5);
         // Off by +(table_step / 4) — still snaps to p0 because the
         // next semitone in the table is ~5% away on the *16 scale.
-        let p1 = XmPitch::PERIOD_TAB_PUB[8] as f32 * 16.0;
-        let mid = (p0 + p1) / 2.0;
-        let snapped = snap_to_semitone(mid - 1.0, XmPitchTable::Amiga);
-        assert!((snapped - p0).abs() < (p1 - p0).abs(), "should pick p0");
-        let snapped = snap_to_semitone(mid + 1.0, XmPitchTable::Amiga);
-        assert!((snapped - p1).abs() < (p1 - p0).abs(), "should pick p1");
+        let p1 = XmPitch::amiga_table_period(1, 0);
+        let quarter = (p0 - p1) / 4.0;
+        let snapped = snap_to_semitone(p0 - quarter, XmPitchTable::Amiga);
+        assert!((snapped - p0).abs() < 0.5, "should pick p0");
+        let snapped = snap_to_semitone(p1 + quarter, XmPitchTable::Amiga);
+        assert!((snapped - p1).abs() < 0.5, "should pick p1");
     }
 
     #[test]

@@ -199,6 +199,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- XM Amiga frequency table: the printed 96-entry `PeriodTab` starts at B (907), not C, and the row is addressed by `(RealNote + 1) * 8 + FineTune/16` with octave = that / 96 and a `* 32` scale — C-4 is now period 1712 = 8363 Hz (the literal `(Note MOD 12)*8 ... *16` reading played every Amiga-mode note 1.89× too high). Negative finetunes reach the B entries below C; the interpolation partner of entry 95 is the next octave's entry 0. Oracle-pinned (`scale_amiga`, `slides_amiga`).
 - **XM `E90` now retrigs the sample once, on tick 0** (`src/xm_player.rs`).
   `multimedia-cx-fasttracker-2.html` §2.1.15.10: "If the parameter x is
   0, this effect retrigs the sample only once - on tick 0." A bare `E90`

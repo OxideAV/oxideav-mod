@@ -343,21 +343,44 @@ impl XmPitch {
     /// own period-based pitch math (vibrato / tone-porta in Amiga mode).
     pub const PERIOD_TAB_PUB: [u16; 96] = Self::PERIOD_TAB;
 
-    fn amiga_period(real_note: i32, finetune: i32) -> f32 {
-        // finetune/16 can be negative; wrap index accordingly.
-        let n_mod = real_note.rem_euclid(12) as usize;
-        let n_div = real_note.div_euclid(12);
-        // finetune / 16 with floor semantics, then interpolate fractional.
+    /// XM Amiga-table period for `real_note` (0 = C-0) and a signed
+    /// finetune, on the engine's period scale (C-4 at finetune 0 =
+    /// 1712, so `8363 * 1712 / period` is the output frequency).
+    ///
+    /// `FastTracker-2-v2.04-xm.txt` §"Amiga frequence table" prints a
+    /// 96-entry table whose entry 0 is 907 — the ProTracker period of
+    /// **B**, one semitone below C (856, entry 8) — and indexes it by
+    /// `(Note MOD 12)*8 + FineTune/16` with `*16/2^(Note DIV 12)` and
+    /// `Frequency = 8363*1712/Period`. Read literally that puts C-4 at
+    /// 907 and plays every note 1.89× too high; the black-box oracle
+    /// plays C-4 at exactly 8363 Hz (period 1712). The layout that
+    /// yields it: the table runs B..A# (eight finetune steps per
+    /// semitone) and the row is addressed by
+    /// `(RealNote + 1) * 8 + FineTune/16` — octave = that / 96, entry =
+    /// that mod 96 — scaled by `32 / 2^octave`. Negative finetunes on C
+    /// therefore reach entry 0..7 (B of the octave below), the +7/16
+    /// finetune of B reads entry 7, and only the interpolation partner
+    /// of entry 95 wraps to the next octave's entry 0 (halved).
+    #[doc(hidden)]
+    pub fn amiga_table_period(real_note: i32, finetune: i32) -> f32 {
         let ft = finetune as f32 / 16.0;
         let ft_floor = ft.floor();
         let frac = ft - ft_floor;
-        let base_idx = (n_mod as isize * 8 + ft_floor as isize).clamp(0, 95) as usize;
-        let next_idx = (base_idx + 1).min(95);
-        let p0 = Self::PERIOD_TAB[base_idx] as f32;
-        let p1 = Self::PERIOD_TAB[next_idx] as f32;
+        let total = (real_note + 1) * 8 + ft_floor as i32;
+        let octave = total.div_euclid(96);
+        let i = total.rem_euclid(96) as usize;
+        let p0 = Self::PERIOD_TAB[i] as f32;
+        let p1 = if i + 1 < 96 {
+            Self::PERIOD_TAB[i + 1] as f32
+        } else {
+            Self::PERIOD_TAB[0] as f32 / 2.0
+        };
         let p = p0 * (1.0 - frac) + p1 * frac;
-        let octave_div = 2.0f32.powi(n_div);
-        (p * 16.0) / octave_div
+        (p * 32.0) / 2.0f32.powi(octave)
+    }
+
+    fn amiga_period(real_note: i32, finetune: i32) -> f32 {
+        Self::amiga_table_period(real_note, finetune)
     }
 
     fn linear_period(real_note: i32, finetune: i32) -> f32 {
@@ -469,6 +492,45 @@ mod tests {
         };
         let f = p.note_to_freq((48, 0));
         assert!((f - 8363.0).abs() < 1.0, "got {f}");
+    }
+
+    #[test]
+    fn xm_amiga_pitch_c4_is_8363_hz() {
+        // C-4 (real note 48) at finetune 0 is table entry 8 (856) one
+        // octave up = period 1712, i.e. exactly 8363 Hz — the same anchor
+        // the linear table has. Pinned by the black-box oracle (round
+        // 458): a literal reading of the printed table (entry 0 = 907,
+        // `* 16`) played every Amiga-mode note 1.89× too high.
+        let p = XmPitch {
+            table: XmPitchTable::Amiga,
+        };
+        let f = p.note_to_freq((48, 0));
+        assert!((f - 8363.0).abs() < 1.0, "got {f}");
+        assert!((XmPitch::amiga_table_period(48, 0) - 1712.0).abs() < 0.01);
+        // E-4 is entry 4*8+8 = 40 (678): 856/678 above C-4.
+        let e = p.note_to_freq((52, 0));
+        assert!((e / f - 856.0 / 678.0).abs() < 1e-3, "E/C = {}", e / f);
+    }
+
+    #[test]
+    fn xm_amiga_finetune_crosses_the_octave_edges() {
+        // C-4 with finetune -128 (-1 semitone) is entry 0 (907): B-3.
+        let b3 = XmPitch::amiga_table_period(47, 0);
+        assert!((b3 - 1814.0).abs() < 0.01, "B-3 = {b3}");
+        let c4_minus = XmPitch::amiga_table_period(48, -128);
+        assert!((b3 - c4_minus).abs() < 0.01, "{b3} vs {c4_minus}");
+        // B-4 with finetune +112 (+7/16) is entry 7 (862) — the same
+        // octave row as B, one step short of C-5 (856).
+        let b4_plus = XmPitch::amiga_table_period(59, 112);
+        let c5 = XmPitch::amiga_table_period(60, 0);
+        let b4 = XmPitch::amiga_table_period(59, 0);
+        assert!((b4 - 907.0).abs() < 0.01 && (c5 - 856.0).abs() < 0.01);
+        assert!((b4_plus - 862.0).abs() < 0.01, "B-4 +7/16 = {b4_plus}");
+        // A#-4 +15/16 interpolates entry 95 (457) toward the next
+        // octave's entry 0 (907 / 2).
+        let as4_plus = XmPitch::amiga_table_period(58, 127);
+        let expect = (457.0 * (1.0 - 15.0 / 16.0) + 453.5 * (15.0 / 16.0)) * 32.0 / 16.0;
+        assert!((as4_plus - expect).abs() < 0.01, "{as4_plus} vs {expect}");
     }
 
     #[test]
