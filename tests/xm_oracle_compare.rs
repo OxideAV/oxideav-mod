@@ -65,7 +65,9 @@ const FX_VIBRATO: u8 = 0x04;
 const FX_TREMOLO: u8 = 0x07;
 const FX_PAN: u8 = 0x08;
 const FX_VOL_SLIDE: u8 = 0x0A;
+const FX_JUMP: u8 = 0x0B;
 const FX_VOLUME: u8 = 0x0C;
+const FX_BREAK: u8 = 0x0D;
 const FX_E: u8 = 0x0E;
 const FX_SPEED: u8 = 0x0F;
 const FX_GLOBAL_VOL: u8 = 0x10;
@@ -951,6 +953,102 @@ fn case_autovib_depth() -> Case {
     one_pattern("autovib_depth", w, p)
 }
 
+/// Pattern loop `E6x` with a jump / break on the same row from another
+/// channel, in both channel orders. Every note sits on channel 0 (the
+/// loop effect goes on channel `lc`, the jump / break on `fc`), so the
+/// pitch trace is the row trace.
+fn case_loop_vs_flow(flow: u8, loop_first: bool) -> Case {
+    let w = base_writer();
+    let (lc, fc) = if loop_first { (0u8, 1u8) } else { (1, 0) };
+    let mut p0 = XmWriterPattern::new(8);
+    let mut mark = |row: u16, note: u8, param: u8| {
+        if lc == 0 {
+            p0.put(row, 0, with_effect(cell_note(note, 1), FX_E, param));
+        } else {
+            p0.note(row, 0, note, 1);
+            p0.put(row, lc, cell_effect(FX_E, param));
+        }
+    };
+    mark(1, E4, 0x60);
+    mark(3, C5, 0x62);
+    p0.note(0, 0, C4, 1);
+    p0.note(2, 0, G4, 1);
+    p0.put(3, fc, cell_effect(flow, 0x02));
+    p0.note(4, 0, C3, 1);
+    p0.note(5, 0, C3 + 2, 1);
+    let mut p1 = XmWriterPattern::new(8);
+    p1.note(0, 0, C4 + 2, 1);
+    p1.note(1, 0, C4 + 4, 1);
+    p1.note(2, 0, C4 + 5, 1);
+    p1.note(3, 0, C4 + 7, 1);
+    p1.note(4, 0, C4 + 9, 1);
+    let mut p2 = XmWriterPattern::new(8);
+    p2.note(0, 0, C5 + 2, 1);
+    p2.note(1, 0, C5 + 4, 1);
+    p2.note(2, 0, C5 + 5, 1);
+    p2.note(3, 0, C5 + 7, 1);
+    p2.note(4, 0, C5 + 9, 1);
+    let name = match (flow, loop_first) {
+        (FX_JUMP, true) => "loop_then_jump",
+        (FX_JUMP, false) => "jump_then_loop",
+        (FX_BREAK, true) => "loop_then_break",
+        _ => "break_then_loop",
+    };
+    patterns(name, w, vec![p0, p1, p2], 24)
+}
+
+/// Pattern loop on its own (nested restart, loop count memory across
+/// rows) followed by a break; the loop row itself carries a note.
+fn case_loop_plain() -> Case {
+    let w = base_writer();
+    let mut p0 = XmWriterPattern::new(8);
+    p0.put(0, 0, with_effect(cell_note(C4, 1), FX_E, 0x60));
+    p0.note(1, 0, E4, 1);
+    p0.put(2, 0, with_effect(cell_note(G4, 1), FX_E, 0x61));
+    p0.put(3, 0, with_effect(cell_note(C5, 1), FX_E, 0x61));
+    p0.put(4, 0, with_effect(cell_note(C3, 1), FX_BREAK, 0x02));
+    p0.note(5, 0, C3 + 4, 1);
+    let mut p1 = XmWriterPattern::new(8);
+    p1.note(0, 0, C4 + 2, 1);
+    p1.note(1, 0, C4 + 4, 1);
+    p1.note(2, 0, C4 + 5, 1);
+    p1.note(3, 0, C4 + 7, 1);
+    p1.note(4, 0, C4 + 9, 1);
+    patterns("loop_plain", w, vec![p0, p1], 24)
+}
+
+/// `Bxx` + `Dxx` on one row (jump to order + row), and a break to a
+/// row past the next pattern's length.
+fn case_jump_break_combos() -> Case {
+    let w = base_writer();
+    let mut p0 = XmWriterPattern::new(8);
+    p0.note(0, 0, C4, 1);
+    p0.put(1, 0, with_effect(cell_note(E4, 1), FX_JUMP, 0x02));
+    p0.put(1, 1, cell_effect(FX_BREAK, 0x03));
+    p0.note(2, 0, G4, 1);
+    let mut p1 = XmWriterPattern::new(8);
+    p1.note(0, 0, C4 + 2, 1);
+    p1.note(1, 0, C4 + 4, 1);
+    p1.note(2, 0, C4 + 5, 1);
+    p1.note(3, 0, C4 + 7, 1);
+    let mut p2 = XmWriterPattern::new(8);
+    p2.note(0, 0, C5, 1);
+    p2.note(1, 0, C5 + 2, 1);
+    p2.note(2, 0, C5 + 4, 1);
+    p2.put(3, 0, with_effect(cell_note(C5 + 5, 1), FX_BREAK, 0x20));
+    p2.note(4, 0, C5 + 7, 1);
+    let mut p3 = XmWriterPattern::new(8);
+    p3.note(0, 0, C3, 1);
+    p3.note(1, 0, C3 + 2, 1);
+    p3.put(2, 0, with_effect(cell_note(C3 + 4, 1), FX_BREAK, 0x01));
+    p3.note(3, 0, C3 + 5, 1);
+    let mut p4 = XmWriterPattern::new(8);
+    p4.note(0, 0, C3 + 7, 1);
+    p4.note(1, 0, C3 + 9, 1);
+    p4.note(2, 0, C3 + 11, 1);
+    patterns("jump_break_combos", w, vec![p0, p1, p2, p3, p4], 20)
+}
+
 /// Volume-column slides and fine slides with zero parameters, plus
 /// `Cxx` overriding the column.
 fn case_vol_column_slides() -> Case {
@@ -1223,6 +1321,22 @@ fn case_timing() -> Case {
     one_pattern("timing", w, p)
 }
 
+/// `F00` and a speed change on the last row before a jump.
+fn case_speed_zero() -> Case {
+    let w = base_writer();
+    let mut p0 = XmWriterPattern::new(4);
+    p0.note(0, 0, C4, 1);
+    p0.put(1, 0, with_effect(cell_note(E4, 1), FX_SPEED, 0x00));
+    p0.note(2, 0, G4, 1);
+    p0.note(3, 0, C5, 1);
+    let mut p1 = XmWriterPattern::new(4);
+    p1.note(0, 0, C3, 1);
+    p1.note(1, 0, C3 + 4, 1);
+    p1.put(2, 0, with_effect(cell_note(C3 + 7, 1), FX_SPEED, 0x02));
+    p1.note(3, 0, C3 + 9, 1);
+    patterns("speed_zero", w, vec![p0, p1], 10)
+}
+
 /// Glissando + tone portamento with the vol-column `Mx` form.
 fn case_glissando() -> Case {
     let w = base_writer();
@@ -1323,6 +1437,42 @@ fn oracle_autovib_depth() {
 }
 
 #[test]
+fn oracle_loop_then_jump() {
+    oracle_run!(r, case_loop_vs_flow(FX_JUMP, true));
+    r.pitch(6.0).finish();
+}
+
+#[test]
+fn oracle_jump_then_loop() {
+    oracle_run!(r, case_loop_vs_flow(FX_JUMP, false));
+    r.pitch(6.0).finish();
+}
+
+#[test]
+fn oracle_loop_then_break() {
+    oracle_run!(r, case_loop_vs_flow(FX_BREAK, true));
+    r.pitch(6.0).finish();
+}
+
+#[test]
+fn oracle_break_then_loop() {
+    oracle_run!(r, case_loop_vs_flow(FX_BREAK, false));
+    r.pitch(6.0).finish();
+}
+
+#[test]
+fn oracle_loop_plain() {
+    oracle_run!(r, case_loop_plain());
+    r.pitch(6.0).finish();
+}
+
+#[test]
+fn oracle_jump_break_combos() {
+    oracle_run!(r, case_jump_break_combos());
+    r.pitch(6.0).finish();
+}
+
+#[test]
 fn oracle_vol_column_slides() {
     oracle_run!(r, case_vol_column_slides());
     r.pitch(6.0).tick_rms(0.12).finish();
@@ -1397,6 +1547,12 @@ fn oracle_panning() {
 #[test]
 fn oracle_timing() {
     oracle_run!(r, case_timing());
+    r.tick_trace().finish();
+}
+
+#[test]
+fn oracle_speed_zero() {
+    oracle_run!(r, case_speed_zero());
     r.tick_trace().finish();
 }
 

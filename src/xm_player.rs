@@ -332,6 +332,13 @@ pub struct XmChannel {
     pub pat_loop_row: u16,
     /// Pattern-loop remaining iteration count; 0 = no active loop.
     pub pat_loop_count: u8,
+    /// Set when a pattern loop on this channel ran out in the current
+    /// pattern (cleared by an `E60` hit while no loop is in flight and
+    /// by entering another pattern). While
+    /// set, a further `E6x` runs `x - 1` passes and then breaks to the
+    /// next pattern's row 0 instead of continuing. Black-box pinned
+    /// (round 458 `loop_plain` gate and the loop probes).
+    pub pat_loop_done: bool,
     /// Hxy memory — last non-zero global-volume-slide param.
     pub global_vol_slide_mem: u8,
     /// Pxy memory — last non-zero panning-slide param.
@@ -407,12 +414,23 @@ pub struct XmPlayerState {
     pub tick_sample_cursor: u32,
     pub ended: bool,
 
-    /// Pending pattern jump (Bxy): if `Some(order)`, on next row advance
-    /// we move to that order-table index instead of `row + 1`.
-    pub pending_order_jump: Option<u16>,
-    /// Pending pattern-break row (Dxy): if `Some(row)`, on next row
-    /// advance we move to row in the *next* pattern (or the Bxy target).
-    pub pending_break_row: Option<u16>,
+    /// Pending position jump (`Bxx`): on the next row advance we move
+    /// to that order-table index (row `break_row` if a `Dxx` shares
+    /// the row, else 0).
+    pub pending_jump: Option<u16>,
+    /// Pending pattern break (`Dxx`): on the next row advance we move
+    /// to the next order at row `break_row`.
+    pub pending_break: bool,
+    /// The row the next pattern starts on. `Dxx` writes it; a pattern
+    /// loop jump also writes its loop-start row here and a finished
+    /// loop leaves it — so the pattern after a completed loop starts
+    /// on the loop-start row (FT2 behaviour, black-box pinned in round
+    /// 458). Consumed (reset to 0) by every advance except the
+    /// loop-exhausted break (`pending_break0`).
+    pub break_row: u16,
+    /// Pending "loop exhausted" break: next order, row 0, leaving
+    /// `break_row` untouched.
+    pub pending_break0: bool,
     /// Counts how many times the song has looped around the order table
     /// via the restart-position mechanism. Used so `ended` can fire after
     /// a single pass for callers that want a one-shot render.
@@ -471,8 +489,10 @@ impl XmPlayerState {
             tick: 0,
             tick_sample_cursor: 0,
             ended: false,
-            pending_order_jump: None,
-            pending_break_row: None,
+            pending_jump: None,
+            pending_break: false,
+            break_row: 0,
+            pending_break0: false,
             loops: 0,
             global_volume: 64,
             pattern_delay: 0,
@@ -945,22 +965,21 @@ impl XmPlayerState {
             match effect {
                 0x0B => {
                     // Bxy: jump to order ep.
-                    self.pending_order_jump = Some(ep as u16);
-                    if self.pending_break_row.is_none() {
-                        self.pending_break_row = Some(0);
-                    }
+                    self.pending_jump = Some(ep as u16);
                 }
                 0x0D => {
                     // Dxy: pattern-break row = x*10 + y (DECIMAL — an
                     // FT2 quirk, commonly miscoded by third-party
                     // players).
-                    let row = (ep >> 4) as u16 * 10 + (ep & 0x0F) as u16;
-                    self.pending_break_row = Some(row);
+                    self.break_row = (ep >> 4) as u16 * 10 + (ep & 0x0F) as u16;
+                    self.pending_break = true;
                 }
                 0x0F => {
+                    // F00 is outside both documented ranges ($1-$1F
+                    // speed, $20-$FF BPM) and FT2 ignores it — it is
+                    // NOT an end-of-song marker (black-box pinned,
+                    // round 458 `speed_zero` gate).
                     if ep == 0 {
-                        // F00: end of song.
-                        self.ended = true;
                     } else if ep < 0x20 {
                         self.speed = ep;
                     } else {
@@ -976,19 +995,45 @@ impl XmPlayerState {
                     let y = ep & 0x0F;
                     match x {
                         0x06 => {
-                            // E6x — Pattern loop. y == 0 marks loop
-                            // start; y > 0 jumps back to start `y` times.
+                            // E6x — Pattern loop. y == 0 marks the loop
+                            // start; y > 0 jumps back to it `y` times.
+                            // The count is shared across the row and
+                            // pattern boundaries; every jump also
+                            // latches the loop-start row as the next
+                            // pattern's start row (`break_row`). Once a
+                            // loop has run out in this pattern
+                            // (`pat_loop_done`), a further E6y without
+                            // a new E60 plays `y - 1` passes and then
+                            // breaks to the next pattern at row 0 —
+                            // all black-box pinned (round 458).
                             let ch = &mut self.channels[ch_idx];
                             if y == 0 {
                                 ch.pat_loop_row = cur_row;
+                                // A fresh E60 (no loop in flight)
+                                // re-arms looping; one re-hit inside
+                                // a running pass does not.
+                                if ch.pat_loop_count == 0 {
+                                    ch.pat_loop_done = false;
+                                }
                             } else {
                                 if ch.pat_loop_count == 0 {
                                     ch.pat_loop_count = y;
                                 } else {
                                     ch.pat_loop_count -= 1;
                                 }
-                                if ch.pat_loop_count > 0 {
+                                if !ch.pat_loop_done {
+                                    if ch.pat_loop_count > 0 {
+                                        self.pending_pat_loop_row = Some(ch.pat_loop_row);
+                                        self.break_row = ch.pat_loop_row;
+                                    } else {
+                                        ch.pat_loop_done = true;
+                                    }
+                                } else if ch.pat_loop_count > 1 {
                                     self.pending_pat_loop_row = Some(ch.pat_loop_row);
+                                    self.break_row = ch.pat_loop_row;
+                                } else {
+                                    ch.pat_loop_count = 0;
+                                    self.pending_break0 = true;
                                 }
                             }
                         }
@@ -1413,58 +1458,82 @@ impl XmPlayerState {
         }
         // First post-delay row exits the replay state.
         self.in_pattern_delay_replay = false;
-        // E6n — Pattern loop. If a channel has armed pending_pat_loop_row
-        // for this row, jump back to that row before any other advance.
-        if let Some(target_row) = self.pending_pat_loop_row.take() {
-            self.row = target_row;
-            // Discard any pending Bxy / Dxy in the same row so the loop
-            // happens before song-position changes.
-            self.pending_order_jump = None;
-            self.pending_break_row = None;
+
+        let loop_row = self.pending_pat_loop_row.take();
+        let jump = self.pending_jump.take();
+        let brk = std::mem::take(&mut self.pending_break);
+        let break0 = std::mem::take(&mut self.pending_break0);
+
+        // E6n — Pattern loop jump within the pattern. A `Bxx` / `Dxx`
+        // on the same row (any channel) wins and the loop jump is
+        // dropped (black-box pinned, round 458 `loop_then_jump` /
+        // `jump_then_loop` / `loop_then_break` / `break_then_loop`).
+        if let Some(target_row) = loop_row {
+            if jump.is_none() && !brk && !break0 {
+                self.row = target_row;
+                return;
+            }
+        }
+        if let Some(order) = jump {
+            // Bxx: order from the jump, row from a same-row Dxx (else 0).
+            let row = if brk { self.break_row } else { 0 };
+            self.break_row = 0;
+            self.goto_order(order as usize, row);
             return;
         }
-        // If a Bxy / Dxy fired this row, use it to determine the next
-        // position — Bxy is the order, Dxy is the row-within-next-pattern.
-        //
-        // Note: plain Dxy (without Bxy) advances to the *next* order and
-        // starts at the Dxy row. Bxy alone resets row to 0 (we already
-        // synthesised `pending_break_row = Some(0)` in `enter_row`).
-        if let Some(order) = self.pending_order_jump.take() {
-            self.order_index = order as usize;
-            self.row = self.pending_break_row.take().unwrap_or(0);
-            // Detect end-of-song via a Bxy past the song length.
-            if self.order_index >= self.song_length as usize || self.order_index >= self.order.len()
-            {
-                self.maybe_end_or_restart();
-            }
+        if break0 {
+            // Loop-exhausted break: next order, row 0, and the
+            // `break_row` latch survives for the following advance.
+            let next = self.order_index + 1;
+            self.goto_order(next, 0);
             return;
         }
-        if let Some(row) = self.pending_break_row.take() {
-            self.row = row;
-            self.order_index += 1;
-            if self.order_index >= self.song_length as usize || self.order_index >= self.order.len()
-            {
-                self.maybe_end_or_restart();
-            }
+        if brk {
+            let row = self.break_row;
+            self.break_row = 0;
+            let next = self.order_index + 1;
+            self.goto_order(next, row);
             return;
         }
 
         self.row += 1;
-        // Pattern-length comes from the pattern header; use a default of
-        // 64 if we can't find the active pattern.
-        let pat_len = self
-            .order
+        if self.row >= self.current_pattern_rows() {
+            // Natural end: the next pattern starts on the latched
+            // `break_row` (0 unless a pattern loop finished here).
+            let row = self.break_row;
+            self.break_row = 0;
+            let next = self.order_index + 1;
+            self.goto_order(next, row);
+        }
+    }
+
+    /// Row count of the pattern at the current order (64 if the order
+    /// points outside the pattern table).
+    fn current_pattern_rows(&self) -> u16 {
+        self.order
             .get(self.order_index)
             .and_then(|&o| self.patterns.get(o as usize))
             .map(|p| p.num_rows)
-            .unwrap_or(64);
-        if self.row >= pat_len {
-            self.row = 0;
-            self.order_index += 1;
-            if self.order_index >= self.song_length as usize || self.order_index >= self.order.len()
-            {
-                self.maybe_end_or_restart();
-            }
+            .unwrap_or(64)
+    }
+
+    /// Move to `order` at `row`, wrapping through the restart position
+    /// at the end of the song. A row past the target pattern's length
+    /// starts it at row 0 (black-box pinned: `D20` into an 8-row
+    /// pattern lands on row 0). Every channel's `pat_loop_done` is
+    /// cleared by the pattern change.
+    fn goto_order(&mut self, order: usize, row: u16) {
+        self.order_index = order;
+        if self.order_index >= self.song_length as usize || self.order_index >= self.order.len() {
+            self.maybe_end_or_restart();
+        }
+        self.row = if row < self.current_pattern_rows() {
+            row
+        } else {
+            0
+        };
+        for ch in self.channels.iter_mut() {
+            ch.pat_loop_done = false;
         }
     }
 
@@ -2142,6 +2211,178 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    /// Append a second single-channel pattern (same cell tuple shape as
+    /// `make_multi_row_xm_state`) and extend the order list with it.
+    fn push_pattern(st: &mut XmPlayerState, cells: Vec<(u8, u8, u8)>) {
+        let rows: Vec<Vec<XmCell>> = cells
+            .into_iter()
+            .map(|(n, e, p)| {
+                vec![XmCell {
+                    note: n,
+                    instrument: if n != 0 { 1 } else { 0 },
+                    volume: 0,
+                    effect_type: e,
+                    effect_param: p,
+                }]
+            })
+            .collect();
+        st.patterns.push(XmPattern {
+            header_length: 9,
+            packing_type: 0,
+            num_rows: rows.len() as u16,
+            packed_size: 0,
+            rows,
+        });
+        st.order.push((st.patterns.len() - 1) as u8);
+        st.song_length += 1;
+    }
+
+    /// `(order, row)` at the start of each of the next `n` rows.
+    fn row_trace(st: &mut XmPlayerState, n: usize) -> Vec<(usize, u16)> {
+        (0..n)
+            .map(|_| {
+                let pos = (st.order_index, st.row);
+                walk_row(st);
+                pos
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exhausted_loop_then_e6x_breaks_to_next_pattern_row_zero() {
+        // E60 r0, E61 r2 (loops once), E61 r3 after the loop ran out:
+        // no third pass, rows 4-5 skipped, next pattern at row 0.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0x0E, 0x60),
+            (0, 0, 0),
+            (0, 0x0E, 0x61),
+            (0, 0x0E, 0x61),
+            (0, 0, 0),
+            (0, 0, 0),
+        ]);
+        push_pattern(&mut st, vec![(0, 0, 0); 4]);
+        assert_eq!(
+            row_trace(&mut st, 8),
+            vec![
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn finished_loop_latches_the_next_pattern_start_row() {
+        // E60 r1, E61 r3: after the loop the pattern plays out and the
+        // next pattern starts on row 1 (the loop-start row); the latch
+        // is consumed, so the pattern after that starts on row 0.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0, 0),
+            (0, 0x0E, 0x60),
+            (0, 0, 0),
+            (0, 0x0E, 0x61),
+            (0, 0, 0),
+            (0, 0, 0),
+        ]);
+        push_pattern(&mut st, vec![(0, 0, 0); 3]);
+        push_pattern(&mut st, vec![(0, 0, 0); 3]);
+        assert_eq!(
+            row_trace(&mut st, 12),
+            vec![
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 4),
+                (0, 5),
+                (1, 1),
+                (1, 2),
+                (2, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn exhausted_loop_e62_runs_one_pass_then_breaks_keeping_the_latch() {
+        // E60 r1, E61 r3 (runs out), E62 r5: one pass back to row 1,
+        // then the E61 on row 3 breaks to the next pattern at row 0;
+        // the latch (row 1) survives that break and lands the pattern
+        // after it on row 1.
+        let mut st = make_multi_row_xm_state(vec![
+            (49, 0, 0),
+            (0, 0x0E, 0x60),
+            (0, 0, 0),
+            (0, 0x0E, 0x61),
+            (0, 0, 0),
+            (0, 0x0E, 0x62),
+        ]);
+        push_pattern(&mut st, vec![(0, 0, 0); 2]);
+        push_pattern(&mut st, vec![(0, 0, 0); 3]);
+        assert_eq!(
+            row_trace(&mut st, 14),
+            vec![
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 4),
+                (0, 5),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0),
+                (1, 1)
+            ]
+        );
+        assert_eq!((st.order_index, st.row), (2, 1));
+    }
+
+    #[test]
+    fn jump_or_break_on_the_same_row_beats_the_loop_jump() {
+        let mut st = make_multi_row_xm_state(vec![(49, 0, 0), (0, 0, 0)]);
+        push_pattern(&mut st, vec![(0, 0, 0); 4]);
+        st.row = 1;
+        st.pending_pat_loop_row = Some(0);
+        st.pending_jump = Some(1);
+        st.next_row();
+        assert_eq!((st.order_index, st.row), (1, 0));
+        st.order_index = 0;
+        st.row = 1;
+        st.pending_pat_loop_row = Some(0);
+        st.break_row = 2;
+        st.pending_break = true;
+        st.next_row();
+        assert_eq!((st.order_index, st.row), (1, 2));
+    }
+
+    #[test]
+    fn break_past_the_next_pattern_length_lands_on_row_zero() {
+        let mut st = make_multi_row_xm_state(vec![(49, 0x0D, 0x20), (0, 0, 0)]);
+        push_pattern(&mut st, vec![(0, 0, 0); 8]);
+        walk_row(&mut st);
+        assert_eq!((st.order_index, st.row), (1, 0));
+    }
+
+    #[test]
+    fn f00_is_ignored_not_an_end_marker() {
+        let mut st = make_multi_row_xm_state(vec![(49, 0x0F, 0x00), (0, 0, 0), (0, 0, 0)]);
+        walk_row(&mut st);
+        assert!(!st.ended);
+        assert_eq!(st.speed, 3);
+        assert_eq!(st.row, 1);
     }
 
     #[test]
