@@ -600,13 +600,9 @@ impl XmPlayerState {
                     ch.vib_depth = p;
                 }
             }
-            XmVolume::TonePorta(p) => {
-                // Each value is multiplied by 16 to match 3xy scale
-                // (one vol-col step = 16 period units).
-                if p != 0 {
-                    ch.porta_speed = p << 4;
-                }
-            }
+            // Each value is multiplied by 16 to match 3xy scale (one
+            // vol-col step = 16 period units).
+            XmVolume::TonePorta(p) if p != 0 => ch.porta_speed = p << 4,
             _ => {}
         }
 
