@@ -69,6 +69,7 @@ const FX_E: u8 = 0x0E;
 const FX_SPEED: u8 = 0x0F;
 const FX_GLOBAL_VOL: u8 = 0x10;
 const FX_GLOBAL_SLIDE: u8 = 0x11;
+const FX_KEY_OFF: u8 = 0x14;
 const FX_ENV_POS: u8 = 0x15;
 const FX_PAN_SLIDE: u8 = 0x19;
 const FX_X: u8 = 0x21;
@@ -817,6 +818,57 @@ fn case_env_loop_before_sustain() -> Case {
     one_pattern("env_loop_before_sustain", w, p)
 }
 
+/// Key-off (note 97 and `Kxx`) on an envelope-less instrument, on an
+/// instrument whose envelope is present but switched off, and on one
+/// with an envelope + fadeout.
+fn case_keyoff() -> Case {
+    let mut w = base_writer();
+    let mut off_env = base_instrument();
+    off_env.volume_envelope = XmWriterEnvelope {
+        points: vec![(0, 64), (100, 64)],
+        type_bits: 0,
+        ..XmWriterEnvelope::default()
+    };
+    off_env.volume_fadeout = 4096;
+    let mut fade = base_instrument();
+    fade.volume_envelope = XmWriterEnvelope {
+        points: vec![(0, 64), (100, 64)],
+        type_bits: XM_ENV_ON,
+        ..XmWriterEnvelope::default()
+    };
+    fade.volume_fadeout = 4096;
+    w.instruments = vec![base_instrument(), off_env, fade];
+    let mut p = XmWriterPattern::new(24);
+    p.note(0, 0, C4, 1);
+    p.note(2, 0, KEY_OFF, 0);
+    p.note(4, 0, E4, 2);
+    p.note(6, 0, KEY_OFF, 0);
+    p.note(8, 0, G4, 3);
+    p.note(10, 0, KEY_OFF, 0);
+    p.note(14, 0, C4, 1);
+    p.effect(16, 0, FX_KEY_OFF, 0x00);
+    p.note(18, 0, G4, 3);
+    p.effect(20, 0, FX_KEY_OFF, 0x00);
+    one_pattern("keyoff", w, p)
+}
+
+/// Key-off inside a sustained envelope with fadeout: the release runs
+/// the envelope past the sustain point while the fadeout ramps.
+fn case_fadeout() -> Case {
+    let mut w = base_writer();
+    w.instruments[0].volume_envelope = XmWriterEnvelope {
+        points: vec![(0, 64), (6, 64), (30, 32), (60, 32)],
+        sustain_point: 1,
+        type_bits: XM_ENV_ON | XM_ENV_SUSTAIN,
+        ..XmWriterEnvelope::default()
+    };
+    w.instruments[0].volume_fadeout = 1024;
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(3, 0, KEY_OFF, 0);
+    one_pattern("fadeout", w, p)
+}
+
 /// Panning envelope + autovibrato sweep, triggered through a note
 /// delay.
 fn case_pan_env_autovib_delayed() -> Case {
@@ -1146,6 +1198,18 @@ fn oracle_env_sustain_vs_loop() {
 #[test]
 fn oracle_env_loop_before_sustain() {
     oracle_run!(r, case_env_loop_before_sustain());
+    r.pitch(6.0).tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_keyoff() {
+    oracle_run!(r, case_keyoff());
+    r.pitch(6.0).tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_fadeout() {
+    oracle_run!(r, case_fadeout());
     r.pitch(6.0).tick_rms(0.12).finish();
 }
 

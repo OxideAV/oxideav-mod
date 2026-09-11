@@ -1104,7 +1104,11 @@ impl XmPlayerState {
                 held,
                 32,
             );
-            let fadeout_step = inst.volume_fadeout as i32;
+            // The header's "Volume fadeout" word is subtracted TWICE per
+            // tick from the 65536 register: fadeout 1024 reaches silence
+            // 32 ticks after the key-off (black-box pinned, round 458
+            // `fadeout` / `keyoff` gates), starting on the key-off tick.
+            let fadeout_step = inst.volume_fadeout as i32 * 2;
 
             let inst_vib_type = inst.vibrato_type;
             let inst_vib_rate = inst.vibrato_rate;
@@ -2116,6 +2120,31 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn fadeout_subtracts_twice_the_header_word_per_tick() {
+        // One channel, C-4 on row 0, key-off on row 1, fadeout 4096:
+        // 65536 / 8192 = 8 ticks from the key-off tick to silence.
+        let mut st = make_multi_row_xm_state(vec![(49, 0x00, 0x00), (97, 0x00, 0x00)]);
+        st.instruments[0].volume_fadeout = 4096;
+        st.instruments[0].volume_envelope = XmEnvelope {
+            points: vec![(0, 64), (100, 64)],
+            sustain_point: 0,
+            loop_start_point: 0,
+            loop_end_point: 0,
+            type_bits: 0x01,
+        };
+        walk_row(&mut st); // row 0, six ticks
+        st.advance_tick(); // row 1 tick 0: key-off, first decrement
+        assert_eq!(st.channels[0].fadeout, 65536 - 8192);
+        for _ in 0..6 {
+            st.advance_tick();
+        }
+        assert_eq!(st.channels[0].fadeout, 65536 - 7 * 8192);
+        st.advance_tick();
+        assert_eq!(st.channels[0].fadeout, 0);
+        assert!(!st.channels[0].voice.active);
     }
 
     #[test]
