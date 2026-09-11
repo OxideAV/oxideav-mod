@@ -69,6 +69,7 @@ const FX_E: u8 = 0x0E;
 const FX_SPEED: u8 = 0x0F;
 const FX_GLOBAL_VOL: u8 = 0x10;
 const FX_GLOBAL_SLIDE: u8 = 0x11;
+const FX_ENV_POS: u8 = 0x15;
 const FX_PAN_SLIDE: u8 = 0x19;
 const FX_X: u8 = 0x21;
 
@@ -606,29 +607,25 @@ impl Run {
         self
     }
 
-    /// Per-tick level. The oracle ramps volume changes across the
-    /// tick, so its window reads as the mean of the previous and the
-    /// current tick's level; each tick is accepted if it matches ours
-    /// either raw or as that two-tick mean.
+    /// Per-tick level. The oracle ramps volume changes: a slide or
+    /// envelope step is spread across the whole tick (its window reads
+    /// as the mean of the previous and the current tick's level) while
+    /// a cut decays over about a sixteenth of a tick (≈ 0.125 × the
+    /// previous level). Each tick is accepted if it matches ours raw
+    /// or under either ramp model.
     fn tick_rms(&mut self, tol: f32) -> &mut Self {
         let ra = tick_rms_profile(&self.ours_mono, self.rows());
         let rb = tick_rms_profile(&self.theirs_mono, self.rows());
         report(self.case.name, "trms", &ra, &rb);
-        let ramped: Vec<f32> = (0..ra.len())
+        let prev = |t: usize| if t == 0 { ra[0] } else { ra[t - 1] };
+        let d = (0..ra.len())
+            .filter(|&t| ra[t] > 0.02 || prev(t) > 0.02 || rb[t] > 0.02)
             .map(|t| {
-                if t == 0 {
-                    ra[0]
-                } else {
-                    (ra[t - 1] + ra[t]) / 2.0
-                }
+                let (a, b) = (ra[t], rb[t]);
+                let mean = (prev(t) + a) / 2.0;
+                let cut = a.max(0.125 * prev(t));
+                (a - b).abs().min((mean - b).abs()).min((cut - b).abs())
             })
-            .collect();
-        let d = ra
-            .iter()
-            .zip(&ramped)
-            .zip(&rb)
-            .filter(|((a, m), b)| **a > 0.02 || **m > 0.02 || **b > 0.02)
-            .map(|((a, m), b)| (a - b).abs().min((m - b).abs()))
             .fold(0.0f32, f32::max);
         if d >= tol {
             self.failures
@@ -783,6 +780,26 @@ fn case_slides(linear: bool) -> Case {
     )
 }
 
+/// Envelope with both a sustain point and a loop: the sustain point
+/// sits inside the loop, so while the key is held the cursor must park
+/// on the sustain point (not run the loop); after key-off the loop
+/// runs.
+fn case_env_sustain_vs_loop() -> Case {
+    let mut w = base_writer();
+    w.instruments[0].volume_envelope = XmWriterEnvelope {
+        points: vec![(0, 64), (12, 16), (24, 64), (36, 16)],
+        sustain_point: 1,
+        loop_start_point: 0,
+        loop_end_point: 3,
+        type_bits: XM_ENV_ON | XM_ENV_SUSTAIN | XM_ENV_LOOP,
+    };
+    w.instruments[0].volume_fadeout = 0;
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(6, 0, KEY_OFF, 0);
+    one_pattern("env_sustain_vs_loop", w, p)
+}
+
 /// Sustain point placed *after* the loop: the loop runs while the key
 /// is held and the sustain point is never reached.
 fn case_env_loop_before_sustain() -> Case {
@@ -798,6 +815,42 @@ fn case_env_loop_before_sustain() -> Case {
     p.note(0, 0, C4, 1);
     p.note(8, 0, KEY_OFF, 0);
     one_pattern("env_loop_before_sustain", w, p)
+}
+
+/// Panning envelope + autovibrato sweep, triggered through a note
+/// delay.
+fn case_pan_env_autovib_delayed() -> Case {
+    let mut w = base_writer();
+    w.instruments[0].panning_envelope = XmWriterEnvelope {
+        points: vec![(0, 0), (12, 64), (24, 0)],
+        loop_start_point: 0,
+        loop_end_point: 2,
+        type_bits: XM_ENV_ON | XM_ENV_LOOP,
+        ..XmWriterEnvelope::default()
+    };
+    w.instruments[0].vibrato_type = 0;
+    w.instruments[0].vibrato_sweep = 24;
+    w.instruments[0].vibrato_depth = 15;
+    w.instruments[0].vibrato_rate = 24;
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_E, 0xD3));
+    p.put(8, 0, with_effect(cell_note(C4, 1), FX_E, 0xD0));
+    one_pattern("pan_env_autovib_delayed", w, p)
+}
+
+/// Volume envelope triggered through a note delay: the envelope must
+/// start on the delayed trigger tick.
+fn case_vol_env_delayed() -> Case {
+    let mut w = base_writer();
+    w.instruments[0].volume_envelope = XmWriterEnvelope {
+        points: vec![(0, 0), (8, 64), (16, 8), (40, 8)],
+        type_bits: XM_ENV_ON,
+        ..XmWriterEnvelope::default()
+    };
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_E, 0xD3));
+    p.put(8, 0, with_effect(cell_note(C4, 1), FX_E, 0xD5));
+    one_pattern("vol_env_delayed", w, p)
 }
 
 /// Autovibrato shapes: the three documented type values (0, 1, 2)
@@ -841,6 +894,30 @@ fn case_autovib_depth() -> Case {
     p.note(8, 0, C4, 3);
     p.note(12, 0, C4, 4);
     one_pattern("autovib_depth", w, p)
+}
+
+/// Note delay with a volume column and with an instrument-less note;
+/// `EDx` with x ≥ speed.
+fn case_note_delay() -> Case {
+    let mut w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(
+        0,
+        0,
+        with_volume(with_effect(cell_note(C4, 1), FX_E, 0xD2), 0x30),
+    );
+    p.put(2, 0, with_effect(cell_note(E4, 0), FX_E, 0xD3));
+    p.put(4, 0, with_effect(cell_note(G4, 1), FX_E, 0xD6));
+    p.put(6, 0, with_effect(cell_note(C5, 1), FX_E, 0xD5));
+    p.put(
+        8,
+        0,
+        with_volume(with_effect(cell_note(C4, 1), FX_E, 0xD1), 0x74),
+    );
+    p.put(10, 0, with_effect(cell_note(KEY_OFF, 0), FX_E, 0xD3));
+    p.put(12, 0, with_effect(cell_note(E4, 1), FX_E, 0xD0));
+    p.put(13, 0, with_effect(cell_note(0, 1), FX_E, 0xD2));
+    one_pattern("note_delay", w, p)
 }
 
 /// Global volume, global volume slide with memory, and `Hxx` from a
@@ -950,6 +1027,23 @@ fn case_tremolo() -> Case {
     one_pattern("tremolo", w, p)
 }
 
+/// `Lxx` set envelope position.
+fn case_envpos() -> Case {
+    let mut w = base_writer();
+    w.instruments[0].volume_envelope = XmWriterEnvelope {
+        points: vec![(0, 0), (24, 64), (48, 8), (72, 64)],
+        type_bits: XM_ENV_ON,
+        ..XmWriterEnvelope::default()
+    };
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_ENV_POS, 0x30));
+    p.put(2, 0, cell_effect(FX_ENV_POS, 0x00));
+    p.put(4, 0, cell_effect(FX_ENV_POS, 0x18));
+    p.put(6, 0, cell_effect(FX_ENV_POS, 0x60));
+    p.put(8, 0, cell_effect(FX_ENV_POS, 0x30));
+    one_pattern("envpos", w, p)
+}
+
 /// Panning: `8xx`, `Pxy` with memory, volume-column pan + pan slides,
 /// sample default pan.
 fn case_panning() -> Case {
@@ -1044,9 +1138,27 @@ fn oracle_slides_amiga() {
 }
 
 #[test]
+fn oracle_env_sustain_vs_loop() {
+    oracle_run!(r, case_env_sustain_vs_loop());
+    r.pitch(6.0).tick_rms(0.12).finish();
+}
+
+#[test]
 fn oracle_env_loop_before_sustain() {
     oracle_run!(r, case_env_loop_before_sustain());
     r.pitch(6.0).tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_pan_env_autovib_delayed() {
+    oracle_run!(r, case_pan_env_autovib_delayed());
+    r.balance(0.08).tick_pitch(12.0).tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_vol_env_delayed() {
+    oracle_run!(r, case_vol_env_delayed());
+    r.tick_rms(0.12).finish();
 }
 
 #[test]
@@ -1059,6 +1171,12 @@ fn oracle_autovib_shapes() {
 fn oracle_autovib_depth() {
     oracle_run!(r, case_autovib_depth());
     r.tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_note_delay() {
+    oracle_run!(r, case_note_delay());
+    r.tick_trace().tick_rms(0.12).finish();
 }
 
 #[test]
@@ -1089,6 +1207,12 @@ fn oracle_vibrato_depth() {
 fn oracle_tremolo() {
     oracle_run!(r, case_tremolo());
     r.tick_rms(0.15).finish();
+}
+
+#[test]
+fn oracle_envpos() {
+    oracle_run!(r, case_envpos());
+    r.tick_rms(0.12).finish();
 }
 
 #[test]

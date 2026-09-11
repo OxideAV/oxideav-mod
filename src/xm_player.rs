@@ -211,19 +211,28 @@ pub struct XmChannel {
     /// True while the key is held. False after a key-off event (note 97
     /// or effect Kxx). Controls envelope sustain release + fadeout.
     pub key_on: bool,
-    /// Volume envelope tick cursor (frame position on the envelope
-    /// x-axis). Advances by one per XM tick.
+    /// Volume envelope position (the x-axis tick the last evaluation
+    /// read). Advances by one per XM tick before each read, except on
+    /// the tick that (re)positioned it — see [`Self::vol_env_fresh`].
     pub vol_env_tick: u16,
-    /// Last segment index within the envelope's point list that we
-    /// interpolated inside. Used to detect loop-end arrival.
-    pub vol_env_seg: u8,
+    /// True when `vol_env_tick` was just set by a note trigger or
+    /// `Lxx`: the next evaluation reads that position without
+    /// advancing first. Cleared by the evaluation.
+    pub vol_env_fresh: bool,
     /// Interpolated envelope value, 0..=64, in the last evaluated tick.
     /// Feeds the voice volume multiplier.
     pub vol_env_value: u8,
-    /// Panning envelope tick cursor.
+    /// Panning envelope position (see `vol_env_tick`).
     pub pan_env_tick: u16,
-    /// Panning envelope segment cursor.
-    pub pan_env_seg: u8,
+    /// Panning envelope "read without advancing" flag (see
+    /// `vol_env_fresh`).
+    pub pan_env_fresh: bool,
+    /// Set by a key-off (note 97 / `Kxx`) for the tick it lands on: the
+    /// envelopes still treat the key as held on that tick (a cursor
+    /// parked on the sustain point stays there) and start moving on
+    /// the next one. Black-box pinned (round 458 `env_sustain_vs_loop`
+    /// gate). Cleared by the envelope evaluation.
+    pub release_hold: bool,
     /// Panning envelope value, 0..=64 (32 = centre).
     pub pan_env_value: u8,
     /// Fadeout multiplier register (0..=65536). Starts at `FADEOUT_MAX`
@@ -502,6 +511,246 @@ impl XmPlayerState {
         Some((inst_idx, sample_idx))
     }
 
+    /// Deliver one cell's note / instrument / volume-column part to a
+    /// channel: the instrument column's default re-read, the note
+    /// trigger (or the tone-portamento target, or the key-off), then
+    /// the volume-column value writes. Shared by the tick-0 path and
+    /// the delayed (`EDx`) fire, which sees exactly the same sequence
+    /// on its own tick.
+    ///
+    /// `finetune_override` carries `E5x` and `sample_offset` carries
+    /// `9xx`; both only exist on the tick-0 path (they occupy the
+    /// effect column, so they cannot combine with `EDx`).
+    #[allow(clippy::too_many_arguments)]
+    fn fire_cell(
+        &mut self,
+        ch_idx: usize,
+        note: u8,
+        instrument: u8,
+        volume: u8,
+        tone_porta: bool,
+        finetune_override: Option<i8>,
+        sample_offset: Option<u8>,
+    ) {
+        let cell = XmCell {
+            note,
+            instrument,
+            volume,
+            effect_type: 0,
+            effect_param: 0,
+        };
+        // Resolve sample indices first (immutable self borrow), then
+        // update channel state in a separate mutable borrow.
+        let row_pattern_note = self.channels[ch_idx].pattern_note;
+        let instrument_change_resolved = if instrument != 0 {
+            self.resolve_sample(row_pattern_note.max(49), instrument)
+        } else {
+            None
+        };
+        let note_resolved = if cell.has_note() {
+            let inst = if instrument != 0 {
+                instrument
+            } else {
+                self.channels[ch_idx].instrument
+            };
+            self.resolve_sample(note, inst)
+        } else {
+            None
+        };
+        let table = self.pitch.table;
+        let ch = &mut self.channels[ch_idx];
+
+        // Instrument change. Does *not* restart the voice, just
+        // updates volume / finetune / panning defaults for
+        // subsequent ticks (matches FT2: "instrument column without
+        // a note re-reads volume/pan").
+        if instrument != 0 {
+            ch.instrument = instrument;
+            // Per multimedia-cx FT2 reference, the Rxy counter
+            // resets when the channel's row carries an instrument.
+            ch.multi_retrig_counter = 0;
+            if let Some((i, s)) = instrument_change_resolved {
+                let sample = &self.instruments[i].samples[s];
+                ch.volume = sample.volume.min(64);
+                ch.base_volume = ch.volume;
+                ch.finetune = sample.finetune;
+                ch.relative_note = sample.relative_note;
+                ch.base_panning = sample.panning;
+            }
+        }
+
+        // Volume-column handling, part 1: parameter-memory latches.
+        // The value-writing arms (SetVolume / SetPanning / fine
+        // slides) are applied AFTER the note-trigger block below —
+        // a note+instrument cell loads the sample's default volume
+        // and panning at trigger, and the volume column must land
+        // on top of that default, while still running BEFORE the
+        // standard effects per FastTracker-2-v2.04-xm.txt ("The
+        // volume column is interpreted before the standard
+        // effects, so some standard effects may override volume
+        // column effects").
+        match cell.volume_kind() {
+            XmVolume::SetVibratoSpeed(p) => {
+                if p != 0 {
+                    ch.vib_speed = p;
+                }
+            }
+            XmVolume::Vibrato(p) => {
+                if p != 0 {
+                    ch.vib_depth = p;
+                }
+            }
+            XmVolume::TonePorta(p) => {
+                // Each value is multiplied by 16 to match 3xy scale
+                // (one vol-col step = 16 period units).
+                if p != 0 {
+                    ch.porta_speed = p << 4;
+                }
+            }
+            _ => {}
+        }
+
+        // Tone-porta cell: if a note is present, it becomes the
+        // target — don't retrigger the voice. Voice remains live.
+        if tone_porta && cell.has_note() && ch.period > 0.0 {
+            ch.pattern_note = note;
+            if let Some((i, s)) = note_resolved {
+                let sample = &self.instruments[i].samples[s];
+                ch.finetune = sample.finetune;
+                ch.relative_note = sample.relative_note;
+                let real_note = (note as i32 - 1) + ch.relative_note as i32;
+                ch.porta_target = note_to_period(table, real_note, ch.finetune as i32);
+                ch.sample_in_instr = s as u8;
+            }
+        } else if cell.has_note() {
+            // Note trigger.
+            ch.pattern_note = note;
+            if let Some((i, s)) = note_resolved {
+                let sample = &self.instruments[i].samples[s];
+                ch.finetune = sample.finetune;
+                ch.relative_note = sample.relative_note;
+                if instrument != 0 {
+                    ch.volume = sample.volume.min(64);
+                    ch.base_volume = ch.volume;
+                }
+                ch.base_panning = sample.panning;
+                if let Some(ft) = finetune_override {
+                    ch.finetune = ft;
+                }
+                let real_note = (note as i32 - 1) + ch.relative_note as i32;
+                let period = note_to_period(table, real_note, ch.finetune as i32);
+                ch.period = period;
+                ch.porta_target = period;
+                ch.arp_base_period = period;
+                let freq = period_to_freq(table, period);
+                ch.sample_in_instr = s as u8;
+                let v = ch.volume as f32 / 64.0;
+                ch.voice.trigger(freq, v);
+
+                // 9xy — Sample offset. Applied at trigger. The
+                // memory byte is the *value to use* when 9 is
+                // hit; FT2 stores the last non-zero param.
+                if let Some(param) = sample_offset {
+                    if param != 0 {
+                        ch.sample_offset_mem = param;
+                    }
+                    let off = (ch.sample_offset_mem as f32) * 256.0;
+                    ch.voice.pos = off;
+                }
+
+                // Fresh note: envelopes read position 0 on this
+                // tick, fadeout restarts.
+                ch.key_on = true;
+                ch.vol_env_tick = 0;
+                ch.vol_env_fresh = true;
+                ch.vol_env_value = 64;
+                ch.pan_env_tick = 0;
+                ch.pan_env_fresh = true;
+                ch.pan_env_value = 32;
+                ch.fadeout = FADEOUT_MAX;
+
+                // Vibrato + tremolo position reset on a new note,
+                // controlled by waveform-bit 2 ("don't retrig").
+                if (ch.vib_waveform & 0x04) == 0 {
+                    ch.vib_pos = 0;
+                }
+                if (ch.trem_waveform & 0x04) == 0 {
+                    ch.trem_pos = 0;
+                }
+                // Autovibrato: the sweep counter always restarts
+                // on a new note (the sweep is a separate ramp-in
+                // envelope, not a phase register). The LFO phase
+                // `auto_vib_pos` is reset on trigger UNLESS bit 2
+                // of the instrument's `vibrato_type` byte is set
+                // ("+4 to the type" = don't-retrigger flag, per
+                // FT2 manual §3.15.4 and the in-tree note
+                // `docs/audio/trackers/xm/xm-instrument-autovibrato.md`).
+                let inst_vib_type = self.instruments[i].vibrato_type;
+                if (inst_vib_type & 0x04) == 0 {
+                    ch.auto_vib_pos = 0;
+                }
+                ch.auto_vib_sweep_cnt = 0;
+                // Multi-retrig counter: NOT reset here. Per
+                // `multimedia-cx-fasttracker-2.html` §2.1.22 the
+                // Rxy counter resets only (a) before the song
+                // starts, (b) on a row whose channel carries an
+                // INSTRUMENT number ("doesn't matter if there's a
+                // note in the note column" — handled in the
+                // instrument branch above), and (c) after a
+                // non-tick-0 E9x retrig. A bare note with no
+                // instrument byte is none of those, so its trigger
+                // leaves the counter running.
+                ch.tremor_counter = 0;
+            }
+        } else if cell.is_note_off() {
+            // XM note 97 = key-off. Don't stop the voice; release
+            // the envelope sustain and let fadeout take over. If the
+            // instrument has no volume envelope, FT2 silences the
+            // voice immediately — mirror that so single-sample
+            // instruments still behave.
+            ch.key_on = false;
+            ch.release_hold = true;
+            let inst_idx = ch.instrument.saturating_sub(1) as usize;
+            let has_vol_env = self
+                .instruments
+                .get(inst_idx)
+                .map(|i| i.volume_envelope.is_on() && !i.volume_envelope.points.is_empty())
+                .unwrap_or(false);
+            if !has_vol_env {
+                ch.voice.active = false;
+            }
+        }
+
+        // Volume-column handling, part 2: value writes. These land
+        // after the trigger's sample-default load (so a vol-col
+        // SetVolume on a note+instrument cell survives) and before
+        // `apply_tick0_effect` (so standard effects like Cxx still
+        // override them, per the v2.04 ordering sentence quoted in
+        // part 1).
+        match cell.volume_kind() {
+            XmVolume::SetVolume(v) => {
+                ch.volume = v.min(64);
+                ch.base_volume = ch.volume;
+            }
+            XmVolume::SetPanning(p) => {
+                // Volume-column panning: 0xC0..=0xCF, displayed as
+                // 0..=15, maps to 0..=0xFF (see FT2 volume-column
+                // table).
+                ch.base_panning = (p as u16 * 17).min(255) as u8;
+            }
+            XmVolume::FineVolumeSlideUp(p) => {
+                // Fine slides apply once, on tick 0.
+                ch.volume = (ch.volume as u16 + p as u16).min(64) as u8;
+                ch.base_volume = ch.volume;
+            }
+            XmVolume::FineVolumeSlideDown(p) => {
+                ch.volume = ch.volume.saturating_sub(p);
+                ch.base_volume = ch.volume;
+            }
+            _ => {}
+        }
+    }
+
     fn enter_row(&mut self) {
         for ch_idx in 0..self.channels.len() {
             let Some(cell) = self.cell_at(self.row, ch_idx) else {
@@ -510,30 +759,10 @@ impl XmPlayerState {
 
             // A cell with effect 3xy / 5xy — or volume-column Mx — turns
             // the note (if any) into a tone-porta *target* rather than
-            // retriggering the voice. We detect it early so the trigger
-            // logic can branch on it.
+            // retriggering the voice.
             let is_tone_porta_cell = cell.effect_type == 0x03
                 || cell.effect_type == 0x05
                 || matches!(cell.volume_kind(), XmVolume::TonePorta(_));
-
-            // Resolve sample indices first (immutable self borrow), then
-            // update channel state in a separate mutable borrow.
-            let row_pattern_note = self.channels[ch_idx].pattern_note;
-            let instrument_change_resolved = if cell.instrument != 0 {
-                self.resolve_sample(row_pattern_note.max(49), cell.instrument)
-            } else {
-                None
-            };
-            let note_resolved = if cell.has_note() {
-                let inst = if cell.instrument != 0 {
-                    cell.instrument
-                } else {
-                    self.channels[ch_idx].instrument
-                };
-                self.resolve_sample(cell.note, inst)
-            } else {
-                None
-            };
 
             let ch = &mut self.channels[ch_idx];
             ch.effect = cell.effect_type;
@@ -542,71 +771,30 @@ impl XmPlayerState {
             ch.note_delay_tick = 0;
             ch.note_cut_tick = 0;
 
-            // Instrument change. Does *not* restart the voice, just
-            // updates volume / finetune / panning defaults for
-            // subsequent ticks (matches FT2: "instrument column without
-            // a note re-reads volume/pan").
-            if cell.instrument != 0 {
-                ch.instrument = cell.instrument;
-                // Per multimedia-cx FT2 reference, the Rxy counter
-                // resets when the channel's row carries an instrument.
-                ch.multi_retrig_counter = 0;
-                if let Some((i, s)) = instrument_change_resolved {
-                    let sample = &self.instruments[i].samples[s];
-                    ch.volume = sample.volume.min(64);
-                    ch.base_volume = ch.volume;
-                    ch.finetune = sample.finetune;
-                    ch.relative_note = sample.relative_note;
-                    ch.base_panning = sample.panning;
+            // EDx (x > 0): NOTHING of this cell reaches the channel
+            // until tick x — not the instrument column's default
+            // re-read, not the volume column, not the pitch. A delay
+            // of `speed` or more never fires at all (the row ends
+            // first). Black-box pinned (round 458 `note_delay` gate).
+            let delay = if cell.effect_type == 0x0E && (cell.effect_param >> 4) == 0x0D {
+                cell.effect_param & 0x0F
+            } else {
+                0
+            };
+            if delay > 0 {
+                if delay < self.speed {
+                    ch.note_delay_tick = delay;
+                    ch.pending_note = cell.note;
+                    ch.pending_instrument = cell.instrument;
+                    ch.pending_volume = cell.volume;
                 }
+                continue;
             }
 
-            // Volume-column handling, part 1: parameter-memory latches.
-            // The value-writing arms (SetVolume / SetPanning / fine
-            // slides) are applied AFTER the note-trigger block below —
-            // a note+instrument cell loads the sample's default volume
-            // and panning at trigger, and the volume column must land
-            // on top of that default, while still running BEFORE the
-            // standard effects per FastTracker-2-v2.04-xm.txt ("The
-            // volume column is interpreted before the standard
-            // effects, so some standard effects may override volume
-            // column effects").
-            match cell.volume_kind() {
-                XmVolume::Empty => {}
-                XmVolume::SetVolume(_)
-                | XmVolume::SetPanning(_)
-                | XmVolume::FineVolumeSlideUp(_)
-                | XmVolume::FineVolumeSlideDown(_) => {
-                    // Applied post-trigger; see part 2 below.
-                }
-                XmVolume::VolumeSlideUp(p) | XmVolume::VolumeSlideDown(p) => {
-                    if p != 0 {
-                        ch.vol_slide_col_mem = p;
-                    }
-                }
-                XmVolume::SetVibratoSpeed(p) => {
-                    if p != 0 {
-                        ch.vib_speed = p;
-                    }
-                }
-                XmVolume::Vibrato(p) => {
-                    if p != 0 {
-                        ch.vib_depth = p;
-                    }
-                }
-                XmVolume::PanningSlideLeft(_) | XmVolume::PanningSlideRight(_) => {
-                    // Per the FT2 v2.04 spec, all volume-column effects
-                    // work as the standard effects. Panning slides are
-                    // per-tick (rows >= 1); the tick-0 enter_row path
-                    // does no initial slide. The per-tick step happens
-                    // in `apply_tickn_effect`'s `vol_col` match arm.
-                }
-                XmVolume::TonePorta(p) => {
-                    // Each value is multiplied by 16 to match 3xy scale
-                    // (one vol-col step = 16 period units).
-                    if p != 0 {
-                        ch.porta_speed = p << 4;
-                    }
+            // Volume-column slide memories are latched at row entry.
+            if let XmVolume::VolumeSlideUp(p) | XmVolume::VolumeSlideDown(p) = cell.volume_kind() {
+                if p != 0 {
+                    ch.vol_slide_col_mem = p;
                 }
             }
 
@@ -689,168 +877,37 @@ impl XmPlayerState {
                 _ => {}
             }
 
-            let table = self.pitch.table;
-            // Tone-porta cell: if a note is present, it becomes the
-            // target — don't retrigger the voice. Voice remains live.
-            if is_tone_porta_cell && cell.has_note() && ch.period > 0.0 {
-                ch.pattern_note = cell.note;
-                if let Some((i, s)) = note_resolved {
-                    let sample = &self.instruments[i].samples[s];
-                    ch.finetune = sample.finetune;
-                    ch.relative_note = sample.relative_note;
-                    let real_note = (cell.note as i32 - 1) + ch.relative_note as i32;
-                    ch.porta_target = note_to_period(table, real_note, ch.finetune as i32);
-                    ch.sample_in_instr = s as u8;
-                }
-            } else if cell.has_note() {
-                // Note trigger.
-                ch.pattern_note = cell.note;
-                if let Some((i, s)) = note_resolved {
-                    let sample = &self.instruments[i].samples[s];
-                    ch.finetune = sample.finetune;
-                    ch.relative_note = sample.relative_note;
-                    if cell.instrument != 0 {
-                        ch.volume = sample.volume.min(64);
-                        ch.base_volume = ch.volume;
-                    }
-                    ch.base_panning = sample.panning;
-                    // E5x — Set finetune (override the sample default).
-                    // The nibble is an unsigned offset from 8 on the
-                    // -128..+127 finetune scale: `E58` = 0, `E50` =
-                    // -128 (one semitone down), `E5F` = +112. The FT2
-                    // manual (§3.15.6) gives no numeric mapping and the
-                    // ProTracker signed-nibble reading (8..F = -8..-1)
-                    // is NOT what FT2 does: the black-box oracle plays
-                    // `E58` at the sample's untuned pitch and `E50` a
-                    // full semitone flat (round 458, `tuning_*` gates).
-                    if cell.effect_type == 0x0E && (cell.effect_param >> 4) == 0x05 {
-                        ch.finetune = e5x_finetune(cell.effect_param & 0x0F);
-                    }
-                    let real_note = (cell.note as i32 - 1) + ch.relative_note as i32;
-                    let period = note_to_period(table, real_note, ch.finetune as i32);
-                    ch.period = period;
-                    ch.porta_target = period;
-                    ch.arp_base_period = period;
-                    let freq = period_to_freq(table, period);
-                    ch.sample_in_instr = s as u8;
-                    let v = ch.volume as f32 / 64.0;
+            // E5x — Set finetune (override the sample default).
+            // The nibble is an unsigned offset from 8 on the
+            // -128..+127 finetune scale: `E58` = 0, `E50` =
+            // -128 (one semitone down), `E5F` = +112. The FT2
+            // manual (§3.15.6) gives no numeric mapping and the
+            // ProTracker signed-nibble reading (8..F = -8..-1)
+            // is NOT what FT2 does: the black-box oracle plays
+            // `E58` at the sample's untuned pitch and `E50` a
+            // full semitone flat (round 458, `tuning_*` gates).
+            let finetune_override = if cell.effect_type == 0x0E && (cell.effect_param >> 4) == 0x05
+            {
+                Some(e5x_finetune(cell.effect_param & 0x0F))
+            } else {
+                None
+            };
+            let sample_offset = if cell.effect_type == 0x09 {
+                Some(cell.effect_param)
+            } else {
+                None
+            };
+            self.fire_cell(
+                ch_idx,
+                cell.note,
+                cell.instrument,
+                cell.volume,
+                is_tone_porta_cell,
+                finetune_override,
+                sample_offset,
+            );
 
-                    // Handle note-delay (EDx): if ED with non-zero x,
-                    // defer the actual trigger to tick `x` instead of 0.
-                    let is_delay = cell.effect_type == 0x0E
-                        && (cell.effect_param >> 4) == 0x0D
-                        && (cell.effect_param & 0x0F) != 0;
-                    if is_delay {
-                        ch.note_delay_tick = cell.effect_param & 0x0F;
-                        ch.pending_note = cell.note;
-                        ch.pending_instrument = cell.instrument;
-                        ch.pending_volume = cell.volume;
-                    } else {
-                        ch.voice.trigger(freq, v);
-
-                        // 9xy — Sample offset. Applied at trigger. The
-                        // memory byte is the *value to use* when 9 is
-                        // hit; FT2 stores the last non-zero param.
-                        if cell.effect_type == 0x09 {
-                            if cell.effect_param != 0 {
-                                ch.sample_offset_mem = cell.effect_param;
-                            }
-                            let off = (ch.sample_offset_mem as f32) * 256.0;
-                            ch.voice.pos = off;
-                        }
-
-                        // Fresh note resets envelope cursors + fadeout.
-                        ch.key_on = true;
-                        ch.vol_env_tick = 0;
-                        ch.vol_env_seg = 0;
-                        ch.vol_env_value = 64;
-                        ch.pan_env_tick = 0;
-                        ch.pan_env_seg = 0;
-                        ch.pan_env_value = 32;
-                        ch.fadeout = FADEOUT_MAX;
-
-                        // Vibrato + tremolo position reset on a new note,
-                        // controlled by waveform-bit 2 ("don't retrig").
-                        if (ch.vib_waveform & 0x04) == 0 {
-                            ch.vib_pos = 0;
-                        }
-                        if (ch.trem_waveform & 0x04) == 0 {
-                            ch.trem_pos = 0;
-                        }
-                        // Autovibrato: the sweep counter always restarts
-                        // on a new note (the sweep is a separate ramp-in
-                        // envelope, not a phase register). The LFO phase
-                        // `auto_vib_pos` is reset on trigger UNLESS bit 2
-                        // of the instrument's `vibrato_type` byte is set
-                        // ("+4 to the type" = don't-retrigger flag, per
-                        // FT2 manual §3.15.4 and the in-tree note
-                        // `docs/audio/trackers/xm/xm-instrument-autovibrato.md`).
-                        let inst_vib_type = self.instruments[i].vibrato_type;
-                        if (inst_vib_type & 0x04) == 0 {
-                            ch.auto_vib_pos = 0;
-                        }
-                        ch.auto_vib_sweep_cnt = 0;
-                        // Multi-retrig counter: NOT reset here. Per
-                        // `multimedia-cx-fasttracker-2.html` §2.1.22 the
-                        // Rxy counter resets only (a) before the song
-                        // starts, (b) on a row whose channel carries an
-                        // INSTRUMENT number ("doesn't matter if there's a
-                        // note in the note column" — handled in the
-                        // cell.instrument != 0 branch above), and (c)
-                        // after a non-tick-0 E9x retrig. A bare note with
-                        // no instrument byte is none of those, so its
-                        // trigger leaves the counter running.
-                        ch.tremor_counter = 0;
-                    }
-                }
-            } else if cell.is_note_off() {
-                // XM note 97 = key-off. Don't stop the voice; release
-                // the envelope sustain and let fadeout take over. If the
-                // instrument has no volume envelope, FT2 silences the
-                // voice immediately — mirror that so single-sample
-                // instruments still behave.
-                ch.key_on = false;
-                let inst_idx = ch.instrument.saturating_sub(1) as usize;
-                let has_vol_env = self
-                    .instruments
-                    .get(inst_idx)
-                    .map(|i| i.volume_envelope.is_on() && !i.volume_envelope.points.is_empty())
-                    .unwrap_or(false);
-                if !has_vol_env {
-                    ch.voice.active = false;
-                }
-            }
-
-            // Volume-column handling, part 2: value writes. These land
-            // after the trigger's sample-default load (so a vol-col
-            // SetVolume on a note+instrument cell survives) and before
-            // `apply_tick0_effect` (so standard effects like Cxx still
-            // override them, per the v2.04 ordering sentence quoted in
-            // part 1).
-            match cell.volume_kind() {
-                XmVolume::SetVolume(v) => {
-                    ch.volume = v.min(64);
-                    ch.base_volume = ch.volume;
-                }
-                XmVolume::SetPanning(p) => {
-                    // Volume-column panning: 0xC0..=0xCF, displayed as
-                    // 0..=15, maps to 0..=0xFF (see FT2 volume-column
-                    // table).
-                    ch.base_panning = (p as u16 * 17).min(255) as u8;
-                }
-                XmVolume::FineVolumeSlideUp(p) => {
-                    // Fine slides apply once, on tick 0.
-                    ch.volume = (ch.volume as u16 + p as u16).min(64) as u8;
-                    ch.base_volume = ch.volume;
-                }
-                XmVolume::FineVolumeSlideDown(p) => {
-                    ch.volume = ch.volume.saturating_sub(p);
-                    ch.base_volume = ch.volume;
-                }
-                _ => {}
-            }
-
-            apply_tick0_effect(ch);
+            apply_tick0_effect(&mut self.channels[ch_idx]);
 
             // Kxy (effect 0x14) — Key off, "Same as note number 97"
             // (`multimedia-cx-fasttracker-2.html` Kxy). `apply_tick0_effect`
@@ -1008,6 +1065,23 @@ impl XmPlayerState {
         // run every tick (including tick 0) per the FT2 "envelopes
         // processed once per frame" rule.
         for ch_idx in 0..self.channels.len() {
+            // Note delay (EDx): the deferred cell fires on tick x, ahead
+            // of this tick's envelope read so a fresh envelope starts
+            // on the fire tick itself. The fire is the same sequence
+            // as a tick-0 cell (instrument re-read, trigger / key-off,
+            // volume column).
+            let cur_tick = self.tick;
+            if self.channels[ch_idx].note_delay_tick > 0
+                && cur_tick == self.channels[ch_idx].note_delay_tick
+            {
+                let (note, instrument, volume) = {
+                    let ch = &self.channels[ch_idx];
+                    (ch.pending_note, ch.pending_instrument, ch.pending_volume)
+                };
+                self.fire_cell(ch_idx, note, instrument, volume, false, None, None);
+                self.channels[ch_idx].note_delay_tick = 0;
+            }
+
             let inst_idx = self.channels[ch_idx].instrument as usize;
             if inst_idx == 0 {
                 continue;
@@ -1019,18 +1093,19 @@ impl XmPlayerState {
             // Collect envelope outputs under an immutable borrow of
             // `inst`, then apply them under a mutable borrow of the
             // channel.
+            let held = self.channels[ch_idx].key_on || self.channels[ch_idx].release_hold;
             let vol_env = tick_envelope(
                 &inst.volume_envelope,
                 self.channels[ch_idx].vol_env_tick,
-                self.channels[ch_idx].vol_env_seg,
-                self.channels[ch_idx].key_on,
+                self.channels[ch_idx].vol_env_fresh,
+                held,
                 64,
             );
             let pan_env = tick_envelope(
                 &inst.panning_envelope,
                 self.channels[ch_idx].pan_env_tick,
-                self.channels[ch_idx].pan_env_seg,
-                self.channels[ch_idx].key_on,
+                self.channels[ch_idx].pan_env_fresh,
+                held,
                 32,
             );
             let fadeout_step = inst.volume_fadeout as i32;
@@ -1048,17 +1123,17 @@ impl XmPlayerState {
                 .map(|c| c.volume_kind())
                 .unwrap_or(XmVolume::Empty);
             let table = self.pitch.table;
-            let cur_tick = self.tick;
             let global_volume = self.global_volume;
 
             let ch = &mut self.channels[ch_idx];
             // Apply envelope state.
             ch.vol_env_tick = vol_env.next_tick;
-            ch.vol_env_seg = vol_env.next_seg;
+            ch.vol_env_fresh = false;
             ch.vol_env_value = vol_env.value;
             ch.pan_env_tick = pan_env.next_tick;
-            ch.pan_env_seg = pan_env.next_seg;
+            ch.pan_env_fresh = false;
             ch.pan_env_value = pan_env.value;
+            ch.release_hold = false;
 
             // Fadeout: decrements each tick once key is released.
             if !ch.key_on {
@@ -1072,49 +1147,6 @@ impl XmPlayerState {
             if ch.note_cut_tick > 0 && cur_tick == ch.note_cut_tick {
                 ch.volume = 0;
                 ch.base_volume = 0;
-            }
-
-            // Note delay (ED x): trigger the voice at tick x. The delayed
-            // trigger must mirror the tick-0 note-on (`enter_row`) exactly
-            // — a deferred note is still a note-on, so the same envelope /
-            // fadeout reset, the same waveform no-retrigger gating, and
-            // the same tremor counter reset apply.
-            if ch.note_delay_tick > 0 && cur_tick == ch.note_delay_tick {
-                let v = ch.volume as f32 / 64.0;
-                let freq = period_to_freq(table, ch.period);
-                ch.voice.trigger(freq, v);
-
-                ch.key_on = true;
-                ch.vol_env_tick = 0;
-                ch.vol_env_seg = 0;
-                ch.vol_env_value = 64;
-                ch.pan_env_tick = 0;
-                ch.pan_env_seg = 0;
-                ch.pan_env_value = 32;
-                ch.fadeout = FADEOUT_MAX;
-
-                // Vibrato / tremolo / autovibrato phase resets honour the
-                // waveform "don't retrigger" flag (bit 2), identical to
-                // the tick-0 trigger. Without this gate a note-delayed
-                // cell would reset an LFO that an E4x/E7x +4 (or an
-                // instrument vibrato-type +4) explicitly asked to persist.
-                if (ch.vib_waveform & 0x04) == 0 {
-                    ch.vib_pos = 0;
-                }
-                if (ch.trem_waveform & 0x04) == 0 {
-                    ch.trem_pos = 0;
-                }
-                if (inst_vib_type & 0x04) == 0 {
-                    ch.auto_vib_pos = 0;
-                }
-                ch.auto_vib_sweep_cnt = 0;
-                // The Rxy counter is NOT reset by the delayed fire: per
-                // `multimedia-cx-fasttracker-2.html` §2.1.22 the reset
-                // cases are song start / an instrument-number row / a
-                // non-tick-0 E9x retrig. The instrument-number reset for
-                // this row (if any) already ran in `enter_row`.
-                ch.tremor_counter = 0;
-                ch.note_delay_tick = 0;
             }
 
             // E9x — Periodic retrig, param > 0 leg: retrig the sample
@@ -1603,6 +1635,7 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
         0x14 => {
             // Kxy: key-off-as-effect (treat like note 97).
             ch.key_on = false;
+            ch.release_hold = true;
         }
         0x15 => {
             // Lxy: Set envelope position.
@@ -1613,18 +1646,11 @@ fn apply_tick0_effect(ch: &mut XmChannel) {
             // envelope position."). Spec is terse; the canonical FT2
             // reading is that the parameter byte is the new tick offset
             // on the *volume* envelope's x-axis (pan envelope is left
-            // alone). We re-derive the segment index so `tick_envelope`
-            // can resume linear interpolation from the right
-            // (seg, tick) pair.
+            // alone).
+            // The position is read as-is on this tick (no advance),
+            // exactly like a fresh trigger's position 0.
             ch.vol_env_tick = ep as u16;
-            ch.vol_env_seg = 0;
-            // We can't reach the instrument table from here; the
-            // segment will be re-aligned on the next `tick_envelope`
-            // call (it auto-advances `seg` while
-            // `tick >= points[seg + 1].0`). Setting seg = 0 forces
-            // re-alignment from the start of the envelope on the next
-            // tick — correct because the envelope only ever moves
-            // monotonically forward within a (loop-free) segment chain.
+            ch.vol_env_fresh = true;
         }
         0x21 => {
             // X1x / X2x — Extra-fine porta. The XM effect column stores
@@ -1898,35 +1924,39 @@ fn apply_vol_slide(ch: &mut XmChannel, mem: u8) {
 
 /// Output of a single envelope tick.
 struct EnvelopeTick {
-    /// Interpolated y-value at the current tick, 0..=64.
+    /// Interpolated y-value at the position read this tick, 0..=64.
     value: u8,
-    /// Next tick position on the envelope's x-axis.
+    /// The position that was read (stored back as the cursor).
     next_tick: u16,
-    /// Segment index (index into `points` such that
-    /// `points[seg].0 <= next_tick < points[seg+1].0`).
-    next_seg: u8,
 }
 
-/// Advance an XM envelope by one tick.
+/// Evaluate an XM envelope for one tick.
 ///
 /// Implements the FT2 envelope rules documented in
-/// `FastTracker-2-v2.04-xm.txt` §"Volume envelope" plus the annotations
-/// in `FastTracker-2-v2.04-xm.html`:
+/// `FastTracker-2-v2.04-xm.txt` §"Volumes and envelopes" plus the
+/// black-box-pinned tick order (round 458 `env_sustain_vs_loop`,
+/// `vol_env_delayed`, `envpos` gates):
 ///
-/// - Envelope points are `(tick_x, value_y)` pairs, `y` in `0..=64`.
-/// - Within a segment we linearly interpolate between successive points.
-/// - If the sustain bit is set and the note is still key-on, stall at
-///   `points[sustain_point]` (don't advance `tick`).
-/// - If the loop bit is set and the cursor reaches
-///   `points[loop_end_point]`, jump back to `points[loop_start_point]`.
-/// - Past the last point, hold at that point's value.
+/// - Envelope points are `(tick_x, value_y)` pairs, `y` in `0..=64`;
+///   within a segment we linearly interpolate between successive
+///   points and past the last point we hold its value.
+/// - The position is advanced by one BEFORE it is read, except on the
+///   tick that set it (`fresh`: a note trigger reads position 0, `Lxx`
+///   reads `xx`). The caller keeps `key_on` true for the key-off tick
+///   itself (`XmChannel::release_hold`), so a cursor parked on the
+///   sustain point leaves it on the tick after the key-off.
+/// - With the sustain bit set and the key held, a position sitting on
+///   `points[sustain_point]` does not advance.
+/// - With the loop bit set, an advance that reaches
+///   `points[loop_end_point]` lands on `points[loop_start_point]`
+///   instead (only when the loop spans a positive range).
 ///
 /// `default_value` is what to return when the envelope is disabled or
 /// has no points — 64 for volume (full-scale), 32 for panning (centre).
 fn tick_envelope(
     env: &XmEnvelope,
     cur_tick: u16,
-    cur_seg: u8,
+    fresh: bool,
     key_on: bool,
     default_value: u8,
 ) -> EnvelopeTick {
@@ -1934,94 +1964,49 @@ fn tick_envelope(
         return EnvelopeTick {
             value: default_value,
             next_tick: cur_tick,
-            next_seg: cur_seg,
         };
     }
-
-    // Clamp the segment cursor to the valid index range, accounting for
-    // a possibly-truncated points vector (parser already caps at 12).
     let n = env.points.len();
-    let mut seg = (cur_seg as usize).min(n.saturating_sub(1));
-    let mut tick = cur_tick;
-
-    // 0. Re-align the segment cursor with the tick BEFORE evaluating.
-    // An Lxy jump (set envelope position) moves `tick` arbitrarily and
-    // resets the caller's segment to 0; without this pass the very
-    // first evaluation after the jump interpolates inside the stale
-    // segment (clamped to its right edge) instead of at the jumped-to
-    // position — e.g. an Lxy past the final point returned the
-    // second point's value for one tick instead of the last point's.
-    while seg + 1 < n && tick >= env.points[seg + 1].0 {
-        seg += 1;
-    }
-
-    // 1. Evaluate the current (tick, seg) pair.
-    let value = eval_envelope_at(&env.points, seg, tick);
-
-    // 2. Compute the next position for the next call.
-
-    // Sustain: if we're at or past the sustain-point tick and the note
-    // is still held, stall. FT2 holds *on* the sustain point.
-    if env.has_sustain() && key_on {
-        let sp = (env.sustain_point as usize).min(n - 1);
-        if tick >= env.points[sp].0 {
-            // Re-anchor to the sustain point's tick so jitter / overshoot
-            // from the initial catch-up doesn't drift.
-            tick = env.points[sp].0;
-            seg = sp.min(n.saturating_sub(2));
-            return EnvelopeTick {
-                value,
-                next_tick: tick,
-                next_seg: seg as u8,
-            };
-        }
-    }
-
-    // Advance one tick.
-    tick = tick.saturating_add(1);
-
-    // Loop: if we crossed the loop-end point, snap back to loop-start.
-    if env.has_loop() {
-        let le = (env.loop_end_point as usize).min(n - 1);
-        let ls = (env.loop_start_point as usize).min(le);
-        let loop_end_tick = env.points[le].0;
-        let loop_start_tick = env.points[ls].0;
-        if tick >= loop_end_tick && loop_end_tick > loop_start_tick {
-            tick = loop_start_tick;
-            seg = ls;
-        }
-    }
-
-    // Keep `seg` aligned with `tick` — advance until we're in the
-    // segment starting at `points[seg].0`.
-    while seg + 1 < n && tick >= env.points[seg + 1].0 {
-        seg += 1;
-    }
-
-    // Past the last point: clamp tick so we don't wrap. FT2 holds at
-    // the last point's value indefinitely in this case.
     let last_x = env.points[n - 1].0;
+    let mut tick = cur_tick;
+    if !fresh {
+        let sp = (env.sustain_point as usize).min(n - 1);
+        let hold = env.has_sustain() && key_on && tick == env.points[sp].0;
+        if !hold {
+            tick = tick.saturating_add(1);
+            if env.has_loop() {
+                let le = (env.loop_end_point as usize).min(n - 1);
+                let ls = (env.loop_start_point as usize).min(le);
+                let loop_end_tick = env.points[le].0;
+                let loop_start_tick = env.points[ls].0;
+                if tick >= loop_end_tick && loop_end_tick > loop_start_tick {
+                    tick = loop_start_tick;
+                }
+            }
+        }
+    }
     if tick > last_x {
         tick = last_x;
     }
-
     EnvelopeTick {
-        value,
+        value: eval_envelope_at(&env.points, tick),
         next_tick: tick,
-        next_seg: seg as u8,
     }
 }
 
-/// Evaluate an envelope at (seg, tick) via linear interpolation between
-/// `points[seg]` and `points[seg+1]`. If `tick` is past the last point,
-/// returns the last point's y-value.
-fn eval_envelope_at(points: &[(u16, u16)], seg: usize, tick: u16) -> u8 {
+/// Evaluate an envelope at `tick` via linear interpolation between the
+/// two points bracketing it. Past the last point returns the last
+/// point's y-value; before the first point returns the first's.
+fn eval_envelope_at(points: &[(u16, u16)], tick: u16) -> u8 {
     let n = points.len();
     if n == 0 {
         return 0;
     }
-    // Past last point → hold.
-    if seg >= n - 1 {
+    let mut seg = 0;
+    while seg + 1 < n && tick >= points[seg + 1].0 {
+        seg += 1;
+    }
+    if seg + 1 >= n {
         return points[n - 1].1.min(64) as u8;
     }
     let (x0, y0) = points[seg];
@@ -2062,30 +2047,36 @@ pub mod tests {
     #[test]
     fn envelope_disabled_returns_default() {
         let env = env_with_points(vec![(0, 0), (10, 64)], 0);
-        let r = tick_envelope(&env, 5, 0, true, 64);
+        let r = tick_envelope(&env, 5, true, true, 64);
         assert_eq!(r.value, 64);
     }
 
     #[test]
     fn envelope_linear_interpolates() {
-        // (0,0) -> (10,64): at tick 5 we expect ~32.
+        // (0,0) -> (10,64): a fresh read at tick 5 gives 32.
         let env = env_with_points(vec![(0, 0), (10, 64)], 0x01);
-        let r = tick_envelope(&env, 5, 0, true, 64);
+        let r = tick_envelope(&env, 5, true, true, 64);
         assert_eq!(r.value, 32);
+        assert_eq!(r.next_tick, 5);
+        // A non-fresh read advances first: 6 → 38.
+        let r = tick_envelope(&env, 5, false, true, 64);
+        assert_eq!(r.value, 38);
+        assert_eq!(r.next_tick, 6);
     }
 
     #[test]
-    fn envelope_sustain_holds_while_key_on() {
+    fn envelope_sustain_holds_while_key_on_and_releases_in_place() {
         // Points: (0,0), (5,64), (10,0). Sustain at point 1 (tick=5).
         let mut env = env_with_points(vec![(0, 0), (5, 64), (10, 0)], 0x01 | 0x02);
         env.sustain_point = 1;
-        // At tick 5, key on → value 64, next_tick stays 5.
-        let r = tick_envelope(&env, 5, 1, true, 64);
+        // Sitting on tick 5 with the key held: no advance, value 64.
+        let r = tick_envelope(&env, 5, false, true, 64);
         assert_eq!(r.value, 64);
         assert_eq!(r.next_tick, 5);
-        // Released: next call advances past sustain.
-        let r = tick_envelope(&env, 5, 1, false, 64);
+        // Released: the advance resumes.
+        let r = tick_envelope(&env, 5, false, false, 64);
         assert_eq!(r.next_tick, 6);
+        assert_eq!(r.value, 64 - 64 / 5);
     }
 
     #[test]
@@ -2094,19 +2085,19 @@ pub mod tests {
         let mut env = env_with_points(vec![(0, 0), (5, 64), (10, 32)], 0x01 | 0x04);
         env.loop_start_point = 0;
         env.loop_end_point = 2;
-        // At tick 8 segment 1, advancing goes to tick 9 (no loop yet).
-        let r = tick_envelope(&env, 8, 1, true, 64);
+        // From tick 8 the advance lands on 9 (no loop yet).
+        let r = tick_envelope(&env, 8, false, true, 64);
         assert_eq!(r.next_tick, 9);
-        // At tick 9, advancing hits tick 10 == loop_end, so we wrap to 0.
-        let r = tick_envelope(&env, 9, 1, true, 64);
+        // From tick 9 the advance reaches 10 == loop_end → lands on 0.
+        let r = tick_envelope(&env, 9, false, true, 64);
         assert_eq!(r.next_tick, 0);
-        assert_eq!(r.next_seg, 0);
+        assert_eq!(r.value, 0);
     }
 
     #[test]
     fn envelope_past_last_point_holds() {
         let env = env_with_points(vec![(0, 0), (5, 64)], 0x01);
-        let r = tick_envelope(&env, 100, 1, true, 64);
+        let r = tick_envelope(&env, 100, true, true, 64);
         // Should clamp to the last point's y.
         assert_eq!(r.value, 64);
         assert_eq!(r.next_tick, 5);
@@ -2216,40 +2207,37 @@ pub mod tests {
     // ---------------- Lxy / set envelope position ----------------
 
     #[test]
-    fn lxy_sets_volume_envelope_tick_and_zeroes_segment() {
+    fn lxy_sets_volume_envelope_position_for_an_in_place_read() {
         let mut ch = XmChannel {
             vol_env_tick: 3,
-            vol_env_seg: 1,
             pan_env_tick: 7,
-            pan_env_seg: 2,
             effect: 0x15,
             effect_param: 0x20,
             ..Default::default()
         };
         apply_tick0_effect(&mut ch);
-        // Volume envelope cursor moved to the requested tick.
+        // Volume envelope cursor moved to the requested tick and marked
+        // fresh, so the next read is at 0x20 exactly (no advance).
         assert_eq!(ch.vol_env_tick, 0x20);
-        // Segment zeroed so `tick_envelope` re-aligns on the next call.
-        assert_eq!(ch.vol_env_seg, 0);
+        assert!(ch.vol_env_fresh);
         // Pan envelope untouched (Lxy targets the volume envelope per
         // the FT2 reading; pan envelope only moves under explicit
         // panning effects).
         assert_eq!(ch.pan_env_tick, 7);
-        assert_eq!(ch.pan_env_seg, 2);
+        assert!(!ch.pan_env_fresh);
     }
 
     #[test]
     fn lxy_param_zero_rewinds_to_envelope_start() {
         let mut ch = XmChannel {
             vol_env_tick: 100,
-            vol_env_seg: 3,
             effect: 0x15,
             effect_param: 0x00,
             ..Default::default()
         };
         apply_tick0_effect(&mut ch);
         assert_eq!(ch.vol_env_tick, 0);
-        assert_eq!(ch.vol_env_seg, 0);
+        assert!(ch.vol_env_fresh);
     }
 
     // ---------------- E3x captured into ch.glissando ----------------
@@ -3414,12 +3402,12 @@ pub mod tests {
         // hold" rule) — never wrap, never panic.
         let env = env_with_points(vec![(0, 64), (10, 32), (20, 8)], 0x01);
         let mut tick = 200u16; // way past x=20
-        let mut seg = 0u8;
+        let mut fresh = true;
         for _ in 0..5 {
-            let r = tick_envelope(&env, tick, seg, true, 64);
+            let r = tick_envelope(&env, tick, fresh, true, 64);
             assert_eq!(r.value, 8, "past-the-end position holds last y");
             tick = r.next_tick;
-            seg = r.next_seg;
+            fresh = false;
             assert!(tick <= 20, "cursor must clamp to the last point's x");
         }
     }
@@ -3433,11 +3421,9 @@ pub mod tests {
         env.loop_start_point = 2; // x=20
         env.loop_end_point = 1; // x=10  (inverted)
         let mut tick = 0u16;
-        let mut seg = 0u8;
         for _ in 0..40 {
-            let r = tick_envelope(&env, tick, seg, true, 64);
+            let r = tick_envelope(&env, tick, false, true, 64);
             tick = r.next_tick;
-            seg = r.next_seg;
         }
         assert_eq!(tick, 20, "inverted loop degrades to forward walk + hold");
     }
@@ -3449,15 +3435,13 @@ pub mod tests {
         let mut env = env_with_points(vec![(0, 0), (10, 64)], 0x01 | 0x02);
         env.sustain_point = 11; // only 2 points exist
         let mut tick = 0u16;
-        let mut seg = 0u8;
         for _ in 0..30 {
-            let r = tick_envelope(&env, tick, seg, true, 64);
+            let r = tick_envelope(&env, tick, false, true, 64);
             tick = r.next_tick;
-            seg = r.next_seg;
         }
         // Clamped sustain point = last point (x=10): cursor stalls there.
         assert_eq!(tick, 10, "clamped sustain point stalls at last point");
-        let r = tick_envelope(&env, tick, seg, true, 64);
+        let r = tick_envelope(&env, tick, false, true, 64);
         assert_eq!(r.value, 64);
     }
     // ------------- multi-sample instrument routing (round 451) -------------
