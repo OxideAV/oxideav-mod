@@ -529,7 +529,14 @@ impl XmPlayerState {
         } else {
             0
         };
-        let sample_idx = sample_idx.min(inst.samples.len().saturating_sub(1));
+        // A map entry naming a sample the instrument does not have
+        // plays sample 0 (black-box pinned, round 458 `keymap` gate),
+        // not the last sample.
+        let sample_idx = if sample_idx < inst.samples.len() {
+            sample_idx
+        } else {
+            0
+        };
         Some((inst_idx, sample_idx))
     }
 
@@ -629,16 +636,15 @@ impl XmPlayerState {
         }
 
         // Tone-porta cell: if a note is present, it becomes the
-        // target — don't retrigger the voice. Voice remains live.
+        // target — don't retrigger the voice. The voice keeps playing
+        // its current sample with that sample's relative note and
+        // finetune, even when the keymap routes the target note to
+        // another sample (black-box pinned, round 458 `keymap` gate).
         if tone_porta && cell.has_note() && ch.period > 0.0 {
             ch.pattern_note = note;
-            if let Some((i, s)) = note_resolved {
-                let sample = &self.instruments[i].samples[s];
-                ch.finetune = sample.finetune;
-                ch.relative_note = sample.relative_note;
+            if note_resolved.is_some() {
                 let real_note = (note as i32 - 1) + ch.relative_note as i32;
                 ch.porta_target = note_to_period(table, real_note, ch.finetune as i32);
-                ch.sample_in_instr = s as u8;
             }
         } else if cell.has_note() {
             // Note trigger.
@@ -3872,18 +3878,38 @@ pub mod tests {
     }
 
     #[test]
-    fn sample_map_out_of_range_entry_clamps_to_last_sample() {
-        // Robustness pin: a map entry naming a sample the instrument
-        // does not have clamps to the last real sample instead of
-        // dropping the note or indexing out of bounds.
+    fn sample_map_out_of_range_entry_plays_sample_zero() {
+        // A map entry naming a sample the instrument does not have
+        // plays sample 0 (oracle-pinned) instead of dropping the note
+        // or indexing out of bounds.
         let mut st = make_multi_row_xm_state(vec![(49, 0x00, 0x00), (0, 0x00, 0x00)]);
         push_second_sample(&mut st);
         st.instruments[0].sample_map[48] = 200; // nonsense entry
         st.advance_tick(); // row 0 tick 0
         assert_eq!(
-            st.channels[0].sample_in_instr, 1,
-            "out-of-range map entry clamps to the last sample"
+            st.channels[0].sample_in_instr, 0,
+            "out-of-range map entry plays sample 0"
         );
         assert!(st.channels[0].voice.active, "the note still plays");
+    }
+
+    #[test]
+    fn tone_porta_target_keeps_the_playing_sample() {
+        // Row 0: note 40 on sample 0. Row 1: 3FF toward note 60, whose
+        // keymap entry names sample 1 (+12 relative note): the voice
+        // stays on sample 0 and the target is note 60 at sample 0's
+        // tuning, not 60 + 12.
+        let mut st = make_multi_row_xm_state(vec![(40, 0x00, 0x00), (60, 0x03, 0xFF)]);
+        st.patterns[0].rows[1][0].instrument = 0;
+        push_second_sample(&mut st);
+        for i in 48..96 {
+            st.instruments[0].sample_map[i] = 1;
+        }
+        walk_row(&mut st);
+        st.advance_tick(); // row 1 tick 0
+        assert_eq!(st.channels[0].sample_in_instr, 0);
+        assert_eq!(st.channels[0].relative_note, 0);
+        let want = note_to_period(XmPitchTable::Linear, 59, 0);
+        assert!((st.channels[0].porta_target - want).abs() < 0.01);
     }
 }

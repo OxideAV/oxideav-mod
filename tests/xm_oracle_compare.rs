@@ -1102,6 +1102,38 @@ fn case_note_delay() -> Case {
     one_pattern("note_delay", w, p)
 }
 
+/// Multi-sample keymap: sample 0 vs sample 1 routing, an out-of-range
+/// map entry, an instrument-only column, and a tone-portamento note
+/// whose keymap entry names the other sample.
+fn case_keymap() -> Case {
+    let mut w = base_writer();
+    let low = base_sample();
+    let mut high = base_sample();
+    high.relative_note = 12;
+    high.volume = 32;
+    high.panning = 0;
+    let mut ins = XmWriterInstrument {
+        name: "split".into(),
+        samples: vec![low, high],
+        ..XmWriterInstrument::default()
+    };
+    for n in 0..96 {
+        ins.sample_map[n] = if n >= 55 { 1 } else { 0 };
+    }
+    ins.sample_map[(C5 + 5 - 1) as usize] = 7; // out of range
+    w.instruments = vec![ins];
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(2, 0, G4, 1);
+    p.note(4, 0, C4, 1);
+    p.note(6, 0, C5, 1);
+    p.note(8, 0, C5 + 5, 1);
+    p.put(10, 0, cell_note(0, 1));
+    p.note(12, 0, C4, 1);
+    p.put(13, 0, with_effect(cell_note(C5, 0), FX_TONE_PORTA, 0xFF));
+    one_pattern("keymap", w, p)
+}
+
 /// Global volume, global volume slide with memory, and `Hxx` from a
 /// second channel.
 fn case_global_volume() -> Case {
@@ -1482,6 +1514,12 @@ fn oracle_vol_column_slides() {
 fn oracle_note_delay() {
     oracle_run!(r, case_note_delay());
     r.tick_trace().tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_keymap() {
+    oracle_run!(r, case_keymap());
+    r.pitch(6.0).rms(0.12).balance(0.08).finish();
 }
 
 #[test]
