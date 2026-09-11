@@ -800,6 +800,49 @@ fn case_env_loop_before_sustain() -> Case {
     one_pattern("env_loop_before_sustain", w, p)
 }
 
+/// Autovibrato shapes: the three documented type values (0, 1, 2)
+/// plus a retrigger of the sine instrument. Values ≥ 3 are outside
+/// the FT2 manual's set and are not gated.
+fn case_autovib_shapes() -> Case {
+    let mut w = base_writer();
+    let mut shapes = Vec::new();
+    for ty in [0u8, 1, 2] {
+        let mut ins = base_instrument();
+        ins.vibrato_type = ty;
+        ins.vibrato_sweep = 0;
+        ins.vibrato_depth = 12;
+        ins.vibrato_rate = 16;
+        shapes.push(ins);
+    }
+    w.instruments = shapes;
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(4, 0, C4, 2);
+    p.note(8, 0, C4, 3);
+    p.note(12, 0, C4, 1);
+    p.note(14, 0, C4, 1);
+    one_pattern("autovib_shapes", w, p)
+}
+
+/// Autovibrato depth / rate scale (no sweep).
+fn case_autovib_depth() -> Case {
+    let mut w = base_writer();
+    let mut set = Vec::new();
+    for (depth, rate) in [(4u8, 8u8), (15, 8), (8, 32), (15, 2)] {
+        let mut ins = base_instrument();
+        ins.vibrato_depth = depth;
+        ins.vibrato_rate = rate;
+        set.push(ins);
+    }
+    w.instruments = set;
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(4, 0, C4, 2);
+    p.note(8, 0, C4, 3);
+    p.note(12, 0, C4, 4);
+    one_pattern("autovib_depth", w, p)
+}
+
 /// Global volume, global volume slide with memory, and `Hxx` from a
 /// second channel.
 fn case_global_volume() -> Case {
@@ -1004,6 +1047,18 @@ fn oracle_slides_amiga() {
 fn oracle_env_loop_before_sustain() {
     oracle_run!(r, case_env_loop_before_sustain());
     r.pitch(6.0).tick_rms(0.12).finish();
+}
+
+#[test]
+fn oracle_autovib_shapes() {
+    oracle_run!(r, case_autovib_shapes());
+    r.tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_autovib_depth() {
+    oracle_run!(r, case_autovib_depth());
+    r.tick_pitch(15.0).finish();
 }
 
 #[test]

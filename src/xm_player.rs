@@ -1303,41 +1303,41 @@ impl XmPlayerState {
                 }
             }
 
-            // Instrument autovibrato: LFO on period, sweep-ramped.
+            // Instrument autovibrato: LFO on period, sweep-ramped, run
+            // once per tick (including tick 0) per
+            // `FastTracker-2-v2.04-xm.txt` §"Volumes and envelopes".
             //
-            // `inst_vib_type` low two bits select the waveform shape per
-            // FT2's manual §3.15.4 (the same numbering the channel-level
-            // E4x effect uses, applied to the instrument-header byte):
-            // `0 = Sine`, `1 = Ramp down`, `2 = Square`. Bit 2 ("+4 to
-            // the type") is the don't-retrigger-on-new-instrument flag;
-            // it gates the `auto_vib_pos` reset on note-trigger (handled
-            // at note-on, above). The same `waveform_lfo` helper used by
-            // E4x / E7x produces the per-cycle ±127 value, so depth /
-            // sweep math stays on the same scale.
-            //
-            // Sources for the type-byte numbering + sweep semantics:
-            //   - `docs/audio/trackers/xm/xm-instrument-autovibrato.md`
-            //     (in-tree clean-room note on the instrument-header
-            //     auto-vibrato fields, citing the FT2 manual + the
-            //     official XM format description).
-            //   - `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt`
-            //     §"Volumes and envelopes" — "the envelopes are
-            //     processed once per frame … this is also true for the
-            //     instrument vibrato and the fadeout".
+            // Everything numeric here is black-box pinned (round 458
+            // `autovib_shapes` / `autovib_depth` gates) because no
+            // staged text gives the instrument LFO's scale or its
+            // type-byte numbering:
+            //   - the 256-step position advances by `rate` BEFORE the
+            //     value is read, so the first tick already sits one
+            //     step into the cycle;
+            //   - the offset is `wave × depth` linear period units with
+            //     `wave` in -1..=1 — depth 255 swings a full ±255;
+            //   - the sine and square start NEGATIVE (pitch rises
+            //     first), unlike the channel `4xy` vibrato;
+            //   - type 1 is the SQUARE and type 2 the RAMP (rising
+            //     from 0, wrapping to -depth at the half cycle) — the
+            //     reverse of the `E4x` numbering the in-tree note
+            //     `docs/audio/trackers/xm/xm-instrument-autovibrato.md`
+            //     assumed carries over to the instrument byte;
+            //   - the sweep scales the depth by `ticks_since_trigger /
+            //     sweep` until it reaches 1.
+            // Bit 2 ("+4 to the type") is the don't-retrigger flag; it
+            // gates the `auto_vib_pos` reset on note-trigger (handled at
+            // note-on, above).
             if inst_vib_depth > 0 && inst_vib_rate > 0 {
-                // Sweep: amplitude scales from 0 to 1 over `sweep` ticks.
                 let sweep_amp =
                     if inst_vib_sweep == 0 || ch.auto_vib_sweep_cnt >= inst_vib_sweep as u16 {
                         1.0
                     } else {
                         ch.auto_vib_sweep_cnt as f32 / inst_vib_sweep as f32
                     };
-                let lfo = waveform_lfo(inst_vib_type & 0x03, ch.auto_vib_pos >> 2) as f32;
-                // Autovibrato depth is 0..=15 per FT2; convert to period
-                // units on the same scale as 4xy.
-                let offset = lfo * inst_vib_depth as f32 * sweep_amp / 64.0;
-                period += offset;
                 ch.auto_vib_pos = ch.auto_vib_pos.wrapping_add(inst_vib_rate);
+                let wave = autovib_wave(inst_vib_type & 0x03, ch.auto_vib_pos);
+                period += wave * inst_vib_depth as f32 * sweep_amp;
                 ch.auto_vib_sweep_cnt = ch.auto_vib_sweep_cnt.saturating_add(1);
             }
 
@@ -1747,6 +1747,30 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume, table: XmPitchTable
             ch.base_panning = ch.base_panning.saturating_add(p);
         }
         _ => {}
+    }
+}
+
+/// Instrument autovibrato wave at 256-step position `pos`, in
+/// -1..=1: 0 sine (negative first), 1 square (negative first), 2 ramp
+/// (0 → +1 over the first half, then -1 → 0), 3 (undefined) → sine.
+/// See the autovibrato block in `advance_tick` for the provenance.
+fn autovib_wave(shape: u8, pos: u8) -> f32 {
+    match shape & 0x03 {
+        1 => {
+            if pos < 128 {
+                -1.0
+            } else {
+                1.0
+            }
+        }
+        2 => {
+            if pos < 128 {
+                pos as f32 / 128.0
+            } else {
+                (pos as f32 - 256.0) / 128.0
+            }
+        }
+        _ => -(SINE_TABLE[(pos >> 2) as usize] as f32) / 127.0,
     }
 }
 
@@ -2688,32 +2712,50 @@ pub mod tests {
     }
 
     #[test]
-    fn autovib_square_shape_offsets_period_by_constant_first_half() {
-        // vibrato_type = 2 (square). With a fresh trigger + sweep=0
-        // (full depth immediately), the first cycle's positive half
-        // should push `voice.freq` to a higher pitch than the
-        // un-modulated C-4 (lower period = higher freq).
-        let mut st = make_minimal_xm_state(0x02, 15, 8, 0);
-        // Run tick 0 — the autovib block sees `auto_vib_pos = 0` (reset
-        // by trigger) before stepping; the LFO read uses pos 0
-        // (square = +127 for pos<32).
+    fn autovib_square_is_type_one_and_starts_pitch_up() {
+        // vibrato_type = 1 is the square. With a fresh trigger and
+        // sweep = 0 the first tick reads the negative half (-depth on
+        // the period → higher pitch) — pinned by the black-box oracle.
+        let mut st = make_minimal_xm_state(0x01, 15, 8, 0);
         st.advance_tick();
         let freq_sq = st.channels[0].voice.freq;
-        assert!(freq_sq > 0.0, "voice freq should be set on a fresh trigger");
-
-        // Compare against vibrato_type=0 (sine) — sine at pos 0 is 0,
-        // so the offset is 0; square at pos 0 is +127, so the period
-        // is pushed positive → freq is *lower* than the un-modulated
-        // sine-at-zero baseline. We assert ordering rather than exact
-        // values so the test survives small constant-factor changes
-        // to the autovib depth scaling.
+        let mut st_none = make_minimal_xm_state(0x00, 0, 8, 0);
+        st_none.advance_tick();
+        let freq_plain = st_none.channels[0].voice.freq;
+        assert!(freq_sq > freq_plain, "square={freq_sq} plain={freq_plain}");
+        // Sine at the first step (pos 8 after one rate-8 advance) is also
+        // negative-first, and smaller than the square's full swing.
         let mut st_sine = make_minimal_xm_state(0x00, 15, 8, 0);
         st_sine.advance_tick();
         let freq_sine = st_sine.channels[0].voice.freq;
+        assert!(freq_sine > freq_plain && freq_sine < freq_sq);
+    }
+
+    #[test]
+    fn autovib_wave_shapes() {
+        assert_eq!(autovib_wave(1, 0), -1.0);
+        assert_eq!(autovib_wave(1, 128), 1.0);
+        assert_eq!(autovib_wave(2, 0), 0.0);
+        assert!((autovib_wave(2, 64) - 0.5).abs() < 1e-6);
+        assert_eq!(autovib_wave(2, 128), -1.0);
+        assert!((autovib_wave(2, 192) + 0.5).abs() < 1e-6);
+        assert_eq!(autovib_wave(0, 64), -1.0);
+        assert_eq!(autovib_wave(0, 192), 1.0);
+        assert_eq!(autovib_wave(3, 64), autovib_wave(0, 64));
+    }
+
+    #[test]
+    fn autovib_depth_is_the_period_swing() {
+        // depth 255, rate 64: the second tick reads pos 128 (sine 0),
+        // the first pos 64 (sine -1) → period lowered by exactly 255.
+        let mut st = make_minimal_xm_state(0x00, 255, 64, 0);
+        st.advance_tick();
+        let f_first = st.channels[0].voice.freq;
+        let base = period_to_freq(XmPitchTable::Linear, st.channels[0].period);
+        let expect = period_to_freq(XmPitchTable::Linear, st.channels[0].period - 255.0);
         assert!(
-            freq_sq < freq_sine,
-            "square at pos 0 (+127) must lower freq vs sine at pos 0 (0): \
-             square={freq_sq}, sine={freq_sine}"
+            (f_first - expect).abs() < 0.5,
+            "{f_first} vs {expect} (base {base})"
         );
     }
 
