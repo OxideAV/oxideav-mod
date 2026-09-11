@@ -131,21 +131,17 @@ impl MixerVoice {
         let loop_start = source.loop_start().min(len.saturating_sub(1));
         let loop_end = source.loop_end().min(len);
         let kind = source.loop_kind();
+        if matches!(kind, LoopKind::PingPong) && loop_end > loop_start {
+            return self.render_ping_pong(source, len, loop_start, loop_end, out_rate);
+        }
 
         // Resolve position into a valid integer index. For ping-pong we
         // may already have flipped direction last step; keep the pos
         // inside [loop_start, loop_end) while looping, or stop on end.
         let pos = self.pos;
         if pos < 0.0 {
-            // Ping-pong may dip below loop_start briefly — bounce.
-            if matches!(kind, LoopKind::PingPong) {
-                let over = -pos;
-                self.pos = loop_start as f32 + over;
-                self.direction = 1;
-            } else {
-                self.active = false;
-                return 0.0;
-            }
+            self.active = false;
+            return 0.0;
         }
 
         // A forward loop wraps at `loop_end`, NOT at the buffer end:
@@ -167,11 +163,6 @@ impl MixerVoice {
                     let span = (loop_end - loop_start) as f32;
                     let over = self.pos - loop_start as f32;
                     self.pos = loop_start as f32 + over.rem_euclid(span);
-                }
-                LoopKind::PingPong if loop_end > loop_start => {
-                    let over = self.pos - (loop_end as f32 - 1.0);
-                    self.pos = (loop_end as f32 - 1.0 - over).max(loop_start as f32);
-                    self.direction = -1;
                 }
                 _ => {
                     self.active = false;
@@ -202,24 +193,70 @@ impl MixerVoice {
         let s1 = source.at(s1_idx);
         let interp = s0 + (s1 - s0) * frac;
 
-        // Advance. Step is signed for ping-pong.
-        let step = self.freq / out_rate;
-        let signed_step = step * self.direction as f32;
-        self.pos += signed_step;
+        // Advance (forward-only paths reach here).
+        self.pos += self.freq / out_rate;
 
-        // Ping-pong end-of-loop bounce (forward → reverse).
-        if matches!(kind, LoopKind::PingPong) {
-            if self.direction == 1 && self.pos >= loop_end as f32 && loop_end > loop_start {
-                let over = self.pos - (loop_end as f32 - 1.0);
-                self.pos = (loop_end as f32 - 1.0 - over).max(loop_start as f32);
-                self.direction = -1;
-            } else if self.direction == -1 && self.pos < loop_start as f32 {
-                let over = loop_start as f32 - self.pos;
-                self.pos = loop_start as f32 + over;
-                self.direction = 1;
-            }
+        interp * self.volume
+    }
+
+    /// Ping-pong (bidirectional) loop renderer.
+    ///
+    /// The loop is played as a virtual forward waveform of `2 × span`
+    /// frames: the loop body, then the loop body mirrored — frame
+    /// `loop_end - 1` is read twice at the turn and `loop_start` twice
+    /// at the return. That makes a `span`-frame ping-pong loop repeat
+    /// every `2 × span` frames, which is what the black-box oracle
+    /// plays (round 458 `loops` gate: a 32-frame ping-pong loop sounds
+    /// exactly one octave below a 32-frame forward loop; reflecting
+    /// around `loop_end - 1` instead lost two frames per cycle and
+    /// played 3% sharp).
+    ///
+    /// `pos` keeps its absolute meaning: below `loop_end` it is the
+    /// forward read position (including the one-shot run-in before
+    /// `loop_start`), and `loop_end .. loop_end + span` is the mirrored
+    /// half. `direction` is derived from the half (1 forward, -1
+    /// mirrored) so callers that inspect it keep working.
+    fn render_ping_pong<S: SampleSource + ?Sized>(
+        &mut self,
+        source: &S,
+        len: usize,
+        loop_start: usize,
+        loop_end: usize,
+        out_rate: f32,
+    ) -> f32 {
+        let span = loop_end - loop_start;
+        let cycle = 2.0 * span as f32;
+        if self.pos < 0.0 {
+            self.pos = 0.0;
         }
-
+        if self.pos >= loop_start as f32 + cycle {
+            let over = self.pos - loop_start as f32;
+            self.pos = loop_start as f32 + over.rem_euclid(cycle);
+        }
+        let k = self.pos - loop_start as f32;
+        let (i, partner, frac) = if k < span as f32 {
+            // Forward half (or the run-in before the loop).
+            let i = (self.pos as usize).min(len - 1);
+            let frac = self.pos - i as f32;
+            let partner = if i + 1 < loop_end {
+                i + 1
+            } else {
+                loop_end - 1
+            };
+            (i, partner, frac)
+        } else {
+            // Mirrored half: descending through the loop body.
+            let kf = k.floor();
+            let frac = k - kf;
+            let j = loop_start + (2 * span - 1 - kf as usize).min(span - 1);
+            let partner = if j > loop_start { j - 1 } else { loop_start };
+            (j, partner, frac)
+        };
+        self.direction = if k < span as f32 { 1 } else { -1 };
+        let s0 = source.at(i);
+        let s1 = source.at(partner);
+        let interp = s0 + (s1 - s0) * frac;
+        self.pos += self.freq / out_rate;
         interp * self.volume
     }
 }
@@ -646,6 +683,29 @@ mod tests {
         }
         assert!(v.active, "ping-pong voice must stay active");
         assert!(saw_reverse, "ping-pong voice must reverse at the loop end");
+    }
+
+    #[test]
+    fn ping_pong_loop_repeats_every_two_spans() {
+        // 8-frame loop at one frame per render: the read sequence is
+        // 0..7, then 7..0, then 0..7 — a 16-frame period with the end
+        // frames doubled at each turn.
+        let src = TestSource {
+            pcm: (0..8).map(|i| i as f32 / 10.0).collect(),
+            loop_start: 0,
+            loop_end: 8,
+            kind: LoopKind::PingPong,
+        };
+        let mut v = MixerVoice::default();
+        v.trigger(44100.0, 1.0);
+        let got: Vec<i32> = (0..32)
+            .map(|_| (v.render_one(&src, 44100.0) * 10.0).round() as i32)
+            .collect();
+        let mut want: Vec<i32> = (0..8).collect();
+        want.extend((0..8).rev());
+        want.extend(0..8);
+        want.extend((0..8).rev());
+        assert_eq!(got, want);
     }
 
     #[test]

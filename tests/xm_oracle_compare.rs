@@ -1134,6 +1134,45 @@ fn case_keymap() -> Case {
     one_pattern("keymap", w, p)
 }
 
+/// 16-bit sample with a ping-pong loop, an 8-bit ping-pong loop, and a
+/// forward-loop bit with loop length 0.
+fn case_loops() -> Case {
+    let mut w = base_writer();
+    let mut pp16 = XmWriterSample {
+        sixteen_bit: true,
+        loop_mode: 2,
+        loop_start: 8,
+        loop_length: 32,
+        ..XmWriterSample::default()
+    };
+    pp16.pcm = (0..64)
+        .map(|i| if (i / 8) % 2 == 0 { 12000 } else { -12000 })
+        .collect();
+    let mut pp8 = base_sample();
+    pp8.loop_mode = 2;
+    pp8.loop_start = 16;
+    pp8.loop_length = 32;
+    // Forward-loop bit with loop length 0: a one-shot, long enough
+    // (4096 frames ≈ 1.4 rows) to read its pitch before it ends.
+    let mut zero_len = square_sample(4096, 16, 12000);
+    zero_len.loop_length = 0;
+    let mut short_body = base_sample();
+    short_body.pcm.extend(std::iter::repeat(0i16).take(64));
+    short_body.loop_length = 64; // tail past loop_end is discarded
+    w.instruments = vec![
+        single_sample_instrument(pp16),
+        single_sample_instrument(pp8),
+        single_sample_instrument(zero_len),
+        single_sample_instrument(short_body),
+    ];
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(4, 0, C4, 2);
+    p.note(8, 0, C4, 3);
+    p.note(12, 0, C4, 4);
+    one_pattern("loops", w, p)
+}
+
 /// Global volume, global volume slide with memory, and `Hxx` from a
 /// second channel.
 fn case_global_volume() -> Case {
@@ -1520,6 +1559,12 @@ fn oracle_note_delay() {
 fn oracle_keymap() {
     oracle_run!(r, case_keymap());
     r.pitch(6.0).rms(0.12).balance(0.08).finish();
+}
+
+#[test]
+fn oracle_loops() {
+    oracle_run!(r, case_loops());
+    r.pitch(6.0).tick_rms(0.12).finish();
 }
 
 #[test]
