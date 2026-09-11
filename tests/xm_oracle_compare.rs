@@ -699,6 +699,40 @@ fn case_scale(linear: bool) -> Case {
     )
 }
 
+/// Sample finetune + relative note + `E5x` set finetune under one
+/// frequency table.
+fn case_tuning(linear: bool) -> Case {
+    let mut w = base_writer();
+    w.linear = linear;
+    let mut fine = base_sample();
+    fine.finetune = 64; // +half a semitone
+    fine.relative_note = 7;
+    let mut ins = base_instrument();
+    ins.samples.push(fine);
+    for n in 0..96 {
+        ins.sample_map[n] = if n >= 60 { 1 } else { 0 };
+    }
+    w.instruments = vec![ins];
+    let mut p = XmWriterPattern::new(16);
+    p.note(0, 0, C4, 1);
+    p.note(2, 0, C5, 1); // fine sample: C-5 + 7 + 50 cents
+    p.note(4, 0, C5 + 5, 1);
+    p.put(6, 0, with_effect(cell_note(C4, 1), FX_E, 0x58)); // E58
+    p.put(8, 0, with_effect(cell_note(C4, 1), FX_E, 0x57)); // E57
+    p.put(10, 0, with_effect(cell_note(C5, 1), FX_E, 0x50)); // E50 on fine
+    p.put(12, 0, with_effect(cell_note(C4, 1), FX_E, 0x5F)); // E5F
+    p.note(14, 0, C4, 1);
+    one_pattern(
+        if linear {
+            "tuning_linear"
+        } else {
+            "tuning_amiga"
+        },
+        w,
+        p,
+    )
+}
+
 /// Portamento up / down + tone portamento + fine / extra-fine slides.
 fn case_slides(linear: bool) -> Case {
     let mut w = base_writer();
@@ -855,6 +889,18 @@ fn case_glissando() -> Case {
 fn oracle_scale_amiga() {
     oracle_run!(r, case_scale(false));
     r.pitch(6.0).rms(0.12).finish();
+}
+
+#[test]
+fn oracle_tuning_linear() {
+    oracle_run!(r, case_tuning(true));
+    r.pitch(6.0).finish();
+}
+
+#[test]
+fn oracle_tuning_amiga() {
+    oracle_run!(r, case_tuning(false));
+    r.pitch(6.0).finish();
 }
 
 #[test]

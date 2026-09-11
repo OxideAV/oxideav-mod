@@ -683,16 +683,16 @@ impl XmPlayerState {
                     }
                     ch.base_panning = sample.panning;
                     // E5x — Set finetune (override the sample default).
-                    // FT2 expresses x as a signed nibble: 0..=7 -> 0..7,
-                    // 8..=F -> -8..-1, scaled *16 to fill the i8 range.
+                    // The nibble is an unsigned offset from 8 on the
+                    // -128..+127 finetune scale: `E58` = 0, `E50` =
+                    // -128 (one semitone down), `E5F` = +112. The FT2
+                    // manual (§3.15.6) gives no numeric mapping and the
+                    // ProTracker signed-nibble reading (8..F = -8..-1)
+                    // is NOT what FT2 does: the black-box oracle plays
+                    // `E58` at the sample's untuned pitch and `E50` a
+                    // full semitone flat (round 458, `tuning_*` gates).
                     if cell.effect_type == 0x0E && (cell.effect_param >> 4) == 0x05 {
-                        let raw = cell.effect_param & 0x0F;
-                        let signed = if raw >= 8 {
-                            (raw as i32) - 16
-                        } else {
-                            raw as i32
-                        };
-                        ch.finetune = (signed * 16) as i8;
+                        ch.finetune = e5x_finetune(cell.effect_param & 0x0F);
                     }
                     let real_note = (cell.note as i32 - 1) + ch.relative_note as i32;
                     let period = note_to_period(table, real_note, ch.finetune as i32);
@@ -1721,6 +1721,11 @@ fn apply_tickn_effect(ch: &mut XmChannel, vol_col: XmVolume, table: XmPitchTable
     }
 }
 
+/// `E5x` finetune: `(x - 8) * 16` on the signed-byte scale.
+fn e5x_finetune(x: u8) -> i8 {
+    ((x as i32 - 8) * 16) as i8
+}
+
 /// Compute the initial XM "period" for a given real note + finetune
 /// under the active frequency table.
 ///
@@ -2071,6 +2076,14 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn e5x_nibble_is_an_unsigned_offset_from_eight() {
+        assert_eq!(e5x_finetune(0x8), 0);
+        assert_eq!(e5x_finetune(0x0), -128);
+        assert_eq!(e5x_finetune(0x7), -16);
+        assert_eq!(e5x_finetune(0xF), 112);
     }
 
     #[test]
