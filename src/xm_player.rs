@@ -1123,10 +1123,9 @@ impl XmPlayerState {
                 inst.volume_envelope.is_on() && !inst.volume_envelope.points.is_empty();
             // Snapshot the volume-column kind for this cell so we can
             // detect vol-col vibrato without re-borrowing self.
-            let vol_col_kind = self
-                .cell_at(self.row, ch_idx)
-                .map(|c| c.volume_kind())
-                .unwrap_or(XmVolume::Empty);
+            let row_cell = self.cell_at(self.row, ch_idx).unwrap_or_default();
+            let vol_col_kind = row_cell.volume_kind();
+            let row_has_note = row_cell.has_note();
             let table = self.pitch.table;
             let global_volume = self.global_volume;
             let speed = self.speed;
@@ -1196,7 +1195,14 @@ impl XmPlayerState {
                     ch.multi_retrig_y_mem
                 };
                 ch.multi_retrig_counter = ch.multi_retrig_counter.wrapping_add(1);
-                if ry > 0 && ch.multi_retrig_counter >= ry {
+                // The counter also advances on tick 0, but the row's
+                // own note-on stands in for a tick-0 retrig: a note row
+                // never fires on tick 0 (`R71` with a note halves from
+                // tick 1), while a continuing `R00` row fires on tick 0
+                // as soon as the counter reaches `y`. Black-box pinned
+                // (round 458 `retrig` gate).
+                let note_row_tick0 = cur_tick == 0 && row_has_note;
+                if ry > 0 && ch.multi_retrig_counter >= ry && !note_row_tick0 {
                     ch.voice.pos = 0.0;
                     ch.voice.direction = 1;
                     ch.voice.active = true;
@@ -2136,6 +2142,26 @@ pub mod tests {
         // i.e. ANCHOR - 47*64 = 4672.
         let c = snap_to_semitone(4608.0 + 33.0, XmPitchTable::Linear);
         assert!((c - 4672.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn rxy_note_row_never_fires_on_tick_zero() {
+        // R71 (every tick, ×1/2) with a note: 64 on tick 0, 32 on tick
+        // 1, 16 on tick 2. The following R00 row fires on its tick 0.
+        let mut st = make_multi_row_xm_state(vec![(49, 0x1B, 0x71), (0, 0x1B, 0x00)]);
+        st.speed = 3;
+        st.advance_tick();
+        assert_eq!(st.channels[0].volume, 64);
+        st.tick = 1;
+        st.advance_tick();
+        assert_eq!(st.channels[0].volume, 32);
+        st.tick = 2;
+        st.advance_tick();
+        assert_eq!(st.channels[0].volume, 16);
+        st.tick = 0;
+        st.next_row();
+        st.advance_tick();
+        assert_eq!(st.channels[0].volume, 8, "continuing row fires on tick 0");
     }
 
     #[test]

@@ -199,6 +199,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- XM `Rxy` multi retrig: a row that carries a note never fires on its tick 0 (the note-on is the trigger; `R71` with a note halves from tick 1), while a continuing `R00` row fires on tick 0 as soon as the counter reaches `y`. Oracle-pinned (`retrig` gate: `E9x`, `Rxy` memory, note cut).
 - XM arpeggio order: FT2 counts the arpeggio down from the row end — tick 0 is the base note and tick t selects by `(speed - t) % 3` (1 → +x, 2 → +y, 0 → base), so speed 6 plays base, +y, +x, base, +y, +x and speed 4 plays base, base, +y, +x. Oracle-pinned across speeds 3..=9 (`arpeggio` gate).
 - XM tremor: the counter is evaluated-then-advanced on ticks > 0 only (tick 0 keeps the previous gate), and the gate is a latch — an effect that ends inside its "off" phase leaves the channel silent until the next note trigger (`Cxx` and the volume column do not re-open it). Oracle-pinned (`tremor` gate).
 - XM fadeout: the header's "Volume fadeout" word is subtracted twice per tick from the 65536 register (fadeout 1024 = 32 ticks to silence), starting on the key-off tick. Oracle-pinned (`fadeout`, `keyoff` gates: note 97 and `Kxx` on envelope-less, envelope-off and envelope+fadeout instruments).

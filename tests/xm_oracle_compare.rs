@@ -73,6 +73,7 @@ const FX_GLOBAL_SLIDE: u8 = 0x11;
 const FX_KEY_OFF: u8 = 0x14;
 const FX_ENV_POS: u8 = 0x15;
 const FX_PAN_SLIDE: u8 = 0x19;
+const FX_MULTI_RETRIG: u8 = 0x1B;
 const FX_TREMOR: u8 = 0x1D;
 const FX_X: u8 = 0x21;
 
@@ -1117,6 +1118,23 @@ fn case_arpeggio() -> Case {
     one_pattern("arpeggio", w, p)
 }
 
+/// Retrig (`E9x`), multi retrig (`Rxy`) and note cut.
+fn case_retrig() -> Case {
+    let w = base_writer();
+    let mut p = XmWriterPattern::new(16);
+    p.put(0, 0, with_effect(cell_note(C4, 1), FX_E, 0x92));
+    p.effect(1, 0, FX_E, 0x93);
+    p.put(3, 0, with_effect(cell_note(C4, 1), FX_MULTI_RETRIG, 0x32));
+    p.effect(4, 0, FX_MULTI_RETRIG, 0x00);
+    p.effect(5, 0, FX_MULTI_RETRIG, 0x03);
+    p.put(7, 0, with_effect(cell_note(C4, 1), FX_E, 0xC3));
+    p.put(9, 0, with_effect(cell_note(C4, 1), FX_E, 0xC0));
+    p.put(10, 0, with_effect(cell_note(C4, 1), FX_MULTI_RETRIG, 0xE1));
+    p.put(12, 0, with_effect(cell_note(C4, 1), FX_MULTI_RETRIG, 0x71));
+    p.effect(13, 0, FX_MULTI_RETRIG, 0x00);
+    one_pattern("retrig", w, p)
+}
+
 /// `Lxx` set envelope position.
 fn case_envpos() -> Case {
     let mut w = base_writer();
@@ -1321,6 +1339,12 @@ fn oracle_tremor() {
 fn oracle_arpeggio() {
     oracle_run!(r, case_arpeggio());
     r.tick_pitch(15.0).finish();
+}
+
+#[test]
+fn oracle_retrig() {
+    oracle_run!(r, case_retrig());
+    r.tick_rms(0.15).tick_pitch(15.0).finish();
 }
 
 #[test]
