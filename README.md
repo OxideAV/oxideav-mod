@@ -466,31 +466,29 @@ every FT2 standard effect listed in
 plus the eleven volume-column kinds. The "captured but not honoured"
 items are all closed:
 
-- **E4x / E7x vibrato + tremolo waveform shapes** — the LFO shape set by
-  E4x (vibrato) / E7x (tremolo) is now honoured, not just the bit-2
-  retrigger flag. `waveform_lfo` returns the per-cycle value on the same
-  ±127 scale as the sine table: shape 0 sine, 1 downward saw, 2 square
-  ("starting from +y"), 3 random (deterministic sine fallback — no PRNG
-  is documented). Replaces the prior hardcoded-sine LFO for both effects.
-  Cited in `docs/audio/trackers/mod/multimedia-cx-protracker.html` §4xy
-  (the 64-step full-cycle shape catalogue) +
-  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` E4/E7 +
-  `docs/audio/trackers/mod/Protracker-2.3A-misc-info.txt` lines 387/390
-  (the "0 sine / 1 ramp-down / 2 square / 3 random" numbering, shared by
-  the FT2 E4x/E7x effects).
+- **E4x / E7x vibrato + tremolo waveform shapes** — the LFO shape set
+  by E4x (vibrato) / E7x (tremolo) is honoured through the FT2-specific
+  `ft2_lfo` helper (the shared ProTracker helper stays for STM): shape
+  0 sine, 1 ramp (starts at 0, rises to +124 at the half cycle, wraps to
+  -128 — a period ramp *up*, the manual's "ramp down" in pitch),
+  2 square (+127 first), 3 undefined → sine. The 64-step position
+  advances by `speed` on ticks > 0 (a cycle is `64 / speed` effect
+  ticks; tick 0 evaluates without advancing), vibrato offsets the
+  period by `lfo × depth / 16` (±119 units at depth 15, pitch dips
+  first) and tremolo the volume by `lfo × depth / 32`. All black-box
+  pinned (round 458 `vibrato` / `vibrato_depth` / `tremolo` gates).
 - **E3x glissando control** — when on, tone-porta (3xy / 5xy / vol-col
   Mx) snaps the period to the nearest semitone after each tick's linear
   slide step. Works in both Linear and Amiga pitch tables; the Amiga
   snap walks `XmPitch::PERIOD_TAB_PUB` across the 10-octave span and
   picks the nearest table entry by absolute period error. Cited in
   `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 222.
-- **Lxy set envelope position** — moves the volume-envelope tick cursor
-  to `param`. The segment index is reset to 0 so the next
-  `tick_envelope` call re-aligns from the start of the segment chain
-  (which is monotonic without the loop bit, so re-alignment is exact).
-  Pan envelope is left untouched, matching the FT2 reading. Cited in
-  `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 226 and
-  `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.20.
+- **Lxy set envelope position** — moves the volume-envelope position
+  to `param` and reads it on that very tick (the same in-place read a
+  fresh trigger gets at position 0); the pan envelope is left untouched.
+  Cited in `docs/audio/trackers/xm/FastTracker-2-v2.04-xm.txt` line 226
+  and `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.20;
+  tick order black-box pinned (round 458 `envpos` gate).
 - **Rxy multi-retrig per-nibble memory** — the two nibbles of `Rxy`
   carry **independent** memories per
   `docs/audio/trackers/xm/multimedia-cx-fasttracker-2.html` §2.1.22:
@@ -570,19 +568,55 @@ items are all closed:
   subsequent sample header and PCM body (value > 40). A regression
   test drives both broken shapes end-to-end through PCM extraction.
 
-The instrument-level autovibrato (`vibrato_type` byte) now honours the
-type byte's waveform shape and the +4 "don't retrigger" flag, sharing
-the same `waveform_lfo` helper as the E4x / E7x effects: `0 = Sine`,
-`1 = Ramp down`, `2 = Square` (value 3 is undefined in FT2 and falls
-back to the deterministic sine, per `xm-instrument-autovibrato.md`'s
-"FT2 documents only three waveforms" finding). With bit 2 set, the LFO
-phase persists across note triggers; the sweep-in counter still
-restarts on every trigger because the sweep is a separate ramp-in
-envelope rather than a phase register. Numeric mapping + the +4 flag
-sourced from the in-tree clean-room note
+The instrument-level autovibrato (`vibrato_type` byte) is black-box
+pinned end to end (round 458 `autovib_shapes` / `autovib_depth` gates),
+because no staged text gives the instrument LFO's scale or its
+type-byte numbering: the 256-step position advances by `rate` *before*
+each read (every tick, including tick 0), the offset is `wave × depth`
+linear period units (depth 255 swings a full ±255), the sine and the
+square start *negative* (pitch rises first, unlike the channel `4xy`
+vibrato), and the type byte maps **1 → square, 2 → ramp** (rising from
+0, wrapping to -depth at the half cycle) — the reverse of the `E4x`
+numbering the in-tree note
 [`docs/audio/trackers/xm/xm-instrument-autovibrato.md`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/xm/xm-instrument-autovibrato.md)
-(which cites `FastTracker-2.08-manual.doc` §3.15.4 / §4.2.1 / §4.2.6
-and the `FastTracker-2-v2.04-xm.txt` field table at +235..+238).
+assumed carries over to the instrument byte. The sweep scales the depth
+linearly over `sweep` ticks (`FastTracker-2.08-manual.doc` §4.2.6).
+Type values ≥ 3 are outside the manual's set and stay unpinned; bit 2
+is still honoured as the don't-retrigger flag.
+
+### Black-box oracle gates (round 458)
+
+`tests/xm_oracle_compare.rs` renders 38 synthetic fixtures (built with
+the hidden `xm_writer`) through this engine and through an installed
+command-line player — `openmpt123 --render` or `xmp -o`, invoked as
+opaque binaries whose PCM alone is read — and compares per-row and
+per-tick dominant pitch, per-tick level (accepting the oracle's
+volume-ramp models), stereo balance and row / tick flow traces. The
+tests print a clean SKIP when no oracle is on `PATH`. Everything the
+staged texts leave open was settled against the oracle and is pinned
+by a unit test as well:
+
+| Area | Oracle-pinned rule |
+| ---- | ------------------ |
+| Amiga frequency table | the printed 96-entry table starts at B (907), the row is addressed by `(RealNote + 1) × 8 + FineTune/16` (octave = / 96) with a `× 32` scale — C-4 = period 1712 = 8363 Hz |
+| `E5x` | finetune = `(x − 8) × 16` (`E58` = 0, `E50` = −128) |
+| vibrato / tremolo | see the E4x / E7x bullet above |
+| instrument autovibrato | see the paragraph above |
+| envelopes | position advances before each read except on the tick that set it (trigger → 0, `Lxx` → xx); the key-off tick still counts as held |
+| note delay | `EDx` defers the whole cell (instrument re-read, volume column, pitch, key-off) to tick x; x ≥ speed never fires |
+| fadeout | twice the header word per tick, from the key-off tick |
+| tremor | evaluated on ticks > 0 only; the gate latches past the effect's end until the next note (`Cxx` / volume column do not re-open it) |
+| arpeggio | tick 0 base, then `(speed − tick) % 3` → 1 = +x, 2 = +y |
+| `Rxy` | never fires on tick 0 of a note row; continuing rows do |
+| volume-column slides | no memory of their own (`+0` / `-0` no-op) but they seed the `Axy` memory |
+| order flow | `Bxx` / `Dxx` on any channel beat a same-row loop jump; `Dxx` past the pattern length → row 0; `F00` ignored |
+| pattern loops | each jump latches its start row as the next pattern's start row and a finished loop leaves it; an `E6x` after a loop ran out (no new `E60`) plays x − 1 passes and breaks to the next pattern's row 0 without consuming the latch |
+| keymap | out-of-range entries play sample 0; a tone-porta note keeps the playing sample |
+| ping-pong loops | `2 × span` mirrored waveform, end frames doubled at the turns (shared mixer, IT battery unchanged) |
+| `9xx` | at or past the sample end plays nothing, loops included |
+
+The absolute mix level is not gated: the v2.04 volume formula ends in
+an unspecified `Scale` factor.
 
 ### Shared-mixer loop boundary (STM + XM)
 
@@ -798,6 +832,10 @@ clean SKIP when no oracle binary is on `PATH`, so CI stays green.
 
 ## Reference-compare conformance gates
 
+(The XM black-box render battery lives above under *Black-box oracle
+gates (round 458)*; the IT one under *Impulse Tracker (.it) playback
+coverage*.)
+
 Two integration harnesses drive this crate's engines side-by-side with a
 runtime-loaded black-box reference render binary (dlopen'd via
 `libloading`; only its published C entry-points are called, and it is
@@ -837,8 +875,15 @@ aborting / OOMing.
 | `stm_decode` | `stm::parse_header` → `stm::parse_patterns` → `stm::extract_samples` → `stm_player::StmPlayerState::new` → 2048-frame `render` |
 | `xm_decode`  | `xm::parse_header` → `xm::parse_patterns` → `xm::parse_instruments` → `xm::extract_sample_bodies` → `xm_player::XmPlayerState::new` → 2048-frame `render` |
 | `it_decode`  | `it::parse_module` (header + message + instruments + samples + patterns) → `it_player::ItPlayerState::new` → 2048-frame `render` |
+| `xm_player_steered` | fuzz bytes read as a *recipe* for the hidden `xm_writer` (channels, tempo, instruments with arbitrary envelope / autovibrato / keymap bytes, samples with any loop bounds, cells with every effect byte) → always-valid module → 8192-frame `render`, so the player's state machines (loops / jumps, delays, envelopes, retrig, tremor, offsets) get the budget the raw parser target rejects |
+| `it_player_steered` | the same recipe idea through `it_writer`: NNA / DCT / DCA combinations, envelopes and sustain loops in any order, keymaps, every command letter and volume-column value → 8192-frame `render` |
 
-Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`.
+Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`;
+`.github/workflows/fuzz.yml` runs all six targets daily through the
+org-level reusable workflow (30-minute budget). Round 458: the two
+steered targets ran 3.4 M / 6.4 M executions in 420 s each and the raw
+`xm_decode` / `it_decode` targets 3.7 M / 4.5 M in 300 s each on the
+reworked engines, all clean.
 Each target has a minimal valid-header seed under
 `fuzz/corpus/<target>/minimal.{mod,stm,xm,it}` (IT also seeds an
 instrument-mode and an effect-heavy module) so libfuzzer's coverage
