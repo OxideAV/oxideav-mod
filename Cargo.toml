@@ -21,7 +21,10 @@ oxideav-core = "0.1"
 # is hosted at https://samples.oxideav.org/magicaltux/mod/halluc.mod and
 # cached on disk under `target/test-fixtures/` after the first fetch so
 # repeat runs are offline and fast.
-ureq = "3"
+# default-features = false drops ureq's gzip layer (flate2 /
+# miniz_oxide); the workspace uses compcol for compression and the
+# fixtures are fetched uncompressed. `rustls` keeps https working.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # `libloading` is used by `tests/tracker_reference_compare.rs` to
 # dlopen a trace reference impl at runtime as a black-box behaviour
 # oracle for per-row playback comparison. The crate gracefully skips
