@@ -60,19 +60,29 @@ differs.
 oxideav-mod = "0.0"
 ```
 
-```rust,ignore
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+```rust
+use oxideav_core::{CodecId, Frame, RuntimeContext};
 
-let mut containers = ContainerRegistry::new();
-let mut codecs = CodecRegistry::new();
-oxideav_mod::register_containers(&mut containers);
-oxideav_mod::register_codecs(&mut codecs);
+let mut ctx = RuntimeContext::new();
+oxideav_mod::register(&mut ctx); // MOD / STM / XM / IT demuxers + player codecs
 
-// Select mixed stereo output:
-//   CodecId::new(oxideav_mod::CODEC_ID_STR)          // "mod"
-// Or planar per-channel output:
-//   CodecId::new(oxideav_mod::CODEC_ID_PLANAR_STR)   // "mod_planar"
+let input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::fs::File::open("song.mod")?);
+let mut dmx = ctx.containers.open_demuxer("mod", input, &ctx.codecs)?;
+
+// The demuxer emits the whole module as one packet under the mixed
+// stereo codec id `oxideav_mod::CODEC_ID_STR` ("mod"). For planar
+// per-channel output, switch the id to `CODEC_ID_PLANAR_STR`
+// ("mod_planar") before building the decoder.
+let mut params = dmx.streams()[0].params.clone();
+params.codec_id = CodecId::new(oxideav_mod::CODEC_ID_STR);
+let mut dec = ctx.codecs.first_decoder(&params)?;
+
+dec.send_packet(&dmx.next_packet()?)?;
+while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+    // af.data[0] is interleaved S16 stereo at 44.1 kHz.
+    let _ = af;
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Status
