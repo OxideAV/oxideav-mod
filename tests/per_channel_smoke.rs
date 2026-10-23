@@ -7,7 +7,7 @@
 
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
-use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_PLANAR_STR};
+use oxideav_mod::{CODEC_ID_PLANAR_STR, container::OUTPUT_SAMPLE_RATE, register_codecs};
 
 const HEADER_FIXED_SIZE: usize = 1084;
 const PATTERN_BYTES: usize = 64 * 4 * 4;
@@ -82,7 +82,7 @@ fn planar_decoder_via_registry_emits_one_plane_per_channel() {
                 }
                 for (idx, plane) in a.data.iter().enumerate() {
                     assert_eq!(plane.len(), plane_bytes_expected);
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         let s = i16::from_le_bytes([chunk[0], chunk[1]]) as i64;
                         plane_energy[idx] += (s * s) as u64;
                     }

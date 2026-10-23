@@ -35,9 +35,9 @@ use std::process::Command;
 use oxideav_mod::xm::{extract_sample_bodies, parse_header, parse_instruments, parse_patterns};
 use oxideav_mod::xm_player::XmPlayerState;
 use oxideav_mod::xm_writer::{
-    cell_effect, cell_note, single_sample_instrument, square_sample, with_effect, with_volume,
-    XmWriter, XmWriterEnvelope, XmWriterInstrument, XmWriterPattern, XmWriterSample, XM_ENV_LOOP,
-    XM_ENV_ON, XM_ENV_SUSTAIN,
+    XM_ENV_LOOP, XM_ENV_ON, XM_ENV_SUSTAIN, XmWriter, XmWriterEnvelope, XmWriterInstrument,
+    XmWriterPattern, XmWriterSample, cell_effect, cell_note, single_sample_instrument,
+    square_sample, with_effect, with_volume,
 };
 
 const RATE: u32 = 44_100;
@@ -251,7 +251,11 @@ fn our_render_stereo(xm_bytes: &[u8], max_frames: usize) -> Vec<f32> {
 }
 
 fn mono(st: &[f32]) -> Vec<f32> {
-    st.chunks_exact(2).map(|f| (f[0] + f[1]) / 2.0).collect()
+    st.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|f| (f[0] + f[1]) / 2.0)
+        .collect()
 }
 
 fn rms(x: &[f32]) -> f32 {
@@ -314,11 +318,7 @@ fn rms_profile(x: &[f32], rows: usize) -> Vec<f32> {
         .map(|r| {
             let s = r * ROW_FRAMES;
             let e = (s + ROW_FRAMES).min(x.len());
-            if s >= e {
-                0.0
-            } else {
-                rms(&x[s..e])
-            }
+            if s >= e { 0.0 } else { rms(&x[s..e]) }
         })
         .collect();
     let peak = out.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
@@ -335,11 +335,7 @@ fn tick_rms_profile(x: &[f32], rows: usize) -> Vec<f32> {
         .map(|t| {
             let s = t * TICK_FRAMES;
             let e = (s + TICK_FRAMES).min(x.len());
-            if s >= e {
-                0.0
-            } else {
-                rms(&x[s..e])
-            }
+            if s >= e { 0.0 } else { rms(&x[s..e]) }
         })
         .collect();
     let peak = out.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
@@ -396,11 +392,7 @@ fn balance_profile(st: &[f32], rows: usize) -> Vec<f32> {
             let l: Vec<f32> = st[s..e].iter().step_by(2).copied().collect();
             let rr: Vec<f32> = st[s..e].iter().skip(1).step_by(2).copied().collect();
             let (lr, rr) = (rms(&l), rms(&rr));
-            if lr + rr < 1e-5 {
-                0.5
-            } else {
-                rr / (lr + rr)
-            }
+            if lr + rr < 1e-5 { 0.5 } else { rr / (lr + rr) }
         })
         .collect()
 }
@@ -687,7 +679,7 @@ fn skip(name: &str) {
 
 /// Resolve the oracle and render `case`; `run` is the checked [`Run`].
 macro_rules! oracle_run {
-    ($run:ident, $case:expr) => {
+    ($run:ident, $case:expr_2021) => {
         let case = $case;
         let Some(o) = oracle() else {
             return skip(case.name);
@@ -1158,7 +1150,7 @@ fn case_loops() -> Case {
     let mut zero_len = square_sample(4096, 16, 12000);
     zero_len.loop_length = 0;
     let mut short_body = base_sample();
-    short_body.pcm.extend(std::iter::repeat(0i16).take(64));
+    short_body.pcm.extend(std::iter::repeat_n(0i16, 64));
     short_body.loop_length = 64; // tail past loop_end is discarded
     w.instruments = vec![
         single_sample_instrument(pp16),

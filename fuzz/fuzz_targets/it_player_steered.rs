@@ -14,7 +14,7 @@
 //! panbrello, tempo slides, pattern delay) advances.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mod::it::{parse_module, ItCell};
+use oxideav_mod::it::{ItCell, parse_module};
 use oxideav_mod::it_player::ItPlayerState;
 use oxideav_mod::it_writer::{
     ItWriter, ItWriterEnvelope, ItWriterInstrument, ItWriterPattern, ItWriterSample,

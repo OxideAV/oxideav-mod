@@ -16,7 +16,9 @@
 //! (retrig, tremor, arpeggio, vibrato) advance.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mod::xm::{extract_sample_bodies, parse_header, parse_instruments, parse_patterns, XmCell};
+use oxideav_mod::xm::{
+    XmCell, extract_sample_bodies, parse_header, parse_instruments, parse_patterns,
+};
 use oxideav_mod::xm_player::XmPlayerState;
 use oxideav_mod::xm_writer::{
     XmWriter, XmWriterEnvelope, XmWriterInstrument, XmWriterPattern, XmWriterSample,
@@ -138,7 +140,9 @@ fuzz_target!(|data: &[u8]| {
         w.patterns.push(p);
     }
     let n_orders = 1 + (b.u8() % 6) as usize;
-    w.orders = (0..n_orders).map(|_| b.u8() % (n_patterns as u8 + 1)).collect();
+    w.orders = (0..n_orders)
+        .map(|_| b.u8() % (n_patterns as u8 + 1))
+        .collect();
     w.restart_position = b.u16() % (n_orders as u16 + 2);
 
     let bytes = w.build();

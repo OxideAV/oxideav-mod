@@ -6,7 +6,7 @@
 //! very first row at which the two engines disagree — either on song
 //! position or (when position agrees) on PCM content.
 //!
-//! The trace reference impl is loaded with `libloading` so this test
+//! The trace reference impl is loaded with `dlsym` so this test
 //! compiles + links without a system C dependency. If the reference
 //! dylib is not present on the host the test prints a clean SKIP
 //! message and returns success — useful for CI hosts that don't ship
@@ -30,12 +30,12 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
 
-use libloading::{Library, Symbol};
+use dlsym::Library;
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, TimeBase,
 };
-use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
+use oxideav_mod::{CODEC_ID_STR, container::OUTPUT_SAMPLE_RATE, register_codecs};
 
 // ---------- Published C-interface ABI mirror of the reference dylib ----------
 
@@ -144,47 +144,57 @@ impl ModPlugLib {
 
         let lib = candidates
             .iter()
-            .find_map(|p| unsafe { Library::new(p) }.ok())?;
+            .find_map(|p| unsafe { Library::open(p) }.ok())?;
 
         // Resolve every symbol once, then bind into the struct. If any
         // symbol is missing the test skips cleanly.
         unsafe {
-            let load: Symbol<FnModPlugLoad> = lib.get(b"ModPlug_Load\0").ok()?;
-            let unload: Symbol<FnModPlugUnload> = lib.get(b"ModPlug_Unload\0").ok()?;
-            let read: Symbol<FnModPlugRead> = lib.get(b"ModPlug_Read\0").ok()?;
-            let get_order: Symbol<FnModPlugGetCurrentOrder> =
-                lib.get(b"ModPlug_GetCurrentOrder\0").ok()?;
-            let get_pattern: Symbol<FnModPlugGetCurrentPattern> =
-                lib.get(b"ModPlug_GetCurrentPattern\0").ok()?;
-            let get_row: Symbol<FnModPlugGetCurrentRow> =
-                lib.get(b"ModPlug_GetCurrentRow\0").ok()?;
-            let get_speed: Symbol<FnModPlugGetCurrentSpeed> =
-                lib.get(b"ModPlug_GetCurrentSpeed\0").ok()?;
-            let get_tempo: Symbol<FnModPlugGetCurrentTempo> =
-                lib.get(b"ModPlug_GetCurrentTempo\0").ok()?;
-            let get_settings: Symbol<FnModPlugGetSettings> =
-                lib.get(b"ModPlug_GetSettings\0").ok()?;
-            let set_settings: Symbol<FnModPlugSetSettings> =
-                lib.get(b"ModPlug_SetSettings\0").ok()?;
-            let get_master_volume: Symbol<FnModPlugGetMasterVolume> =
-                lib.get(b"ModPlug_GetMasterVolume\0").ok()?;
-            let set_master_volume: Symbol<FnModPlugSetMasterVolume> =
-                lib.get(b"ModPlug_SetMasterVolume\0").ok()?;
+            let load: FnModPlugLoad = lib.get::<FnModPlugLoad>(c"ModPlug_Load").ok()?.into_inner();
+            let unload: FnModPlugUnload = lib
+                .get::<FnModPlugUnload>(c"ModPlug_Unload")
+                .ok()?
+                .into_inner();
+            let read: FnModPlugRead = lib.get::<FnModPlugRead>(c"ModPlug_Read").ok()?.into_inner();
+            let get_order: FnModPlugGetCurrentOrder = lib
+                .get::<FnModPlugGetCurrentOrder>(c"ModPlug_GetCurrentOrder")
+                .ok()?
+                .into_inner();
+            let get_pattern: FnModPlugGetCurrentPattern = lib
+                .get::<FnModPlugGetCurrentPattern>(c"ModPlug_GetCurrentPattern")
+                .ok()?
+                .into_inner();
+            let get_row: FnModPlugGetCurrentRow = lib
+                .get::<FnModPlugGetCurrentRow>(c"ModPlug_GetCurrentRow")
+                .ok()?
+                .into_inner();
+            let get_speed: FnModPlugGetCurrentSpeed = lib
+                .get::<FnModPlugGetCurrentSpeed>(c"ModPlug_GetCurrentSpeed")
+                .ok()?
+                .into_inner();
+            let get_tempo: FnModPlugGetCurrentTempo = lib
+                .get::<FnModPlugGetCurrentTempo>(c"ModPlug_GetCurrentTempo")
+                .ok()?
+                .into_inner();
+            let get_settings: FnModPlugGetSettings = lib
+                .get::<FnModPlugGetSettings>(c"ModPlug_GetSettings")
+                .ok()?
+                .into_inner();
+            let set_settings: FnModPlugSetSettings = lib
+                .get::<FnModPlugSetSettings>(c"ModPlug_SetSettings")
+                .ok()?
+                .into_inner();
+            let get_master_volume: FnModPlugGetMasterVolume = lib
+                .get::<FnModPlugGetMasterVolume>(c"ModPlug_GetMasterVolume")
+                .ok()?
+                .into_inner();
+            let set_master_volume: FnModPlugSetMasterVolume = lib
+                .get::<FnModPlugSetMasterVolume>(c"ModPlug_SetMasterVolume")
+                .ok()?
+                .into_inner();
 
-            // Convert each Symbol into a raw fn pointer so we don't have
-            // to keep Symbols alive (Library is the lifetime root).
-            let load = *load;
-            let unload = *unload;
-            let read = *read;
-            let get_order = *get_order;
-            let get_pattern = *get_pattern;
-            let get_row = *get_row;
-            let get_speed = *get_speed;
-            let get_tempo = *get_tempo;
-            let get_settings = *get_settings;
-            let set_settings = *set_settings;
-            let get_master_volume = *get_master_volume;
-            let set_master_volume = *set_master_volume;
+            // Each symbol was detached into a raw fn pointer above
+            // (`into_inner`); `_lib` keeps the library alive as the
+            // lifetime root.
 
             Some(ModPlugLib {
                 _lib: lib,
@@ -250,11 +260,7 @@ fn cache_path(name: &str) -> Option<PathBuf> {
             crate_dir.join("..").join("..").join("target")
         });
     let path = target_dir.join("test-fixtures").join(name);
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 /// Minimal RIFF/WAVE writer for S16LE PCM.
@@ -303,7 +309,7 @@ fn decode_ours(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
                 if pcm.len() / 2 >= max_frames {
@@ -328,7 +334,7 @@ struct OurStepper {
 impl OurStepper {
     fn new(bytes: &[u8]) -> Self {
         use oxideav_mod::header::parse_header;
-        use oxideav_mod::player::{parse_patterns, PlayerState};
+        use oxideav_mod::player::{PlayerState, parse_patterns};
         use oxideav_mod::samples::extract_samples;
         let header = parse_header(bytes).expect("header");
         let samples = extract_samples(&header, bytes);
@@ -489,7 +495,9 @@ fn render_both_full(bytes: &[u8], mp: &ModPlugLib, total_frames: usize) -> (Vec<
     };
     let mp_n = (mp_n as usize).min(mp_buf.len());
     let mp_pcm: Vec<i16> = mp_buf[..mp_n]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     unsafe { (mp.unload)(mp_file) };
@@ -585,7 +593,7 @@ fn trace(
         }
         let mp_n_frames = (mp_n as usize) / 4; // 2 ch * 2 bytes
         let mut mp_chunk: Vec<i16> = Vec::with_capacity(mp_n_frames * 2);
-        for c in mp_buf_bytes[..(mp_n as usize)].chunks_exact(2) {
+        for c in mp_buf_bytes[..(mp_n as usize)].as_chunks::<2>().0 {
             mp_chunk.push(i16::from_le_bytes([c[0], c[1]]));
         }
 
@@ -746,8 +754,8 @@ fn run_one(name: &str) {
     }
 
     // Per-second lag scan over the L channel only.
-    let our_l: Vec<i16> = our_full.chunks_exact(2).map(|c| c[0]).collect();
-    let mp_l: Vec<i16> = mp_full.chunks_exact(2).map(|c| c[0]).collect();
+    let our_l: Vec<i16> = our_full.as_chunks::<2>().0.iter().map(|c| c[0]).collect();
+    let mp_l: Vec<i16> = mp_full.as_chunks::<2>().0.iter().map(|c| c[0]).collect();
     let total_secs = our_l.len() / OUTPUT_SAMPLE_RATE as usize;
     eprintln!("[ref_compare:{name}] per-second lag (L channel, ±200 samples search):");
     for sec in 0..total_secs.min(15) {
@@ -1039,7 +1047,7 @@ fn ref_calibration_single_channel_loud_voice() {
     // per-trigger ramp, and run with full hard pan = 1.0 to mirror
     // the reference's no-mixer-colouration setup. Build the player by hand.
     use oxideav_mod::header::parse_header;
-    use oxideav_mod::player::{parse_patterns, PlayerState};
+    use oxideav_mod::player::{PlayerState, parse_patterns};
     use oxideav_mod::samples::extract_samples;
     let header = parse_header(&bytes).expect("header");
     let samples = extract_samples(&header, &bytes);
@@ -1084,12 +1092,24 @@ fn ref_calibration_single_channel_loud_voice() {
             )
         };
         let mp_pcm2: Vec<i16> = mp_buf2[..(mp_n2 as usize)]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         unsafe { (lib.unload)(mp_file2) };
-        let l: Vec<i16> = mp_pcm2[2_000..].chunks_exact(2).map(|c| c[0]).collect();
-        let r: Vec<i16> = mp_pcm2[2_000..].chunks_exact(2).map(|c| c[1]).collect();
+        let l: Vec<i16> = mp_pcm2[2_000..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| c[0])
+            .collect();
+        let r: Vec<i16> = mp_pcm2[2_000..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| c[1])
+            .collect();
         eprintln!(
             "[ref_calibration] sep={sep:>3}  mp L peak={} rms={:.0} | R peak={} rms={:.0}",
             peak_abs_i16(&l),
@@ -1117,7 +1137,9 @@ fn ref_calibration_single_channel_loud_voice() {
         )
     };
     let mp_pcm: Vec<i16> = mp_buf[..(mp_n as usize)]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     unsafe { (lib.unload)(mp_file) };
@@ -1233,8 +1255,8 @@ fn ref_row_transition_alignment() {
 
     let mut ours = OurStepper::new(&bytes);
     let total_frames = OUTPUT_SAMPLE_RATE as usize * 12; // ~12 s — enough to span sec 10 transition
-                                                         // Render one frame at a time on each engine and watch for row
-                                                         // transitions.
+    // Render one frame at a time on each engine and watch for row
+    // transitions.
     let mut our_buf = [0i16; 64 * 2];
     let mut mp_buf = [0u8; 64 * 4];
     let mut prev_our = (-1i32, -1i32, -1i32); // (order, pat, row)
@@ -1330,7 +1352,7 @@ fn headroom_calibration_pin_no_reference_required() {
     }
 
     use oxideav_mod::header::parse_header;
-    use oxideav_mod::player::{parse_patterns, PlayerState};
+    use oxideav_mod::player::{PlayerState, parse_patterns};
     use oxideav_mod::samples::extract_samples;
     let header = parse_header(&bytes).expect("header");
     let samples = extract_samples(&header, &bytes);

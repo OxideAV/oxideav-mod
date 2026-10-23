@@ -640,11 +640,7 @@ fn decode_packed_cell(data: &[u8], cur: usize) -> (XmCell, usize) {
         let grab = |off: &mut usize, data: &[u8]| -> u8 {
             let p = cur + *off;
             *off += 1;
-            if p < data.len() {
-                data[p]
-            } else {
-                0
-            }
+            if p < data.len() { data[p] } else { 0 }
         };
         if mask & 0x01 != 0 {
             cell.note = grab(&mut off, data);
@@ -667,11 +663,7 @@ fn decode_packed_cell(data: &[u8], cur: usize) -> (XmCell, usize) {
         cell.note = first;
         let grab = |rel: usize| -> u8 {
             let p = cur + rel;
-            if p < data.len() {
-                data[p]
-            } else {
-                0
-            }
+            if p < data.len() { data[p] } else { 0 }
         };
         cell.instrument = grab(1);
         cell.volume = grab(2);
@@ -1102,7 +1094,7 @@ mod tests {
         out[74..76].copy_from_slice(&flags.to_le_bytes());
         out[76..78].copy_from_slice(&6u16.to_le_bytes()); // default tempo
         out[78..80].copy_from_slice(&125u16.to_le_bytes()); // default BPM
-                                                            // order[0] = 0, rest stays 0 or we write 255 like STM does
+        // order[0] = 0, rest stays 0 or we write 255 like STM does
         for i in 1..XM_ORDER_TABLE_SIZE {
             out[XM_ORDER_TABLE_OFFSET + i] = 0xFF;
         }
@@ -1326,9 +1318,9 @@ mod tests {
         block.push(0); // packing type
         block.extend_from_slice(&1u16.to_le_bytes()); // num_rows
         block.extend_from_slice(&1u16.to_le_bytes()); // packed_size
-                                                      // No packed body bytes — the slice should be empty after
-                                                      // clamping. `decode_packed_cell` against an empty slice
-                                                      // returns the default cell with consumed == 0.
+        // No packed body bytes — the slice should be empty after
+        // clamping. `decode_packed_cell` against an empty slice
+        // returns the default cell with consumed == 0.
         bytes.extend(block);
 
         let h = parse_header(&bytes).unwrap();
@@ -1473,7 +1465,7 @@ mod tests {
         bytes.extend_from_slice(&nbuf);
         bytes.push(0); // type
         bytes.extend_from_slice(&1u16.to_le_bytes()); // num_samples = 1
-                                                      // File ends exactly at cur+29.
+        // File ends exactly at cur+29.
         assert!(parse_instruments(&h, &bytes, inst_off).is_err());
     }
 

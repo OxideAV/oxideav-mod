@@ -36,7 +36,7 @@
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
-    container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_PLANAR_STR, CODEC_ID_STR,
+    CODEC_ID_PLANAR_STR, CODEC_ID_STR, container::OUTPUT_SAMPLE_RATE, register_codecs,
 };
 
 const HEADER_FIXED_SIZE: usize = 1084;
@@ -133,7 +133,7 @@ fn decode_mixed(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
                 if pcm.len() / 2 >= max_frames {
@@ -166,7 +166,7 @@ fn decode_planar(bytes: Vec<u8>, max_frames: usize) -> Vec<Vec<i16>> {
                     planes.resize(a.data.len(), Vec::new());
                 }
                 for (i, plane) in a.data.iter().enumerate() {
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         planes[i].push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }
@@ -529,7 +529,7 @@ fn malformed_song_length_terminates() {
     });
     // Force song_length large but cap order table at all-pattern-0.
     bytes[950] = 4; // 4 orders, each pointing to pattern 0 (already the default).
-                    // Cap at 2 s — any reasonable song should finish well under this.
+    // Cap at 2 s — any reasonable song should finish well under this.
     let pcm = decode_mixed(bytes, 5_000_000);
     assert!(!pcm.is_empty());
     // 4 × 64 × 6 × 882 × 2 ≈ 2.7M — must be at or under that.
@@ -570,7 +570,7 @@ fn pan_separation_default_keeps_both_ears_alive_on_right_only_intro() {
     use oxideav_core::CodecParameters;
     use oxideav_mod::container::OUTPUT_SAMPLE_RATE;
     use oxideav_mod::header::parse_header;
-    use oxideav_mod::player::{parse_patterns, PlayerState};
+    use oxideav_mod::player::{PlayerState, parse_patterns};
     use oxideav_mod::samples::extract_samples;
 
     // Intro that only sounds on channels 1 (right) and 2 (right) —
@@ -585,8 +585,12 @@ fn pan_separation_default_keeps_both_ears_alive_on_right_only_intro() {
     // ---- Default-pan render via the registered codec ----
     let _ = CodecParameters::audio; // silence "unused" if any
     let pcm_default = decode_mixed(bytes.clone(), 88_200); // 2 s
-    let (left, right): (Vec<i16>, Vec<i16>) =
-        pcm_default.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
+    let (left, right): (Vec<i16>, Vec<i16>) = pcm_default
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| (c[0], c[1]))
+        .unzip();
     let l_rms =
         (left.iter().map(|&s| (s as i64).pow(2)).sum::<i64>() as f64 / left.len() as f64).sqrt();
     let r_rms =
@@ -615,7 +619,8 @@ fn pan_separation_default_keeps_both_ears_alive_on_right_only_intro() {
     let mut hard = vec![0i16; 88_200 * 2];
     let n = player.render(&mut hard);
     hard.truncate(n * 2);
-    let (hl, hr): (Vec<i16>, Vec<i16>) = hard.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
+    let (hl, hr): (Vec<i16>, Vec<i16>) =
+        hard.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).unzip();
     let hl_rms =
         (hl.iter().map(|&s| (s as i64).pow(2)).sum::<i64>() as f64 / hl.len() as f64).sqrt();
     let hr_rms =

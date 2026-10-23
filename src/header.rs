@@ -718,7 +718,7 @@ mod tests {
         out[20 + 24] = 0x05;
         out[950] = 3; // pattern-list size
         out[951] = 2; // stored tracks
-                      // Position 0 plays track 1 on channels 0/2, track 0 on 1/3.
+        // Position 0 plays track 1 on channels 0/2, track 0 on 1/3.
         out[952..956].copy_from_slice(&[1, 0, 1, 0]);
         out[ST26_MAGIC_OFFSET..ST26_MAGIC_OFFSET + 4].copy_from_slice(magic);
         out

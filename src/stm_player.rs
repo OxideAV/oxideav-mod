@@ -57,7 +57,7 @@
 
 use crate::mixer::{MixerVoice, PitchModel, StmC3Pitch};
 use crate::stm::{
-    StmCell, StmHeader, StmNoteKind, StmPattern, StmSampleBody, PATTERN_ROWS, STM_CHANNELS,
+    PATTERN_ROWS, STM_CHANNELS, StmCell, StmHeader, StmNoteKind, StmPattern, StmSampleBody,
 };
 use crate::xm_player::waveform_lfo;
 
@@ -651,7 +651,7 @@ impl StmPlayerState {
             // accompanying envelope / sample-swap path).
             if ch.retrig_ticks > 0
                 && cur_tick > 0
-                && cur_tick % ch.retrig_ticks == 0
+                && cur_tick.is_multiple_of(ch.retrig_ticks)
                 && ch.voice.active
             {
                 ch.voice.pos = 0.0;
@@ -753,12 +753,13 @@ impl StmPlayerState {
             // If the channel is actively playing, recompute the voice
             // frequency from the (possibly-modulated) semitone position.
             let inst_idx = ch.instrument.saturating_sub(1) as usize;
-            if let Some(body) = self.samples.get(inst_idx) {
-                if ch.voice.active && ch.cur_semis > 0.0 {
-                    let new_freq = semis_to_freq(body.c3_hz as f32, semis);
-                    if new_freq > 0.0 {
-                        ch.voice.freq = new_freq;
-                    }
+            if let Some(body) = self.samples.get(inst_idx)
+                && ch.voice.active
+                && ch.cur_semis > 0.0
+            {
+                let new_freq = semis_to_freq(body.c3_hz as f32, semis);
+                if new_freq > 0.0 {
+                    ch.voice.freq = new_freq;
                 }
             }
 
@@ -871,7 +872,7 @@ impl StmPlayerState {
     /// Render interleaved stereo S16 PCM into `dst` (length must be
     /// even). STM uses hard-pan LRRL like MOD.
     pub fn render(&mut self, dst: &mut [i16]) -> usize {
-        assert!(dst.len() % 2 == 0);
+        assert!(dst.len().is_multiple_of(2));
         let mut produced = 0usize;
         let total_frames = dst.len() / 2;
         let out_rate = self.sample_rate as f32;
@@ -1147,7 +1148,7 @@ pub mod tests {
         // Pattern 0: row 0 / ch 0 = note C-4 (octave 4, semitone 0), instrument 1.
         let mut pattern = vec![0u8; BYTES_PER_PATTERN];
         pattern[0] = 0x40; // octave 4, semitone 0
-                           // vol_lo 0, instrument 1.
+        // vol_lo 0, instrument 1.
         pattern[1] = 1 << 3;
         pattern[2] = 0;
         pattern[3] = 0;

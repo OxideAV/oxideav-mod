@@ -26,12 +26,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_mod::it::{
-    parse_module, ItCell, IT_ENV_LOOP, IT_ENV_ON, IT_ENV_SUSTAIN_LOOP, IT_NOTE_OFF,
+    IT_ENV_LOOP, IT_ENV_ON, IT_ENV_SUSTAIN_LOOP, IT_NOTE_OFF, ItCell, parse_module,
 };
 use oxideav_mod::it_player::ItPlayerState;
 use oxideav_mod::it_writer::{
-    cell_effect, cell_note, square_sample, with_effect, with_volpan, ItWriter, ItWriterEnvelope,
-    ItWriterInstrument, ItWriterPattern, ItWriterSample,
+    ItWriter, ItWriterEnvelope, ItWriterInstrument, ItWriterPattern, ItWriterSample, cell_effect,
+    cell_note, square_sample, with_effect, with_volpan,
 };
 
 const RATE: u32 = 44_100;
@@ -73,7 +73,13 @@ fn oracle() -> Option<Oracle> {
 /// Render `it_bytes` through the oracle; returns mono f32 at 44.1 kHz.
 fn oracle_render(oracle: &Oracle, name: &str, it_bytes: &[u8]) -> Option<Vec<f32>> {
     let st = oracle_render_stereo(oracle, name, it_bytes)?;
-    Some(st.chunks_exact(2).map(|f| (f[0] + f[1]) / 2.0).collect())
+    Some(
+        st.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| (f[0] + f[1]) / 2.0)
+            .collect(),
+    )
 }
 
 /// Render through the oracle; returns interleaved stereo f32.
@@ -211,7 +217,9 @@ fn our_render(it_bytes: &[u8], max_frames: usize) -> (Vec<f32>, Vec<f32>) {
         stereo.extend_from_slice(&buf[..n * 2]);
     }
     let mono = stereo
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|f| (f[0] as f32 + f[1] as f32) / 65536.0)
         .collect();
     let stereo_f: Vec<f32> = stereo.iter().map(|&v| v as f32 / 32768.0).collect();
@@ -231,11 +239,7 @@ fn balance_profile(st: &[f32], rows: usize) -> Vec<f32> {
             let l: Vec<f32> = st[s..e].iter().step_by(2).copied().collect();
             let rr: Vec<f32> = st[s..e].iter().skip(1).step_by(2).copied().collect();
             let (lr, rr) = (rms(&l), rms(&rr));
-            if lr + rr < 1e-5 {
-                0.5
-            } else {
-                rr / (lr + rr)
-            }
+            if lr + rr < 1e-5 { 0.5 } else { rr / (lr + rr) }
         })
         .collect()
 }
@@ -325,11 +329,7 @@ fn rms_profile(x: &[f32], rows: usize) -> Vec<f32> {
         .map(|r| {
             let s = r * ROW_FRAMES;
             let e = (s + ROW_FRAMES).min(x.len());
-            if s >= e {
-                0.0
-            } else {
-                rms(&x[s..e])
-            }
+            if s >= e { 0.0 } else { rms(&x[s..e]) }
         })
         .collect();
     let peak = out.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
@@ -1729,11 +1729,7 @@ fn oracle_panbrello() {
                 let l: Vec<f32> = st[a..b].iter().step_by(2).copied().collect();
                 let r: Vec<f32> = st[a..b].iter().skip(1).step_by(2).copied().collect();
                 let (lr, rr) = (rms(&l), rms(&r));
-                if lr + rr < 1e-5 {
-                    0.5
-                } else {
-                    rr / (lr + rr)
-                }
+                if lr + rr < 1e-5 { 0.5 } else { rr / (lr + rr) }
             })
             .collect()
     };

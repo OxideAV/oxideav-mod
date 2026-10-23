@@ -50,7 +50,7 @@ use std::time::Instant;
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, TimeBase,
 };
-use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
+use oxideav_mod::{CODEC_ID_STR, container::OUTPUT_SAMPLE_RATE, register_codecs};
 
 const FIXTURE_URL: &str = "https://samples.oxideav.org/magicaltux/mod/Sadness.mod";
 
@@ -271,7 +271,7 @@ fn sadness_mod_url_regression() {
         let Frame::Audio(a) = dec.receive_frame().expect("decode 2s") else {
             unreachable!("MOD emits audio only");
         };
-        for chunk in a.data[0].chunks_exact(2) {
+        for chunk in a.data[0].as_chunks::<2>().0 {
             let s = i16::from_le_bytes([chunk[0], chunk[1]]);
             if s != 0 {
                 nonzero += 1;

@@ -26,9 +26,9 @@
 //! `ScreamTracker-v3.20-s3m.txt` §"What is C2SPD?").
 
 use crate::it::{
-    ItCell, ItDca, ItDct, ItEnvelope, ItFrozenView, ItInstrument, ItLoopView, ItModule, ItNna,
-    ItPattern, ItSample, ItVibratoWave, ItVolumeColumn, IT_FADEOUT_COUNT, IT_MAX_NOTE,
-    IT_ORDER_END, IT_ORDER_SKIP, IT_PAN_SURROUND, IT_VOLCOL_PORTA_SLIDE_TABLE,
+    IT_FADEOUT_COUNT, IT_MAX_NOTE, IT_ORDER_END, IT_ORDER_SKIP, IT_PAN_SURROUND,
+    IT_VOLCOL_PORTA_SLIDE_TABLE, ItCell, ItDca, ItDct, ItEnvelope, ItFrozenView, ItInstrument,
+    ItLoopView, ItModule, ItNna, ItPattern, ItSample, ItVibratoWave, ItVolumeColumn,
 };
 use crate::mixer::MixerVoice;
 
@@ -123,11 +123,7 @@ pub const IT_FINE_RAMP_DOWN: [i8; 256] = [
 
 /// `FineSquareWave` — "128 Dup (64), 128 Dup (0)".
 pub fn it_fine_square(pos: u8) -> i8 {
-    if pos < 128 {
-        64
-    } else {
-        0
-    }
+    if pos < 128 { 64 } else { 0 }
 }
 
 /// Waveform lookup shared by vibrato / tremolo / panbrello / sample
@@ -641,7 +637,7 @@ impl ItPlayerState {
         // "find the channel of lowest volume that is in the background"
         let mut best: Option<(usize, f32)> = None;
         for (i, v) in self.voices.iter().enumerate() {
-            if v.background && best.map_or(true, |(_, a)| v.amp < a) {
+            if v.background && best.is_none_or(|(_, a)| v.amp < a) {
                 best = Some((i, v.amp));
             }
         }
@@ -817,26 +813,26 @@ impl ItPlayerState {
         let mut pan = self.channels[ch].pan;
         let mut random_vol_x256 = 256u16;
         let ins = self.instrument_for(instrument).cloned();
-        if self.instrument_mode {
-            if let Some(ins) = &ins {
-                // "NotePan = ChannelPan; if InstrumentPan=On then NotePan
-                // = InstrumentPan; NotePan += (InstrumentNote -
-                // PPCenter) * PPSeparation / 8".
-                if let Some(p) = ins.pan() {
-                    pan = p;
-                }
-                if pan != IT_PAN_SURROUND {
-                    let pps = (note as i32 - ins.pitch_pan_center as i32)
-                        * ins.pitch_pan_separation as i32
-                        / 8;
-                    pan = (pan as i32 + pps).clamp(0, 64) as u8;
-                }
-                if ins.random_volume > 0 {
-                    // ±RV percent around unity.
-                    let r = (self.rand() % (2 * ins.random_volume as u32 + 1)) as i32
-                        - ins.random_volume as i32;
-                    random_vol_x256 = ((256 + 256 * r / 100).clamp(0, 512)) as u16;
-                }
+        if self.instrument_mode
+            && let Some(ins) = &ins
+        {
+            // "NotePan = ChannelPan; if InstrumentPan=On then NotePan
+            // = InstrumentPan; NotePan += (InstrumentNote -
+            // PPCenter) * PPSeparation / 8".
+            if let Some(p) = ins.pan() {
+                pan = p;
+            }
+            if pan != IT_PAN_SURROUND {
+                let pps = (note as i32 - ins.pitch_pan_center as i32)
+                    * ins.pitch_pan_separation as i32
+                    / 8;
+                pan = (pan as i32 + pps).clamp(0, 64) as u8;
+            }
+            if ins.random_volume > 0 {
+                // ±RV percent around unity.
+                let r = (self.rand() % (2 * ins.random_volume as u32 + 1)) as i32
+                    - ins.random_volume as i32;
+                random_vol_x256 = ((256 + 256 * r / 100).clamp(0, 512)) as u16;
             }
         }
         if let Some(p) = sample_pan {
@@ -1026,12 +1022,12 @@ impl ItPlayerState {
             if let Some(vol) = self.sample_for(sample_no).map(|s| s.default_volume) {
                 self.channels[ch].volume = vol;
             }
-            if self.instrument_mode {
-                if let Some(vi) = self.channels[ch].voice {
-                    if self.voices[vi].active && !self.voices[vi].background {
-                        self.retrigger_envelopes(ch);
-                    }
-                }
+            if self.instrument_mode
+                && let Some(vi) = self.channels[ch].voice
+                && self.voices[vi].active
+                && !self.voices[vi].background
+            {
+                self.retrigger_envelopes(ch);
             }
         }
 
@@ -1253,19 +1249,19 @@ impl ItPlayerState {
                 // without a note re-seeks the sounding voice.
                 let c = &self.channels[ch];
                 let cell = self.cell_at(self.row, ch);
-                if !cell.has_note() {
-                    if let Some(vi) = c.voice {
-                        let offset = (c.mem_o as usize) << 8 | (c.high_offset as usize) << 16;
-                        let frames = self
-                            .sample_for(self.voices[vi].sample)
-                            .map_or(0, |s| s.pcm.len());
-                        let v = &mut self.voices[vi];
-                        if v.active && !v.background {
-                            if offset < frames {
-                                v.mixer.pos = offset as f32;
-                            } else if self.old_effects {
-                                v.mixer.pos = frames.saturating_sub(1) as f32;
-                            }
+                if !cell.has_note()
+                    && let Some(vi) = c.voice
+                {
+                    let offset = (c.mem_o as usize) << 8 | (c.high_offset as usize) << 16;
+                    let frames = self
+                        .sample_for(self.voices[vi].sample)
+                        .map_or(0, |s| s.pcm.len());
+                    let v = &mut self.voices[vi];
+                    if v.active && !v.background {
+                        if offset < frames {
+                            v.mixer.pos = offset as f32;
+                        } else if self.old_effects {
+                            v.mixer.pos = frames.saturating_sub(1) as f32;
                         }
                     }
                 }
@@ -1479,24 +1475,24 @@ impl ItPlayerState {
         let volcol = self.channels[ch].volcol;
 
         // Note delay fires its cell on its tick.
-        if let Some(t) = self.channels[ch].note_delay_tick {
-            if self.tick == t {
-                self.channels[ch].note_delay_tick = None;
-                let cell = self.channels[ch].delayed_cell;
-                let mut cell = cell;
-                // Strip the SDx so the delayed cell's own effect (none)
-                // does not re-schedule.
-                cell.mask &= !crate::it::IT_CELL_COMMAND;
-                self.process_cell(ch, cell);
-                self.channels[ch].cmd = FX_S;
-                self.channels[ch].param = param;
-            }
+        if let Some(t) = self.channels[ch].note_delay_tick
+            && self.tick == t
+        {
+            self.channels[ch].note_delay_tick = None;
+            let cell = self.channels[ch].delayed_cell;
+            let mut cell = cell;
+            // Strip the SDx so the delayed cell's own effect (none)
+            // does not re-schedule.
+            cell.mask &= !crate::it::IT_CELL_COMMAND;
+            self.process_cell(ch, cell);
+            self.channels[ch].cmd = FX_S;
+            self.channels[ch].param = param;
         }
-        if let Some(t) = self.channels[ch].note_cut_tick {
-            if self.tick == t {
-                self.channels[ch].note_cut_tick = None;
-                self.note_cut(ch);
-            }
+        if let Some(t) = self.channels[ch].note_cut_tick
+            && self.tick == t
+        {
+            self.channels[ch].note_cut_tick = None;
+            self.note_cut(ch);
         }
 
         let linear = self.linear_slides;
@@ -1875,17 +1871,18 @@ impl ItPlayerState {
             // Sample vibrato ("the depth is basically the running-sum of
             // the rate divided by 256", applied as a fine linear slide).
             let smp = self.module.samples.get(v.sample as usize - 1);
-            if let Some(smp) = smp {
-                if smp.vibrato_depth > 0 && smp.vibrato_rate > 0 {
-                    let sum = v.sample_vib_sweep as u32 + smp.vibrato_rate as u32;
-                    v.sample_vib_sweep = sum.min(0xFFFF) as u16;
-                    let depth = ((sum >> 8) as u8).min(smp.vibrato_depth) as i32;
-                    let w = waveform(smp.vibrato_wave as u8, v.sample_vib_pos, rnd);
-                    let delta = (w * depth) as f64 / 64.0;
-                    freq = linear_slide(freq, delta);
-                    if smp.vibrato_wave != ItVibratoWave::Random {
-                        v.sample_vib_pos = v.sample_vib_pos.wrapping_add(smp.vibrato_speed);
-                    }
+            if let Some(smp) = smp
+                && smp.vibrato_depth > 0
+                && smp.vibrato_rate > 0
+            {
+                let sum = v.sample_vib_sweep as u32 + smp.vibrato_rate as u32;
+                v.sample_vib_sweep = sum.min(0xFFFF) as u16;
+                let depth = ((sum >> 8) as u8).min(smp.vibrato_depth) as i32;
+                let w = waveform(smp.vibrato_wave as u8, v.sample_vib_pos, rnd);
+                let delta = (w * depth) as f64 / 64.0;
+                freq = linear_slide(freq, delta);
+                if smp.vibrato_wave != ItVibratoWave::Random {
+                    v.sample_vib_pos = v.sample_vib_pos.wrapping_add(smp.vibrato_speed);
                 }
             }
 
@@ -1943,7 +1940,7 @@ impl ItPlayerState {
     /// Render interleaved stereo `i16` into `dst`; returns frames
     /// produced (0 once the song has ended).
     pub fn render(&mut self, dst: &mut [i16]) -> usize {
-        assert!(dst.len() % 2 == 0);
+        assert!(dst.len().is_multiple_of(2));
         let total_frames = dst.len() / 2;
         let mut produced = 0usize;
         let out_rate = self.sample_rate as f32;
@@ -2060,9 +2057,9 @@ pub(crate) mod tests {
         build_module, build_new_instrument, build_pattern, build_sample_header, cmd_cell, note_cell,
     };
     use crate::it::{
-        parse_module, ItVolumeColumn, IT_CELL_COMMAND, IT_CELL_NOTE, IT_CELL_VOLPAN, IT_CVT_SIGNED,
-        IT_FLAG_INSTRUMENTS, IT_FLAG_LINEAR_SLIDES, IT_SMP_HAS_SAMPLE, IT_SMP_LOOP,
-        IT_SMP_SUSTAIN_LOOP,
+        IT_CELL_COMMAND, IT_CELL_NOTE, IT_CELL_VOLPAN, IT_CVT_SIGNED, IT_FLAG_INSTRUMENTS,
+        IT_FLAG_LINEAR_SLIDES, IT_SMP_HAS_SAMPLE, IT_SMP_LOOP, IT_SMP_SUSTAIN_LOOP, ItVolumeColumn,
+        parse_module,
     };
 
     const RATE: u32 = 44_100;

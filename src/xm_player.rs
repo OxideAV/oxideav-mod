@@ -1224,7 +1224,7 @@ impl XmPlayerState {
             // `enter_row`'s 0x0E arm.
             if ch.effect == 0x0E && (ch.effect_param >> 4) == 0x09 {
                 let p = ch.effect_param & 0x0F;
-                if p > 0 && cur_tick > 0 && (cur_tick % p) == 0 {
+                if p > 0 && cur_tick > 0 && cur_tick.is_multiple_of(p) {
                     ch.voice.pos = 0.0;
                     ch.voice.direction = 1;
                     ch.voice.active = true;
@@ -1486,11 +1486,13 @@ impl XmPlayerState {
         // on the same row (any channel) wins and the loop jump is
         // dropped (black-box pinned, round 458 `loop_then_jump` /
         // `jump_then_loop` / `loop_then_break` / `break_then_loop`).
-        if let Some(target_row) = loop_row {
-            if jump.is_none() && !brk && !break0 {
-                self.row = target_row;
-                return;
-            }
+        if let Some(target_row) = loop_row
+            && jump.is_none()
+            && !brk
+            && !break0
+        {
+            self.row = target_row;
+            return;
         }
         if let Some(order) = jump {
             // Bxx: order from the jump, row from a same-row Dxx (else 0).
@@ -1570,7 +1572,7 @@ impl XmPlayerState {
     }
 
     pub fn render(&mut self, dst: &mut [i16]) -> usize {
-        assert!(dst.len() % 2 == 0);
+        assert!(dst.len().is_multiple_of(2));
         let mut produced = 0usize;
         let total_frames = dst.len() / 2;
         let out_rate = self.sample_rate as f32;
@@ -3069,9 +3071,9 @@ pub mod tests {
         // the trigger row's tick 0.
         let mut st = make_minimal_xm_state(0x00, 4, 8, 0);
         st.advance_tick(); // enter row 0 → note triggers
-                           // The autovibrato block advanced auto_vib_pos by vibrato_rate
-                           // *after* the trigger reset it to 0. So on the trigger tick the
-                           // post-block value is exactly `vibrato_rate` (8 here).
+        // The autovibrato block advanced auto_vib_pos by vibrato_rate
+        // *after* the trigger reset it to 0. So on the trigger tick the
+        // post-block value is exactly `vibrato_rate` (8 here).
         assert_eq!(
             st.channels[0].auto_vib_pos, 8,
             "after retrigger, sweep counter started at 0 and the autovib \
@@ -3277,7 +3279,7 @@ pub mod tests {
         ]);
         st.speed = 4;
         walk_row(&mut st); // ticks of row 0
-                           // After row 0 the speed memory should have latched to 1.
+        // After row 0 the speed memory should have latched to 1.
         assert_eq!(st.channels[0].multi_retrig_y_mem, 1);
         // Walk row 1 — without reuse, no retrig fires; with reuse,
         // every tick fires and counter is reset every tick.
@@ -3669,7 +3671,7 @@ pub mod tests {
         // The helper stamps instrument=1 only on note rows, so row 1 is
         // a true bare-effect row.
         walk_row(&mut st); // row 0 plays; parked at row 1 tick 0 (not entered)
-                           // Simulate the voice being mid-sample when row 1 begins.
+        // Simulate the voice being mid-sample when row 1 begins.
         st.channels[0].voice.pos = 100.0;
         st.advance_tick(); // row 1 tick 0 — E90 must fire exactly here
         assert_eq!(

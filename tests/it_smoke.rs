@@ -13,9 +13,9 @@ use std::io::Cursor;
 use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame};
 use oxideav_core::{CodecRegistry, Decoder};
-use oxideav_mod::it_writer::{square_sample, ItWriter, ItWriterPattern};
+use oxideav_mod::it_writer::{ItWriter, ItWriterPattern, square_sample};
 use oxideav_mod::{
-    container::OUTPUT_SAMPLE_RATE, it, register_codecs, register_containers, CODEC_ID_IT_STR,
+    CODEC_ID_IT_STR, container::OUTPUT_SAMPLE_RATE, it, register_codecs, register_containers,
 };
 
 fn build_smoke_it() -> Vec<u8> {
@@ -59,10 +59,11 @@ fn it_registry_probe_demux_decode() {
     let params = dm.streams()[0].params.clone();
     assert_eq!(params.codec_id, CodecId::new(CODEC_ID_IT_STR));
     assert_eq!(params.sample_rate, Some(OUTPUT_SAMPLE_RATE));
-    assert!(dm
-        .metadata()
-        .iter()
-        .any(|(k, v)| k == "title" && v == "smoke-it"));
+    assert!(
+        dm.metadata()
+            .iter()
+            .any(|(k, v)| k == "title" && v == "smoke-it")
+    );
     assert_eq!(dm.duration_micros(), Some(960_000));
 
     let pkt = dm.next_packet().expect("one packet");
@@ -82,7 +83,7 @@ fn it_registry_probe_demux_decode() {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 frames += a.samples as u64;
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     if i16::from_le_bytes([chunk[0], chunk[1]]) != 0 {
                         nonzero += 1;
                     }

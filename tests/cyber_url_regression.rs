@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, TimeBase,
 };
-use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
+use oxideav_mod::{CODEC_ID_STR, container::OUTPUT_SAMPLE_RATE, register_codecs};
 
 const FIXTURE_URL: &str = "https://samples.oxideav.org/magicaltux/mod/cyber.mod";
 
@@ -230,7 +230,7 @@ fn decode_n_seconds(bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
                 if pcm.len() / 2 >= max_frames {
@@ -298,7 +298,7 @@ fn cyber_mod_url_regression() {
     // arp base.
     {
         use oxideav_mod::header::parse_header;
-        use oxideav_mod::player::{parse_patterns, PlayerState, PERIOD_TABLE};
+        use oxideav_mod::player::{PERIOD_TABLE, PlayerState, parse_patterns};
         use oxideav_mod::samples::extract_samples;
         let header2 = parse_header(&bytes).expect("parse header");
         let samples = extract_samples(&header2, &bytes);

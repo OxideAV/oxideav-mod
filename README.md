@@ -848,7 +848,7 @@ coverage*.)
 
 Two integration harnesses drive this crate's engines side-by-side with a
 runtime-loaded black-box reference render binary (dlopen'd via
-`libloading`; only its published C entry-points are called, and it is
+`dlsym`; only its published C entry-points are called, and it is
 used strictly as an opaque behaviour oracle whose output is compared
 against ours — the tests skip cleanly when the dylib is absent):
 

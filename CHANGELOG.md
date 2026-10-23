@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95; tests load their black-box reference (libmodplug) through dlsym instead of libloading
+
 ### Added
 
 - Fuzz: structure-aware `xm_player_steered` / `it_player_steered` targets (fuzz bytes read as a recipe for the hidden writers, so the players' state machines get the budget the raw-parser targets reject) and a daily `Fuzz` workflow (`.github/workflows/fuzz.yml`, six targets, 30-minute budget). Round 458 foreground runs: steered 3.4 M / 6.4 M executions in 420 s, raw `xm_decode` / `it_decode` 3.7 M / 4.5 M in 300 s, all clean.

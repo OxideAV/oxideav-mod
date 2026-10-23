@@ -713,7 +713,7 @@ pub fn decode_sample_body(sample: &mut ItSample, bytes: &[u8]) {
     } else {
         let be = sample.convert & IT_CVT_BIG_ENDIAN != 0;
         let mut acc: u16 = 0;
-        for w in body.chunks_exact(2) {
+        for w in body.as_chunks::<2>().0 {
             let raw = if be {
                 u16::from_be_bytes([w[0], w[1]])
             } else {
@@ -1016,10 +1016,10 @@ fn parse_new_envelope(e: &[u8]) -> ItEnvelope {
         let tick = read_u16_le(e, 7 + 3 * i);
         // Ticks must be non-decreasing for the segment walk to
         // terminate; a hostile out-of-order node ends the list.
-        if let Some(&(_, prev)) = nodes.last() {
-            if tick < prev {
-                break;
-            }
+        if let Some(&(_, prev)) = nodes.last()
+            && tick < prev
+        {
+            break;
         }
         nodes.push((y, tick));
     }
@@ -1047,10 +1047,10 @@ fn parse_old_volume_envelope(ins: &[u8], flg: u8, loops: [u8; 4]) -> ItEnvelope 
         if tick == 0xFF || mag == 0xFF {
             break;
         }
-        if let Some(&(_, prev)) = nodes.last() {
-            if (tick as u16) < prev {
-                break;
-            }
+        if let Some(&(_, prev)) = nodes.last()
+            && (tick as u16) < prev
+        {
+            break;
         }
         nodes.push((mag.min(64) as i8, tick as u16));
     }
@@ -2000,11 +2000,13 @@ pub(crate) mod tests {
             "before the first node the first value holds"
         );
         assert_eq!(ItEnvelope::default().value_at_x256(3), 0);
-        assert!(!ItEnvelope {
-            flags: IT_ENV_ON,
-            ..ItEnvelope::default()
-        }
-        .is_on());
+        assert!(
+            !ItEnvelope {
+                flags: IT_ENV_ON,
+                ..ItEnvelope::default()
+            }
+            .is_on()
+        );
     }
 
     #[test]

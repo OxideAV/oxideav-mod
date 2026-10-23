@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-mod"
 version = "0.0.10"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-mod"
 authors = ["Mark Karpeles"]
@@ -25,9 +25,9 @@ oxideav-core = "0.1"
 # miniz_oxide); the workspace uses compcol for compression and the
 # fixtures are fetched uncompressed. `rustls` keeps https working.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-# `libloading` is used by `tests/tracker_reference_compare.rs` to
+# `dlsym` (Karpelès Lab) is used by `tests/tracker_reference_compare.rs` to
 # dlopen a trace reference impl at runtime as a black-box behaviour
 # oracle for per-row playback comparison. The crate gracefully skips
 # the test if the reference dylib isn't installed — there is no
 # compile-time link.
-libloading = "0.9"
+dlsym = "0.0.2"

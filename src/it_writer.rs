@@ -8,10 +8,10 @@
 //! encoder, by design) — hence hidden from the public documentation.
 
 use crate::it::{
-    ItCell, IT_CELL_COMMAND, IT_CELL_INSTRUMENT, IT_CELL_NOTE, IT_CELL_VOLPAN, IT_CVT_SIGNED,
+    IT_CELL_COMMAND, IT_CELL_INSTRUMENT, IT_CELL_NOTE, IT_CELL_VOLPAN, IT_CVT_SIGNED,
     IT_HEADER_FIXED_SIZE, IT_INSTRUMENT_MAGIC, IT_INSTRUMENT_SIZE, IT_KEYMAP_ENTRIES, IT_MAGIC,
     IT_MAX_CHANNELS, IT_PATTERN_HEADER_SIZE, IT_SAMPLE_HEADER_SIZE, IT_SAMPLE_MAGIC, IT_SMP_16BIT,
-    IT_SMP_HAS_SAMPLE,
+    IT_SMP_HAS_SAMPLE, ItCell,
 };
 
 /// One envelope for [`ItWriterInstrument`]: `flags`, node points,
@@ -449,7 +449,7 @@ pub fn square_sample(len: usize, half: usize, amp: i16) -> ItWriterSample {
         name: "square".into(),
         pcm: (0..len)
             .map(|i| {
-                if (i / half.max(1)) % 2 == 0 {
+                if (i / half.max(1)).is_multiple_of(2) {
                     amp
                 } else {
                     -amp
@@ -465,7 +465,7 @@ pub fn square_sample(len: usize, half: usize, amp: i16) -> ItWriterSample {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::it::{parse_module, IT_ENV_ON};
+    use crate::it::{IT_ENV_ON, parse_module};
 
     #[test]
     fn round_trips_through_the_parser() {

@@ -21,7 +21,7 @@ use std::path::Path;
 
 use oxideav_mod::container::OUTPUT_SAMPLE_RATE;
 use oxideav_mod::header::parse_header;
-use oxideav_mod::player::{parse_patterns, PlayerState};
+use oxideav_mod::player::{PlayerState, parse_patterns};
 use oxideav_mod::samples::extract_samples;
 
 const FIXTURE: &str = "/Users/magicaltux/projects/oxideav-workspace/target/test-fixtures/rhmst.mod";
@@ -90,7 +90,7 @@ fn read_wav_s16(path: &Path) -> Option<(Vec<i16>, u16, u32)> {
         return None;
     }
     let mut out = Vec::with_capacity(data.len() / 2);
-    for c in data.chunks_exact(2) {
+    for c in data.as_chunks::<2>().0 {
         out.push(i16::from_le_bytes([c[0], c[1]]));
     }
     Some((out, channels, sample_rate))
@@ -206,38 +206,39 @@ fn render_rhmst_to_wav_with_per_row_diagnostics() {
     // Same step measurement on the black-box reference render — gives
     // us a reality check on what magnitude of inter-frame step is
     // actually expected of a healthy MOD renderer.
-    if let Some((ref_pcm, ch, sr)) = read_wav_s16(Path::new(REF_WAV)) {
-        if ch == 2 && sr == OUTPUT_SAMPLE_RATE {
-            let n = (produced * 2).min(ref_pcm.len());
-            let mut max_l = 0i32;
-            let mut max_r = 0i32;
-            let mut sum_l = 0u64;
-            let mut sum_r = 0u64;
-            let mut nn = 0u64;
-            for f in 1..(n / 2) {
-                let l0 = ref_pcm[(f - 1) * 2] as i32;
-                let r0 = ref_pcm[(f - 1) * 2 + 1] as i32;
-                let l1 = ref_pcm[f * 2] as i32;
-                let r1 = ref_pcm[f * 2 + 1] as i32;
-                let dl = (l1 - l0).abs();
-                let dr = (r1 - r0).abs();
-                if dl > max_l {
-                    max_l = dl;
-                }
-                if dr > max_r {
-                    max_r = dr;
-                }
-                sum_l += dl as u64;
-                sum_r += dr as u64;
-                nn += 1;
+    if let Some((ref_pcm, ch, sr)) = read_wav_s16(Path::new(REF_WAV))
+        && ch == 2
+        && sr == OUTPUT_SAMPLE_RATE
+    {
+        let n = (produced * 2).min(ref_pcm.len());
+        let mut max_l = 0i32;
+        let mut max_r = 0i32;
+        let mut sum_l = 0u64;
+        let mut sum_r = 0u64;
+        let mut nn = 0u64;
+        for f in 1..(n / 2) {
+            let l0 = ref_pcm[(f - 1) * 2] as i32;
+            let r0 = ref_pcm[(f - 1) * 2 + 1] as i32;
+            let l1 = ref_pcm[f * 2] as i32;
+            let r1 = ref_pcm[f * 2 + 1] as i32;
+            let dl = (l1 - l0).abs();
+            let dr = (r1 - r0).abs();
+            if dl > max_l {
+                max_l = dl;
             }
-            if nn > 0 {
-                println!(
-                    "ref  max |Δsample| L={max_l} R={max_r}; mean L={:.1} R={:.1}",
-                    sum_l as f64 / nn as f64,
-                    sum_r as f64 / nn as f64,
-                );
+            if dr > max_r {
+                max_r = dr;
             }
+            sum_l += dl as u64;
+            sum_r += dr as u64;
+            nn += 1;
+        }
+        if nn > 0 {
+            println!(
+                "ref  max |Δsample| L={max_l} R={max_r}; mean L={:.1} R={:.1}",
+                sum_l as f64 / nn as f64,
+                sum_r as f64 / nn as f64,
+            );
         }
     }
 

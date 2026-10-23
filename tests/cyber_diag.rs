@@ -17,11 +17,11 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
 
-use libloading::{Library, Symbol};
+use dlsym::Library;
 
 use oxideav_mod::container::OUTPUT_SAMPLE_RATE;
 use oxideav_mod::header::parse_header;
-use oxideav_mod::player::{parse_patterns, PlayerState};
+use oxideav_mod::player::{PlayerState, parse_patterns};
 use oxideav_mod::samples::extract_samples;
 
 #[repr(C)]
@@ -97,49 +97,48 @@ impl ModPlugLib {
         paths.push(PathBuf::from("/opt/homebrew/lib/libmodplug.dylib"));
         paths.push(PathBuf::from("/usr/local/lib/libmodplug.dylib"));
         paths.push(PathBuf::from("libmodplug.dylib"));
-        let lib = paths.iter().find_map(|p| unsafe { Library::new(p) }.ok())?;
+        let lib = paths
+            .iter()
+            .find_map(|p| unsafe { Library::open(p) }.ok())?;
         unsafe {
             macro_rules! sym {
-                ($n:expr, $t:ty) => {{
-                    let s: Symbol<$t> = lib.get($n).ok()?;
-                    *s
-                }};
+                ($n:expr_2021, $t:ty) => {{ lib.get::<$t>($n).ok()?.into_inner() }};
             }
             let load = sym!(
-                b"ModPlug_Load\0",
+                c"ModPlug_Load",
                 unsafe extern "C" fn(*const c_void, i32) -> *mut ModPlugFile
             );
-            let unload = sym!(b"ModPlug_Unload\0", unsafe extern "C" fn(*mut ModPlugFile));
+            let unload = sym!(c"ModPlug_Unload", unsafe extern "C" fn(*mut ModPlugFile));
             let read = sym!(
-                b"ModPlug_Read\0",
+                c"ModPlug_Read",
                 unsafe extern "C" fn(*mut ModPlugFile, *mut c_void, i32) -> i32
             );
             let get_order = sym!(
-                b"ModPlug_GetCurrentOrder\0",
+                c"ModPlug_GetCurrentOrder",
                 unsafe extern "C" fn(*mut ModPlugFile) -> i32
             );
             let get_pattern = sym!(
-                b"ModPlug_GetCurrentPattern\0",
+                c"ModPlug_GetCurrentPattern",
                 unsafe extern "C" fn(*mut ModPlugFile) -> i32
             );
             let get_row = sym!(
-                b"ModPlug_GetCurrentRow\0",
+                c"ModPlug_GetCurrentRow",
                 unsafe extern "C" fn(*mut ModPlugFile) -> i32
             );
             let get_speed = sym!(
-                b"ModPlug_GetCurrentSpeed\0",
+                c"ModPlug_GetCurrentSpeed",
                 unsafe extern "C" fn(*mut ModPlugFile) -> i32
             );
             let get_tempo = sym!(
-                b"ModPlug_GetCurrentTempo\0",
+                c"ModPlug_GetCurrentTempo",
                 unsafe extern "C" fn(*mut ModPlugFile) -> i32
             );
             let get_settings = sym!(
-                b"ModPlug_GetSettings\0",
+                c"ModPlug_GetSettings",
                 unsafe extern "C" fn(*mut ModPlugSettings)
             );
             let set_settings = sym!(
-                b"ModPlug_SetSettings\0",
+                c"ModPlug_SetSettings",
                 unsafe extern "C" fn(*const ModPlugSettings)
             );
             Some(ModPlugLib {
@@ -219,11 +218,7 @@ fn cache_path() -> Option<PathBuf> {
             crate_dir.join("..").join("..").join("target")
         });
     let p = target_dir.join("test-fixtures").join("cyber.mod");
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.exists() { Some(p) } else { None }
 }
 
 #[test]
@@ -323,7 +318,7 @@ fn cyber_diag_full_trace() {
         }
         let mp_n = mp_n as usize;
         our_pcm.extend_from_slice(&our_buf[..n * 2]);
-        for c in mp_buf[..mp_n].chunks_exact(2) {
+        for c in mp_buf[..mp_n].as_chunks::<2>().0 {
             mp_pcm.push(i16::from_le_bytes([c[0], c[1]]));
         }
         let our_order = player.order_index as i32;
@@ -359,7 +354,14 @@ fn cyber_diag_full_trace() {
             "[cyber_diag] FIRST (order,row) DIVERGENCE @ sample {} t={:.3}s | ours O{}P{}R{:02}T{} | mp O{}P{}R{:02} sp={}",
             e.0,
             e.0 as f64 / OUTPUT_SAMPLE_RATE as f64,
-            e.1, e.2, e.3, e.4, e.5, e.6, e.7, e.8
+            e.1,
+            e.2,
+            e.3,
+            e.4,
+            e.5,
+            e.6,
+            e.7,
+            e.8
         );
     } else {
         println!("[cyber_diag] (order,row) AGREES across the trace");
@@ -402,8 +404,7 @@ fn cyber_diag_full_trace() {
             .unwrap_or((0, -1, -1, -1, -1, -1, -1, -1, -1));
         println!(
             "  t={:>2}s  max|d|={:>5} mean|d|={:>5.0} our_rms={:>5.0} mp_rms={:>5.0}  ours O{}P{}R{:02}  mp O{}P{}R{:02}",
-            sec, max_d, mean, our_rms, mp_rms,
-            st.1, st.2, st.3, st.5, st.6, st.7
+            sec, max_d, mean, our_rms, mp_rms, st.1, st.2, st.3, st.5, st.6, st.7
         );
     }
 
@@ -458,9 +459,16 @@ fn cyber_diag_full_trace() {
                 let ch2 = &player2.channels[2];
                 println!(
                     "  O{}R{:02}T{} ch2: period={} sample={} active={} eff={:X}{:02X} arp_base={} vol={}",
-                    now_ord, now_row, now_tick,
-                    ch2.period, ch2.sample_index, ch2.active,
-                    ch2.effect, ch2.effect_param, ch2.arp_base_period, ch2.volume,
+                    now_ord,
+                    now_row,
+                    now_tick,
+                    ch2.period,
+                    ch2.sample_index,
+                    ch2.active,
+                    ch2.effect,
+                    ch2.effect_param,
+                    ch2.arp_base_period,
+                    ch2.volume,
                 );
             }
             prev_tick = now_tick;

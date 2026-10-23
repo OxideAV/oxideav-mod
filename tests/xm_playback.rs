@@ -71,9 +71,9 @@ fn build_c4_square_xm() -> Vec<u8> {
     // Extended block.
     out.extend_from_slice(&xm::XM_SAMPLE_HEADER_SIZE.to_le_bytes());
     out.extend(vec![0u8; 96]); // sample_map
-                               // Flat envelope at full volume: (0, 64) and (64, 64). This keeps
-                               // the volume scalar at 1.0 throughout the test so we can assert on
-                               // raw audibility without envelope ramp-up colouring the RMS.
+    // Flat envelope at full volume: (0, 64) and (64, 64). This keeps
+    // the volume scalar at 1.0 throughout the test so we can assert on
+    // raw audibility without envelope ramp-up colouring the RMS.
     let mut vol_env = [0u8; 48];
     vol_env[0..2].copy_from_slice(&0u16.to_le_bytes());
     vol_env[2..4].copy_from_slice(&64u16.to_le_bytes());
@@ -263,7 +263,7 @@ fn build_envelope_xm() -> Vec<u8> {
     // Volume type: On (bit 0) + Sustain (bit 1) = 0x03.
     out.push(0x03);
     out.push(0); // pan type
-                 // Vibrato (type/sweep/depth/rate) — zero.
+    // Vibrato (type/sweep/depth/rate) — zero.
     out.push(0);
     out.push(0);
     out.push(0);
@@ -377,8 +377,8 @@ fn xm_player_envelope_sustain_then_fadeout_on_key_off() {
         .filter(|&&x| x != 0)
         .count();
     let _ = tail_nonzero; // fadeout may reach zero before the very end;
-                          // this is informational, not asserted — see head/tail
-                          // RMS ratio above for the real decay check.
+    // this is informational, not asserted — see head/tail
+    // RMS ratio above for the real decay check.
 }
 
 // ---- Round 6: vibrato / tone porta / pattern jump tests ----
@@ -536,7 +536,7 @@ fn dft_mag(signal: &[f32], sample_rate: f32, freq_hz: f32) -> f32 {
 
 /// Read only the left channel of the stereo i16 output, converted to f32.
 fn left_channel(buf: &[i16]) -> Vec<f32> {
-    buf.chunks_exact(2).map(|c| c[0] as f32).collect()
+    buf.as_chunks::<2>().0.iter().map(|c| c[0] as f32).collect()
 }
 
 /// Vibrato on a single sustained note must produce sidebands in the

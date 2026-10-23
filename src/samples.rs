@@ -96,11 +96,7 @@ pub fn extract_samples(header: &ModHeader, bytes: &[u8]) -> Vec<SampleBody> {
             let pcm_len = pcm.len() as u32;
             let start = sample.repeat_start.min(pcm_len);
             let len = sample.repeat_length.min(pcm_len.saturating_sub(start));
-            if len > 2 {
-                (start, len)
-            } else {
-                (0, 0)
-            }
+            if len > 2 { (start, len) } else { (0, 0) }
         } else {
             (0, 0)
         };

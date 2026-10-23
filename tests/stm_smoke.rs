@@ -18,7 +18,7 @@ use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
 use oxideav_mod::{
-    container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, stm, CODEC_ID_STM_STR,
+    CODEC_ID_STM_STR, container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, stm,
 };
 
 /// Build a minimal valid STM file with one pattern (mostly zero) and one

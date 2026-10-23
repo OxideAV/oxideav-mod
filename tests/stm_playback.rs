@@ -262,7 +262,7 @@ fn dft_mag(signal: &[f32], sample_rate: f32, freq_hz: f32) -> f32 {
 
 /// Extract the left channel of interleaved stereo i16 as f32.
 fn left_channel(buf: &[i16]) -> Vec<f32> {
-    buf.chunks_exact(2).map(|c| c[0] as f32).collect()
+    buf.as_chunks::<2>().0.iter().map(|c| c[0] as f32).collect()
 }
 
 /// Vibrato (4xy) on a single sustained note must produce detectable

@@ -10,7 +10,7 @@
 //! asserts position lockstep at every probe for XM, and audibility +
 //! self-consistency for both.
 //!
-//! The reference dylib is loaded with `libloading`, exactly as in
+//! The reference dylib is loaded with `dlsym`, exactly as in
 //! `tracker_reference_compare.rs`: only its **published C
 //! entry-points** are consumed, no reference source is read or
 //! referenced, and the binary is treated strictly as an opaque
@@ -31,7 +31,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
 
-use libloading::{Library, Symbol};
+use dlsym::Library;
 
 use oxideav_mod::{stm, stm_player::StmPlayerState, xm, xm_player::XmPlayerState};
 
@@ -107,33 +107,53 @@ impl RefLib {
 
         let lib = candidates
             .iter()
-            .find_map(|p| unsafe { Library::new(p) }.ok())?;
+            .find_map(|p| unsafe { Library::open(p) }.ok())?;
         unsafe {
-            let load: Symbol<unsafe extern "C" fn(*const c_void, i32) -> *mut ModPlugFile> =
-                lib.get(b"ModPlug_Load\0").ok()?;
-            let unload: Symbol<unsafe extern "C" fn(*mut ModPlugFile)> =
-                lib.get(b"ModPlug_Unload\0").ok()?;
-            let read: Symbol<unsafe extern "C" fn(*mut ModPlugFile, *mut c_void, i32) -> i32> =
-                lib.get(b"ModPlug_Read\0").ok()?;
-            let get_order: Symbol<unsafe extern "C" fn(*mut ModPlugFile) -> i32> =
-                lib.get(b"ModPlug_GetCurrentOrder\0").ok()?;
-            let get_row: Symbol<unsafe extern "C" fn(*mut ModPlugFile) -> i32> =
-                lib.get(b"ModPlug_GetCurrentRow\0").ok()?;
-            let get_speed: Symbol<unsafe extern "C" fn(*mut ModPlugFile) -> i32> =
-                lib.get(b"ModPlug_GetCurrentSpeed\0").ok()?;
-            let get_settings: Symbol<unsafe extern "C" fn(*mut ModPlugSettings)> =
-                lib.get(b"ModPlug_GetSettings\0").ok()?;
-            let set_settings: Symbol<unsafe extern "C" fn(*const ModPlugSettings)> =
-                lib.get(b"ModPlug_SetSettings\0").ok()?;
+            let load: unsafe extern "C" fn(*const c_void, i32) -> *mut ModPlugFile = lib
+                .get::<unsafe extern "C" fn(*const c_void, i32) -> *mut ModPlugFile>(
+                    c"ModPlug_Load",
+                )
+                .ok()?
+                .into_inner();
+            let unload: unsafe extern "C" fn(*mut ModPlugFile) = lib
+                .get::<unsafe extern "C" fn(*mut ModPlugFile)>(c"ModPlug_Unload")
+                .ok()?
+                .into_inner();
+            let read: unsafe extern "C" fn(*mut ModPlugFile, *mut c_void, i32) -> i32 = lib
+                .get::<unsafe extern "C" fn(*mut ModPlugFile, *mut c_void, i32) -> i32>(
+                    c"ModPlug_Read",
+                )
+                .ok()?
+                .into_inner();
+            let get_order: unsafe extern "C" fn(*mut ModPlugFile) -> i32 = lib
+                .get::<unsafe extern "C" fn(*mut ModPlugFile) -> i32>(c"ModPlug_GetCurrentOrder")
+                .ok()?
+                .into_inner();
+            let get_row: unsafe extern "C" fn(*mut ModPlugFile) -> i32 = lib
+                .get::<unsafe extern "C" fn(*mut ModPlugFile) -> i32>(c"ModPlug_GetCurrentRow")
+                .ok()?
+                .into_inner();
+            let get_speed: unsafe extern "C" fn(*mut ModPlugFile) -> i32 = lib
+                .get::<unsafe extern "C" fn(*mut ModPlugFile) -> i32>(c"ModPlug_GetCurrentSpeed")
+                .ok()?
+                .into_inner();
+            let get_settings: unsafe extern "C" fn(*mut ModPlugSettings) = lib
+                .get::<unsafe extern "C" fn(*mut ModPlugSettings)>(c"ModPlug_GetSettings")
+                .ok()?
+                .into_inner();
+            let set_settings: unsafe extern "C" fn(*const ModPlugSettings) = lib
+                .get::<unsafe extern "C" fn(*const ModPlugSettings)>(c"ModPlug_SetSettings")
+                .ok()?
+                .into_inner();
             Some(RefLib {
-                load: *load,
-                unload: *unload,
-                read: *read,
-                get_order: *get_order,
-                get_row: *get_row,
-                get_speed: *get_speed,
-                get_settings: *get_settings,
-                set_settings: *set_settings,
+                load,
+                unload,
+                read,
+                get_order,
+                get_row,
+                get_speed,
+                get_settings,
+                set_settings,
                 _lib: lib,
             })
         }
@@ -319,9 +339,9 @@ fn build_flow_stm() -> Vec<u8> {
     out[inst_off + 20..inst_off + 22].copy_from_slice(&64u16.to_le_bytes()); // loop end
     out[inst_off + 22] = 64; // volume
     out[inst_off + 24..inst_off + 26].copy_from_slice(&8448u16.to_le_bytes()); // C3 Hz
-                                                                               // "length in paragraphs" (staged doc, record offset +30): 64 bytes
-                                                                               // = 4 paragraphs. Our parser doesn't need it, but it is part of
-                                                                               // the documented module-file record, so the fixture carries it.
+    // "length in paragraphs" (staged doc, record offset +30): 64 bytes
+    // = 4 paragraphs. Our parser doesn't need it, but it is part of
+    // the documented module-file record, so the fixture carries it.
     out[inst_off + 30..inst_off + 32].copy_from_slice(&4u16.to_le_bytes());
 
     // Order table: 0, 1, 2, then 255-terminated.
@@ -456,7 +476,9 @@ fn xm_ref_position_lockstep() {
         assert!(n > 0, "reference XM render starved at probe {probe}");
 
         let mp_pcm: Vec<i16> = mp_buf[..n as usize]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         our_energy += rms_i16(&our_buf);
@@ -571,7 +593,9 @@ fn stm_ref_order_flow_and_audibility() {
             break;
         }
         let mp_pcm: Vec<i16> = mp_buf[..n as usize]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         mp_rms_sum += rms_i16(&mp_pcm);

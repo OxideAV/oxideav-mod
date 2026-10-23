@@ -19,7 +19,7 @@ use std::path::Path;
 
 use oxideav_mod::container::OUTPUT_SAMPLE_RATE;
 use oxideav_mod::header::parse_header;
-use oxideav_mod::player::{parse_patterns, PlayerState};
+use oxideav_mod::player::{PlayerState, parse_patterns};
 use oxideav_mod::samples::extract_samples;
 
 // Two equally-valid sources: Mark's local Dropbox copy (hard-coded for
@@ -76,7 +76,7 @@ fn read_wav_s16(path: &Path) -> Option<(Vec<i16>, u16, u32)> {
         return None;
     }
     let mut out = Vec::with_capacity(data.len() / 2);
-    for c in data.chunks_exact(2) {
+    for c in data.as_chunks::<2>().0 {
         out.push(i16::from_le_bytes([c[0], c[1]]));
     }
     Some((out, channels, sample_rate))
@@ -250,21 +250,22 @@ fn render_halluc_to_wav_with_per_row_diagnostics() {
 
     // Per-second cross-correlation against a black-box reference, when
     // a `halluc.mod.wav` sits next to the cached fixture (see REF_WAV).
-    if let Some((ref_pcm, ch, sr)) = read_wav_s16(Path::new(REF_WAV)) {
-        if ch == 2 && sr == OUTPUT_SAMPLE_RATE {
-            let n = (produced * 2).min(ref_pcm.len());
-            let ours: Vec<f32> = pcm[..n].iter().map(|&s| s as f32).collect();
-            let theirs: Vec<f32> = ref_pcm[..n].iter().map(|&s| s as f32).collect();
-            let win = OUTPUT_SAMPLE_RATE as usize * 2; // 1 second of stereo S16
-            for w in 0..(n / win) {
-                let s = w * win;
-                let e = (s + win).min(n);
-                let r = pearson(&ours[s..e], &theirs[s..e]);
-                println!("xcorr t={:>3}s..{:>3}s = {:.4}", w, w + 1, r);
-            }
-            let r_total = pearson(&ours, &theirs);
-            println!("xcorr total ({} frames) = {:.4}", n / 2, r_total);
+    if let Some((ref_pcm, ch, sr)) = read_wav_s16(Path::new(REF_WAV))
+        && ch == 2
+        && sr == OUTPUT_SAMPLE_RATE
+    {
+        let n = (produced * 2).min(ref_pcm.len());
+        let ours: Vec<f32> = pcm[..n].iter().map(|&s| s as f32).collect();
+        let theirs: Vec<f32> = ref_pcm[..n].iter().map(|&s| s as f32).collect();
+        let win = OUTPUT_SAMPLE_RATE as usize * 2; // 1 second of stereo S16
+        for w in 0..(n / win) {
+            let s = w * win;
+            let e = (s + win).min(n);
+            let r = pearson(&ours[s..e], &theirs[s..e]);
+            println!("xcorr t={:>3}s..{:>3}s = {:.4}", w, w + 1, r);
         }
+        let r_total = pearson(&ours, &theirs);
+        println!("xcorr total ({} frames) = {:.4}", n / 2, r_total);
     }
 
     // ---- Per-channel render too, so we can listen to each channel

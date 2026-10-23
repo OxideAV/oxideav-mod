@@ -10,9 +10,9 @@
 //! encoder, by design) — hence hidden from the public documentation.
 
 use crate::xm::{
-    XmCell, XM_BANNER, XM_HEADER_SIZE_OFFSET, XM_ID_BYTE_OFFSET,
-    XM_INSTRUMENT_HEADER_SIZE_WITH_SAMPLES, XM_MIN_HEADER_LEN, XM_ORDER_TABLE_OFFSET,
-    XM_ORDER_TABLE_SIZE, XM_PATTERN_HEADER_SIZE, XM_SAMPLE_HEADER_SIZE, XM_VERSION_0104,
+    XM_BANNER, XM_HEADER_SIZE_OFFSET, XM_ID_BYTE_OFFSET, XM_INSTRUMENT_HEADER_SIZE_WITH_SAMPLES,
+    XM_MIN_HEADER_LEN, XM_ORDER_TABLE_OFFSET, XM_ORDER_TABLE_SIZE, XM_PATTERN_HEADER_SIZE,
+    XM_SAMPLE_HEADER_SIZE, XM_VERSION_0104, XmCell,
 };
 
 /// Envelope type bit 0: envelope on.
@@ -367,7 +367,7 @@ pub fn square_sample(len: usize, half: usize, amp: i16) -> XmWriterSample {
         name: "square".into(),
         pcm: (0..len)
             .map(|i| {
-                if (i / half.max(1)) % 2 == 0 {
+                if (i / half.max(1)).is_multiple_of(2) {
                     amp
                 } else {
                     -amp

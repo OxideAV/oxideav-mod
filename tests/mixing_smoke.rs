@@ -6,7 +6,7 @@
 
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
-use oxideav_mod::{container::OUTPUT_SAMPLE_RATE, register_codecs, CODEC_ID_STR};
+use oxideav_mod::{CODEC_ID_STR, container::OUTPUT_SAMPLE_RATE, register_codecs};
 
 const HEADER_FIXED_SIZE: usize = 1084;
 const PATTERN_BYTES: usize = 64 * 4 * 4;
@@ -68,7 +68,7 @@ fn decode_full(mod_bytes: Vec<u8>, max_frames: usize) -> Vec<i16> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
                 if pcm.len() / 2 >= max_frames {
@@ -115,7 +115,7 @@ fn mod_with_note_produces_audible_output() {
     // least the left channel has energy. Right may legitimately be 0.
     let mut left_peak = 0i16;
     let mut right_peak = 0i16;
-    for pair in pcm.chunks_exact(2) {
+    for pair in pcm.as_chunks::<2>().0 {
         left_peak = left_peak.max(pair[0].abs());
         right_peak = right_peak.max(pair[1].abs());
     }
@@ -204,7 +204,7 @@ fn st26_module_decodes_through_public_registry_path() {
     let peak = pcm.iter().map(|&s| s.unsigned_abs() as u32).max().unwrap();
     assert!(peak > 500, "expected audible ST2.6 output, got peak {peak}");
     let mut left_peak = 0i16;
-    for pair in pcm.chunks_exact(2) {
+    for pair in pcm.as_chunks::<2>().0 {
         left_peak = left_peak.max(pair[0].abs());
     }
     assert!(

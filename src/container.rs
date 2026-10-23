@@ -531,10 +531,10 @@ fn build_it_metadata(h: &it::ItHeader, blob: &[u8], num_channels: u8) -> Vec<(St
     if !h.song_name.is_empty() {
         out.push(("title".into(), h.song_name.clone()));
     }
-    if let Some(msg) = it::extract_message(h, blob) {
-        if !msg.trim().is_empty() {
-            out.push(("comment".into(), msg));
-        }
+    if let Some(msg) = it::extract_message(h, blob)
+        && !msg.trim().is_empty()
+    {
+        out.push(("comment".into(), msg));
     }
     let (maj, min) = h.created_with_version();
     out.push((
@@ -545,10 +545,10 @@ fn build_it_metadata(h: &it::ItHeader, blob: &[u8], num_channels: u8) -> Vec<(St
         ),
     ));
     for &off in &h.sample_offsets {
-        if let Ok(s) = it::parse_sample_header(blob, off as usize) {
-            if !s.name.is_empty() {
-                out.push(("sample".into(), s.name));
-            }
+        if let Ok(s) = it::parse_sample_header(blob, off as usize)
+            && !s.name.is_empty()
+        {
+            out.push(("sample".into(), s.name));
         }
     }
     out.push((
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn it_probe_and_metadata() {
-        use crate::it_writer::{square_sample, ItWriter, ItWriterPattern};
+        use crate::it_writer::{ItWriter, ItWriterPattern, square_sample};
         let mut w = ItWriter {
             song_name: "probe me".into(),
             message: Some("msg".into()),
@@ -656,9 +656,10 @@ mod tests {
         assert!(md.iter().any(|(k, v)| k == "title" && v == "probe me"));
         assert!(md.iter().any(|(k, v)| k == "comment" && v == "msg"));
         assert!(md.iter().any(|(k, v)| k == "sample" && v == "square"));
-        assert!(md
-            .iter()
-            .any(|(k, v)| k == "extra_info" && v.starts_with("4 channels, 1 patterns")));
+        assert!(
+            md.iter()
+                .any(|(k, v)| k == "extra_info" && v.starts_with("4 channels, 1 patterns"))
+        );
         // 16 rows × 6 × 2.5/125 = 1.92 s.
         assert_eq!(dm.duration_micros(), Some(1_920_000));
     }

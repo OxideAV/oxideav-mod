@@ -23,7 +23,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 use crate::container::OUTPUT_SAMPLE_RATE;
 use crate::header::parse_header;
 use crate::it_player::ItPlayerState;
-use crate::player::{parse_patterns, PlayerState};
+use crate::player::{PlayerState, parse_patterns};
 use crate::samples::extract_samples;
 use crate::stm_player::StmPlayerState;
 use crate::xm_player::XmPlayerState;
@@ -610,7 +610,7 @@ mod tests {
                     total_samples += a.samples as u64;
                     // Count non-zero bytes in the PCM plane.
                     let plane = &a.data[0];
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                         if s != 0 {
                             total_nonzero += 1;
@@ -654,7 +654,7 @@ mod tests {
                         assert_eq!(plane.len(), expected_plane_len);
                     }
                     for (idx, plane) in a.data.iter().enumerate() {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                             if s != 0 {
                                 if idx == 0 {
@@ -711,7 +711,7 @@ mod tests {
                         a.samples as usize * 4,
                         "S16 stereo: 4 bytes per sample"
                     );
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                         if s != 0 {
                             total_nonzero += 1;
@@ -832,7 +832,7 @@ mod tests {
                         a.samples as usize * 4,
                         "S16 stereo: 4 bytes per sample"
                     );
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                         if s != 0 {
                             total_nonzero += 1;
@@ -877,7 +877,7 @@ mod tests {
                     total_samples += a.samples as u64;
                     let plane = &a.data[0];
                     assert_eq!(plane.len(), a.samples as usize * 4);
-                    for chunk in plane.chunks_exact(2) {
+                    for chunk in plane.as_chunks::<2>().0 {
                         if i16::from_le_bytes([chunk[0], chunk[1]]) != 0 {
                             total_nonzero += 1;
                         }

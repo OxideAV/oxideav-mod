@@ -180,11 +180,7 @@ impl MixerVoice {
         // the partner clamps to the buffer end.
         let looping = !matches!(kind, LoopKind::None) && loop_end > loop_start;
         let s1_idx = if looping {
-            if i + 1 < loop_end {
-                i + 1
-            } else {
-                loop_start
-            }
+            if i + 1 < loop_end { i + 1 } else { loop_start }
         } else if i + 1 < len {
             i + 1
         } else {
@@ -438,11 +434,7 @@ impl PitchModel for XmPitch {
         match self.table {
             XmPitchTable::Amiga => {
                 let p = Self::amiga_period(real_note, finetune);
-                if p <= 0.0 {
-                    0.0
-                } else {
-                    8363.0 * 1712.0 / p
-                }
+                if p <= 0.0 { 0.0 } else { 8363.0 * 1712.0 / p }
             }
             XmPitchTable::Linear => {
                 let p = Self::linear_period(real_note, finetune);
@@ -607,7 +599,7 @@ mod tests {
         };
         let mut v = MixerVoice::default();
         v.trigger(44100.0, 1.0); // one sample-unit per render
-                                 // Render past the end.
+        // Render past the end.
         for _ in 0..10 {
             v.render_one(&src, 44100.0);
         }

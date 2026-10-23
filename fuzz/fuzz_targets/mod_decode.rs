@@ -79,7 +79,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_mod::header::parse_header;
-use oxideav_mod::player::{parse_patterns, PlayerState};
+use oxideav_mod::player::{PlayerState, parse_patterns};
 use oxideav_mod::samples::extract_samples;
 
 /// Render budget per fuzz iteration. 2048 frames stereo = ~46 ms at

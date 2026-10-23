@@ -189,11 +189,11 @@ fn rms(buf: &[i16]) -> f64 {
 }
 
 fn left(buf: &[i16]) -> Vec<i16> {
-    buf.chunks_exact(2).map(|c| c[0]).collect()
+    buf.as_chunks::<2>().0.iter().map(|c| c[0]).collect()
 }
 
 fn right(buf: &[i16]) -> Vec<i16> {
-    buf.chunks_exact(2).map(|c| c[1]).collect()
+    buf.as_chunks::<2>().0.iter().map(|c| c[1]).collect()
 }
 
 // ---------------- Arpeggio ----------------

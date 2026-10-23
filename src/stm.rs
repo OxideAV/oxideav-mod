@@ -601,7 +601,7 @@ mod tests {
         // silence rather than erroring or panicking.
         let mut bytes = build_minimal_stm(1);
         bytes[0x1D] = 1; // song
-                         // Drop the sample bodies: a song file ends after the patterns.
+        // Drop the sample bodies: a song file ends after the patterns.
         bytes.truncate(PATTERN_DATA_OFFSET + BYTES_PER_PATTERN);
         assert!(is_stm(&bytes), "type-1 song files are valid STM");
         let h = parse_header(&bytes).unwrap();

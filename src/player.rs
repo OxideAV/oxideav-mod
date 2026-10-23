@@ -1728,11 +1728,7 @@ impl PlayerState {
         // downward saw carry its own monotonic sign across the cycle.
         let value = lfo_waveform(ch.vib_wave.shape, ch.vib_pos);
         let delta = ((value.unsigned_abs() * depth as u32) >> 7) as i16;
-        if value < 0 {
-            -delta
-        } else {
-            delta
-        }
+        if value < 0 { -delta } else { delta }
     }
 
     /// Compute the instantaneous tremolo volume offset for this channel.
@@ -1746,11 +1742,7 @@ impl PlayerState {
         // volume units. Sign is carried by the waveform value.
         let value = lfo_waveform(ch.trem_wave.shape, ch.trem_pos);
         let delta = ((value.unsigned_abs() * depth as u32) >> 6) as i16;
-        if value < 0 {
-            -delta
-        } else {
-            delta
-        }
+        if value < 0 { -delta } else { delta }
     }
 
     /// Sample all channels once, returning per-channel floats in
@@ -1871,7 +1863,7 @@ impl PlayerState {
     /// length = n_frames * 2). Returns samples actually rendered (may be
     /// less than requested if song ends).
     pub fn render(&mut self, dst: &mut [i16]) -> usize {
-        assert!(dst.len() % 2 == 0);
+        assert!(dst.len().is_multiple_of(2));
         let mut produced = 0usize;
         let total_frames = dst.len() / 2;
 
@@ -2325,44 +2317,44 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
     let y = param & 0x0F;
 
     // EDx (note delay): when we reach the stored tick, trigger the note.
-    if let Some(delayed) = ch.delay {
-        if tick == delayed.tick {
-            if delayed.sample != 0 {
-                let idx = delayed.sample as usize;
-                ch.sample_index = delayed.sample;
-                if idx >= 1 && idx <= samples.len() {
-                    let body = &samples[idx - 1];
-                    ch.volume = body.volume;
-                    ch.finetune = body.finetune;
-                }
-            } else if ch.pending_sample != 0 {
-                // Consume any deferred sample swap from a previous row.
-                ch.sample_index = ch.pending_sample;
+    if let Some(delayed) = ch.delay
+        && tick == delayed.tick
+    {
+        if delayed.sample != 0 {
+            let idx = delayed.sample as usize;
+            ch.sample_index = delayed.sample;
+            if idx >= 1 && idx <= samples.len() {
+                let body = &samples[idx - 1];
+                ch.volume = body.volume;
+                ch.finetune = body.finetune;
             }
-            ch.pending_sample = 0;
-            // Resolve the delayed note's period through the channel's current
-            // finetune (loaded above from the sample header), exactly like a
-            // tick-0 trigger — a delayed note is still a note-on and must
-            // honour the instrument's finetune (`Protracker-effects-MODFIL12.txt`
-            // §3.3). The stored `delayed.period` is the finetune-0 cell value.
-            ch.period = match note_index_for_period(delayed.period) {
-                Some(note_idx) => PERIOD_TABLE[finetune_row(ch.finetune)][note_idx],
-                None => delayed.period,
-            };
-            ch.sample_pos = 0.0;
-            ch.active = true;
-            ch.arp_base_period = ch.period;
-            // Per-trigger ramp on the EDx delayed retrigger.
-            ch.ramp_prev_sample = ch.last_mixed_sample;
-            ch.ramp_remaining_frames = PlayerState::RAMP_FRAMES;
-            if !ch.vib_wave.no_retrigger {
-                ch.vib_pos = 0;
-            }
-            if !ch.trem_wave.no_retrigger {
-                ch.trem_pos = 0;
-            }
-            ch.delay = None;
+        } else if ch.pending_sample != 0 {
+            // Consume any deferred sample swap from a previous row.
+            ch.sample_index = ch.pending_sample;
         }
+        ch.pending_sample = 0;
+        // Resolve the delayed note's period through the channel's current
+        // finetune (loaded above from the sample header), exactly like a
+        // tick-0 trigger — a delayed note is still a note-on and must
+        // honour the instrument's finetune (`Protracker-effects-MODFIL12.txt`
+        // §3.3). The stored `delayed.period` is the finetune-0 cell value.
+        ch.period = match note_index_for_period(delayed.period) {
+            Some(note_idx) => PERIOD_TABLE[finetune_row(ch.finetune)][note_idx],
+            None => delayed.period,
+        };
+        ch.sample_pos = 0.0;
+        ch.active = true;
+        ch.arp_base_period = ch.period;
+        // Per-trigger ramp on the EDx delayed retrigger.
+        ch.ramp_prev_sample = ch.last_mixed_sample;
+        ch.ramp_remaining_frames = PlayerState::RAMP_FRAMES;
+        if !ch.vib_wave.no_retrigger {
+            ch.vib_pos = 0;
+        }
+        if !ch.trem_wave.no_retrigger {
+            ch.trem_pos = 0;
+        }
+        ch.delay = None;
     }
 
     // ECx: cut — zeros the volume at the specified tick.
@@ -2371,7 +2363,7 @@ fn apply_tickn_effect(ch_idx: usize, tick: u8, channels: &mut [Channel], samples
     }
 
     // E9x: retrig every `retrig_ticks` ticks (non-zero).
-    if effect == 0xE && x == 0x9 && ch.retrig_ticks != 0 && tick % ch.retrig_ticks == 0 {
+    if effect == 0xE && x == 0x9 && ch.retrig_ticks != 0 && tick.is_multiple_of(ch.retrig_ticks) {
         ch.sample_pos = 0.0;
         ch.active = true;
         // Per-trigger ramp on the E9x periodic retrigger.
@@ -2652,11 +2644,7 @@ fn lfo_waveform(shape: u8, pos: i8) -> i32 {
         _ => {
             let idx = (pos.unsigned_abs() & 31) as usize;
             let mag = PROTRACKER_SINE_TABLE[idx] as i32;
-            if pos < 0 {
-                -mag
-            } else {
-                mag
-            }
+            if pos < 0 { -mag } else { mag }
         }
     }
 }
@@ -6785,12 +6773,16 @@ pub mod tests {
         let produced = player.render(&mut buf);
         assert!(produced > 0, "must render some samples");
         let peak_l = buf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| c[0].unsigned_abs() as u32)
             .max()
             .unwrap_or(0);
         let peak_r = buf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| c[1].unsigned_abs() as u32)
             .max()
             .unwrap_or(0);
@@ -6852,16 +6844,20 @@ pub mod tests {
             !n.has_sample(),
             "period/effect must not influence has_sample"
         );
-        assert!(Note {
-            sample: 1,
-            ..Default::default()
-        }
-        .has_sample());
-        assert!(Note {
-            sample: 31,
-            ..Default::default()
-        }
-        .has_sample());
+        assert!(
+            Note {
+                sample: 1,
+                ..Default::default()
+            }
+            .has_sample()
+        );
+        assert!(
+            Note {
+                sample: 31,
+                ..Default::default()
+            }
+            .has_sample()
+        );
     }
 
     #[test]
@@ -6893,21 +6889,27 @@ pub mod tests {
         assert!(Note::default().is_empty());
 
         // Any one non-zero field flips it back.
-        assert!(!Note {
-            period: 1,
-            ..Default::default()
-        }
-        .is_empty());
-        assert!(!Note {
-            sample: 1,
-            ..Default::default()
-        }
-        .is_empty());
-        assert!(!Note {
-            effect: 1,
-            ..Default::default()
-        }
-        .is_empty());
+        assert!(
+            !Note {
+                period: 1,
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !Note {
+                sample: 1,
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !Note {
+                effect: 1,
+                ..Default::default()
+            }
+            .is_empty()
+        );
         assert!(
             !Note {
                 effect_param: 1,
@@ -7205,7 +7207,7 @@ pub mod tests {
 
     #[test]
     fn ust_samples_per_tick_tracks_nondefault_byte() {
-        use crate::header::{parse_ust_header, UST_BPM_OFFSET};
+        use crate::header::{UST_BPM_OFFSET, parse_ust_header};
         let mut bytes = synth_ust_mod(&[]);
         // Faster tempo: 0xC8 = 200 BPM → ~146.72 Hz → 44100/146.72 ≈ 300.
         bytes[UST_BPM_OFFSET] = 0xC8;
