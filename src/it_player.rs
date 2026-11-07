@@ -233,6 +233,7 @@ pub const IT_MAX_VOICES: usize = 256;
 
 /// Per-voice playback cursor over one [`ItEnvelope`].
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct EnvState {
     /// Current tick position.
     pub tick: u16,
@@ -286,6 +287,7 @@ impl EnvState {
 
 /// One virtual channel: a sounding note over the shared mixer voice.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ItVoice {
     pub active: bool,
     /// No longer controlled by its host channel (NNA continue / off /
@@ -340,6 +342,7 @@ pub struct ItVoice {
 
 /// Per-host-channel effect state.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ItChannel {
     /// Index of the foreground voice.
     pub voice: Option<usize>,
@@ -446,6 +449,7 @@ impl ItChannel {
 // ============================================================================
 
 /// Top-level Impulse Tracker player state.
+#[non_exhaustive]
 pub struct ItPlayerState {
     pub module: ItModule,
     pub sample_rate: u32,

@@ -10,6 +10,7 @@ use crate::header::ModHeader;
 
 /// Per-sample decoded body plus the loop metadata needed by the mixer.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SampleBody {
     /// Raw signed 8-bit PCM. Empty if the header declared zero length.
     pub pcm: Vec<i8>,

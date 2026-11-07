@@ -96,6 +96,7 @@ pub fn is_st26_magic(bytes: &[u8]) -> bool {
 /// [`ModHeader::sample_data_offset`] and the variant-aware effect
 /// translation in `player::parse_patterns`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModVariant {
     /// The 31-sample ProTracker / SoundTracker-2.x family (signature at +1080).
     Standard31,
@@ -119,6 +120,7 @@ pub enum ModVariant {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Sample {
     pub name: String,
     /// Sample length in *samples* (spec stores words — we've doubled).
@@ -174,6 +176,7 @@ impl Sample {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ModHeader {
     pub title: String,
     pub samples: Vec<Sample>,

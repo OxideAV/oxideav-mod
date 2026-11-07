@@ -486,6 +486,7 @@ impl Waveform {
 
 /// Per-channel playback state.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct Channel {
     /// 1-based sample index (0 = no sample ever triggered).
     pub sample_index: u8,
@@ -620,6 +621,7 @@ pub struct Channel {
 /// Stores the note/sample/effect details of an EDy-delayed trigger so we
 /// can fire it at the requested tick inside the same row.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct DelayedTrigger {
     pub tick: u8,
     pub period: u16,
@@ -799,6 +801,7 @@ struct Jump {
 /// Top-level player state. Owns samples, patterns, order, and the
 /// per-channel mixer. Feeds `render(dst)` to fill an interleaved stereo
 /// S16 buffer.
+#[non_exhaustive]
 pub struct PlayerState {
     pub samples: Vec<SampleBody>,
     pub patterns: Vec<Pattern>,

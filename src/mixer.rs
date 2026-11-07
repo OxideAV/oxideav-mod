@@ -95,6 +95,7 @@ pub trait PitchModel {
 /// slab on `PlayerState`, typically) and address them by index while the
 /// voice only tracks the *current* index.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct MixerVoice {
     /// Fractional sample cursor into the source.
     pub pos: f32,

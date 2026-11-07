@@ -188,6 +188,7 @@ fn ft2_lfo(shape: u8, pos: u8) -> i32 {
 }
 
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct XmChannel {
     /// 1-based instrument index (0 = none).
     pub instrument: u8,
@@ -396,6 +397,7 @@ pub struct XmChannel {
 }
 
 /// Top-level XM player state.
+#[non_exhaustive]
 pub struct XmPlayerState {
     pub instruments: Vec<XmInstrument>,
     pub patterns: Vec<XmPattern>,

@@ -102,6 +102,7 @@ pub enum XmFrequencyTable {
 /// Top-level XM header fields (everything reachable without walking
 /// patterns / instruments).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct XmHeader {
     pub module_name: String,
     pub tracker_name: String,
@@ -124,6 +125,7 @@ pub struct XmHeader {
 
 /// One pattern header + its decoded row data.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct XmPattern {
     pub header_length: u32,
     /// Packing type; the spec says "always 0".
@@ -217,6 +219,7 @@ impl XmCell {
 
 /// Envelope shape — up to 12 points, each `(x_tick, y_value 0..=64)`.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct XmEnvelope {
     pub points: Vec<(u16, u16)>,
     pub sustain_point: u8,
@@ -303,6 +306,7 @@ impl crate::mixer::SampleSource for XmSampleHeader {
 /// Decoded sample header (40 bytes + variable-length PCM body following
 /// all sample headers of the instrument).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct XmSampleHeader {
     pub name: String,
     /// Sample length **in bytes** (not frames). For 16-bit samples the
@@ -469,6 +473,7 @@ impl XmSampleHeader {
 /// sample headers. Sample PCM bodies are attached by
 /// [`extract_sample_bodies`].
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct XmInstrument {
     pub name: String,
     /// Size of the instrument header block this record came from

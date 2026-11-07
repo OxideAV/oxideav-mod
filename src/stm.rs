@@ -87,6 +87,7 @@ impl From<u8> for StmFileType {
 
 /// Decoded STM instrument record (pre-sample-extraction).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct StmInstrument {
     pub name: String,
     /// "Instrument disk" — legacy field, kept for fidelity.
@@ -107,6 +108,7 @@ pub struct StmInstrument {
 
 /// Top-level STM header.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct StmHeader {
     pub title: String,
     pub tracker_name: String,
@@ -163,6 +165,7 @@ pub enum StmNoteKind {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct StmPattern {
     /// `rows[row_index][channel_index]`.
     pub rows: Vec<Vec<StmCell>>,
@@ -170,6 +173,7 @@ pub struct StmPattern {
 
 /// Per-instrument sample body after extraction.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct StmSampleBody {
     /// Raw signed 8-bit PCM. Empty if the instrument has no samples or
     /// the file was truncated.

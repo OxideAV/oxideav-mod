@@ -104,6 +104,7 @@ pub const IT_PAN_DISABLED: u8 = 128;
 
 /// Parsed `IMPM` header (everything before the instrument headers).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ItHeader {
     /// Song name (26 bytes, NUL-trimmed).
     pub song_name: String,
@@ -418,6 +419,7 @@ impl ItVibratoWave {
 
 /// One `IMPS` sample header plus its decoded body.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ItSample {
     /// DOS filename (12 bytes).
     pub filename: String,
@@ -846,6 +848,7 @@ pub const IT_ENV_SUSTAIN_LOOP: u8 = 1 << 2;
 /// model. Old-format volume envelopes are converted into this model at
 /// parse time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ItEnvelope {
     /// Raw `Flg` byte — see `IT_ENV_*`.
     pub flags: u8,
@@ -899,6 +902,7 @@ impl ItEnvelope {
 
 /// One `IMPI` instrument, either layout.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ItInstrument {
     /// DOS filename (12 bytes).
     pub filename: String,
@@ -1268,6 +1272,7 @@ impl ItCell {
 
 /// One unpacked pattern.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ItPattern {
     /// `Rows` from the pattern header (or 64 for an absent pattern).
     pub num_rows: u16,
@@ -1450,6 +1455,7 @@ pub fn parse_patterns(header: &ItHeader, bytes: &[u8]) -> Vec<ItPattern> {
 
 /// Everything the player needs, parsed in one call.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ItModule {
     pub header: ItHeader,
     pub message: Option<String>,

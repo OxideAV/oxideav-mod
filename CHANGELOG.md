@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the `ModVariant` enum; the parsed module records `ModHeader`, `Sample`, `SampleBody`, `ItHeader`, `ItSample`, `ItInstrument`, `ItEnvelope`, `ItPattern`, `ItModule`, `StmHeader`, `StmInstrument`, `StmPattern`, `StmSampleBody`, `XmHeader`, `XmPattern`, `XmEnvelope`, `XmSampleHeader` and `XmInstrument`; the player-state records `PlayerState`, `Channel`, `DelayedTrigger`, `StmPlayerState`, `StmChannel`, `XmPlayerState`, `XmChannel`, `ItPlayerState`, `ItChannel`, `ItVoice`, `EnvState` and `MixerVoice`. All are produced by the parsers / players; their fields stay readable and assignable. The format-fixed enums (IT NNA / DCT / DCA / vibrato waveform / volume column, XM volume column / loop mode / frequency table, STM file type / note kind, `LoopKind`, `XmPitchTable`) and the pattern-cell / pitch-model value types (`Note`, `ItCell`, `XmCell`, `StmCell`, `Pattern`, `Waveform`, `AmigaPeriodPitch`, `StmC3Pitch`, `XmPitch`, `ItLoopView`) are unchanged.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-mod/compare/v0.0.10...v0.0.11) - 2026-10-23
 
 ### Other

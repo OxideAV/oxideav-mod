@@ -99,6 +99,7 @@ fn semis_to_freq(c3_hz: f32, semis_from_c0: f32) -> f32 {
 
 /// Per-channel playback state for STM.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct StmChannel {
     /// Currently-loaded instrument index (1..=31, 0 = none).
     pub instrument: u8,
@@ -225,6 +226,7 @@ pub struct StmChannel {
 
 /// STM player — owns decoded patterns / samples and a
 /// row/tick/BPM-style state machine.
+#[non_exhaustive]
 pub struct StmPlayerState {
     pub samples: Vec<StmSampleBody>,
     pub patterns: Vec<StmPattern>,
