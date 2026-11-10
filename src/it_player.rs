@@ -522,6 +522,11 @@ pub struct ItPlayerState {
     /// tracker.
     pub stop_on_repeat: bool,
     pass: crate::pass::PassTracker,
+    /// Run the row / tick engine without mixing: `render` then only
+    /// counts frames (the destination buffer is left untouched). Used
+    /// to measure a pass.
+    #[doc(hidden)]
+    pub dry_run: bool,
     pub pending_order_jump: Option<usize>,
     pub pending_break_row: Option<u16>,
     /// `SEx` row repeats remaining.
@@ -588,6 +593,7 @@ impl ItPlayerState {
             tick_sample_cursor: 0,
             ended: false,
             loops: 0,
+            dry_run: false,
             stop_on_repeat: true,
             pass,
             pending_order_jump: None,
@@ -2100,73 +2106,75 @@ impl ItPlayerState {
             let remaining = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining as usize);
 
-            // Voice state (sample, sustain, amplitude, pan) only changes
-            // in `advance_tick`, so resolve it once per tick block and
-            // walk only the sounding voices per frame. The per-voice
-            // arithmetic and the summation order are unchanged, so the
-            // output is byte-identical to the per-frame form.
-            let mut slots: Vec<(usize, f32, ItFrozenView<'_>, Option<VoiceBlock>)> = Vec::new();
-            for (idx, v) in self.voices.iter_mut().enumerate() {
-                if !v.active {
-                    continue;
-                }
-                v.filter = filter_coefficients(v.cutoff, v.resonance, out_rate);
-                let Some(sample) = self.module.samples.get(v.sample as usize - 1) else {
-                    v.active = false;
-                    continue;
-                };
-                let pan = if v.final_pan == IT_PAN_SURROUND {
-                    32
-                } else {
-                    32 + (v.final_pan as i32 - 32) * sep / 128
-                };
-                let pf = pan.clamp(0, 64) as f32 / 64.0;
-                let view = ItLoopView {
-                    sample,
-                    sustain: !v.released,
-                }
-                .frozen();
-                // Loop bounds and the position step are fixed for the
-                // block as well.
-                let block = v.mixer.resolve_block(&view, out_rate);
-                slots.push((idx, pf, view, block));
-            }
-            // Frame-major on purpose: a filtered voice is a serial
-            // recurrence (each output needs the previous two), and
-            // interleaving the voices lets those chains overlap — a
-            // voice-major loop measured slower on filter-heavy songs.
-            for frame in dst[produced * 2..(produced + want) * 2]
-                .as_chunks_mut::<2>()
-                .0
-            {
-                let mut l = 0.0f32;
-                let mut r = 0.0f32;
-                for (idx, pf, view, block) in &slots {
-                    let v = &mut self.voices[*idx];
+            if !self.dry_run {
+                // Voice state (sample, sustain, amplitude, pan) only changes
+                // in `advance_tick`, so resolve it once per tick block and
+                // walk only the sounding voices per frame. The per-voice
+                // arithmetic and the summation order are unchanged, so the
+                // output is byte-identical to the per-frame form.
+                let mut slots: Vec<(usize, f32, ItFrozenView<'_>, Option<VoiceBlock>)> = Vec::new();
+                for (idx, v) in self.voices.iter_mut().enumerate() {
                     if !v.active {
                         continue;
                     }
-                    let mut s = match block {
-                        Some(block) => v.mixer.render_resolved(view, block),
-                        None => 0.0,
-                    };
-                    if let Some([a, b, c]) = v.filter {
-                        // K[n] = a·S[n] + b·K[n-1] + c·K[n-2]
-                        let k = a * s + b * v.filter_k[0] + c * v.filter_k[1];
-                        v.filter_k = [k, v.filter_k[0]];
-                        s = k;
-                    }
-                    let s = s * v.amp;
-                    if !v.mixer.active {
+                    v.filter = filter_coefficients(v.cutoff, v.resonance, out_rate);
+                    let Some(sample) = self.module.samples.get(v.sample as usize - 1) else {
                         v.active = false;
+                        continue;
+                    };
+                    let pan = if v.final_pan == IT_PAN_SURROUND {
+                        32
+                    } else {
+                        32 + (v.final_pan as i32 - 32) * sep / 128
+                    };
+                    let pf = pan.clamp(0, 64) as f32 / 64.0;
+                    let view = ItLoopView {
+                        sample,
+                        sustain: !v.released,
                     }
-                    l += s * (1.0 - *pf);
-                    r += s * *pf;
+                    .frozen();
+                    // Loop bounds and the position step are fixed for the
+                    // block as well.
+                    let block = v.mixer.resolve_block(&view, out_rate);
+                    slots.push((idx, pf, view, block));
                 }
-                let l = (l * mix_vol).clamp(-1.0, 1.0);
-                let r = (r * mix_vol).clamp(-1.0, 1.0);
-                frame[0] = (l * 32767.0) as i16;
-                frame[1] = (r * 32767.0) as i16;
+                // Frame-major on purpose: a filtered voice is a serial
+                // recurrence (each output needs the previous two), and
+                // interleaving the voices lets those chains overlap — a
+                // voice-major loop measured slower on filter-heavy songs.
+                for frame in dst[produced * 2..(produced + want) * 2]
+                    .as_chunks_mut::<2>()
+                    .0
+                {
+                    let mut l = 0.0f32;
+                    let mut r = 0.0f32;
+                    for (idx, pf, view, block) in &slots {
+                        let v = &mut self.voices[*idx];
+                        if !v.active {
+                            continue;
+                        }
+                        let mut s = match block {
+                            Some(block) => v.mixer.render_resolved(view, block),
+                            None => 0.0,
+                        };
+                        if let Some([a, b, c]) = v.filter {
+                            // K[n] = a·S[n] + b·K[n-1] + c·K[n-2]
+                            let k = a * s + b * v.filter_k[0] + c * v.filter_k[1];
+                            v.filter_k = [k, v.filter_k[0]];
+                            s = k;
+                        }
+                        let s = s * v.amp;
+                        if !v.mixer.active {
+                            v.active = false;
+                        }
+                        l += s * (1.0 - *pf);
+                        r += s * *pf;
+                    }
+                    let l = (l * mix_vol).clamp(-1.0, 1.0);
+                    let r = (r * mix_vol).clamp(-1.0, 1.0);
+                    frame[0] = (l * 32767.0) as i16;
+                    frame[1] = (r * 32767.0) as i16;
+                }
             }
             produced += want;
 

@@ -108,7 +108,19 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     // change tempo via Fxx effects so this is typically a loose upper
     // bound; a true value needs a full playback simulation. Formula:
     //   song_length * 64 rows * 6 ticks / 50 tps.
-    let duration_micros: i64 = (header.song_length as i64).saturating_mul(64 * 6 * 1_000_000) / 50;
+    let estimate: i64 = (header.song_length as i64).saturating_mul(64 * 6 * 1_000_000) / 50;
+    // Preferred: the exact length of one pass, from running the engine
+    // without mixing (speed / tempo changes, jumps, breaks, loops and
+    // delays all followed). The estimate above is the fallback for a
+    // pass too long to walk.
+    let duration_micros = {
+        let patterns = crate::player::parse_patterns(&header, &blob);
+        let samples = crate::samples::extract_samples(&header, &blob);
+        let mut player =
+            crate::player::PlayerState::new(&header, samples, patterns, OUTPUT_SAMPLE_RATE);
+        player.dry_run = true;
+        pass_duration_micros(|buf| player.render(buf)).unwrap_or(estimate)
+    };
 
     Ok(Box::new(ModDemuxer {
         streams: vec![stream],
@@ -198,6 +210,34 @@ impl Demuxer for ModDemuxer {
     }
 }
 
+/// Length of one pass in microseconds, measured by driving a player in
+/// its mix-free mode until it reports the song over. `None` when the
+/// pass is empty or longer than [`MAX_MEASURED_PASS_SECONDS`] (the
+/// caller then falls back to its header-based estimate).
+fn pass_duration_micros(mut render: impl FnMut(&mut [i16]) -> usize) -> Option<i64> {
+    let cap = MAX_MEASURED_PASS_SECONDS * OUTPUT_SAMPLE_RATE as u64;
+    // Large enough to take a whole tick per call at any tempo.
+    let mut scratch = vec![0i16; 2 * 16_384];
+    let mut frames = 0u64;
+    loop {
+        let n = render(&mut scratch);
+        if n == 0 {
+            break;
+        }
+        frames += n as u64;
+        if frames > cap {
+            return None;
+        }
+    }
+    if frames == 0 {
+        return None;
+    }
+    Some((frames as i128 * 1_000_000 / OUTPUT_SAMPLE_RATE as i128) as i64)
+}
+
+/// Longest pass the demuxers measure exactly (four hours of audio).
+const MAX_MEASURED_PASS_SECONDS: u64 = 4 * 3600;
+
 /// Scream Tracker 2 probe: the only rock-solid byte-level signature is
 /// `0x1A` at offset `0x1C` combined with a plausible file-type byte
 /// (1 = song, 2 = module) at `0x1D`. The tracker-name field at
@@ -251,7 +291,15 @@ fn open_stm(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     };
 
     let metadata = build_stm_metadata(&header);
-    let duration_micros = stm::estimate_duration_micros(&header);
+    let duration_micros = {
+        let patterns = stm::parse_patterns(&header, &blob);
+        let samples = stm::extract_samples(&header, &blob);
+        let mut player =
+            crate::stm_player::StmPlayerState::new(&header, samples, patterns, OUTPUT_SAMPLE_RATE);
+        player.dry_run = true;
+        pass_duration_micros(|buf| player.render(buf))
+            .unwrap_or_else(|| stm::estimate_duration_micros(&header))
+    };
 
     Ok(Box::new(StmDemuxer {
         streams: vec![stream],
@@ -390,7 +438,23 @@ fn open_xm(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<
     // get row counts. If pattern parsing hiccups we just leave the
     // duration unset rather than error out of container open.
     let duration_micros = match xm::parse_patterns(&header, &blob) {
-        Ok((pats, _)) => xm::estimate_duration_micros(&header, &pats),
+        Ok((pats, after)) => {
+            let estimate = xm::estimate_duration_micros(&header, &pats);
+            // Exact one-pass length when the instruments parse too.
+            match xm::parse_instruments(&header, &blob, after) {
+                Ok(instruments) => {
+                    let mut player = crate::xm_player::XmPlayerState::new(
+                        &header,
+                        instruments,
+                        pats,
+                        OUTPUT_SAMPLE_RATE,
+                    );
+                    player.dry_run = true;
+                    pass_duration_micros(|buf| player.render(buf)).unwrap_or(estimate)
+                }
+                Err(_) => estimate,
+            }
+        }
         Err(_) => 0,
     };
 
@@ -518,7 +582,15 @@ fn open_it(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<
     };
 
     let patterns = it::parse_patterns(&header, &blob);
-    let duration_micros = it::estimate_duration_micros(&header, &patterns);
+    let estimate = it::estimate_duration_micros(&header, &patterns);
+    // Exact one-pass length from a mix-free run of the engine (sample
+    // bodies are not needed for the flow, so they are not decoded).
+    let duration_micros = {
+        let module = it::ItModule::for_flow(header.clone(), patterns.clone());
+        let mut player = crate::it_player::ItPlayerState::new(module, OUTPUT_SAMPLE_RATE);
+        player.dry_run = true;
+        pass_duration_micros(|buf| player.render(buf)).unwrap_or(estimate)
+    };
     let num_channels = patterns
         .iter()
         .map(|p| p.num_channels)

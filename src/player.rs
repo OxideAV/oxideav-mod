@@ -1012,6 +1012,11 @@ pub struct PlayerState {
     /// Clear it to follow ProTracker and loop forever.
     pub stop_on_repeat: bool,
     pass: crate::pass::PassTracker,
+    /// Run the row / tick engine without mixing: `render` then only
+    /// counts frames (the destination buffer is left untouched). Used
+    /// to measure a pass.
+    #[doc(hidden)]
+    pub dry_run: bool,
 
     /// EEx pattern-delay: rows to repeat after the current one completes.
     pattern_delay: u8,
@@ -1139,6 +1144,7 @@ impl PlayerState {
             restart_order: header.restart_position().unwrap_or(0),
             loop_rows: vec![0; n_ch],
             loop_counts: vec![0; n_ch],
+            dry_run: false,
             stop_on_repeat: true,
             pass: {
                 // The opening state (order 0, row 0, no loops armed).
@@ -2206,7 +2212,9 @@ impl PlayerState {
             let remaining_in_tick = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining_in_tick as usize);
 
-            self.mix_block(&mut dst[produced * 2..(produced + want) * 2], None);
+            if !self.dry_run {
+                self.mix_block(&mut dst[produced * 2..(produced + want) * 2], None);
+            }
             produced += want;
 
             self.tick_sample_cursor += want as u32;

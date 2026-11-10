@@ -1807,6 +1807,30 @@ pub fn parse_midi_macros(header: &ItHeader, bytes: &[u8]) -> ItMidiMacros {
     macros
 }
 
+impl ItModule {
+    /// A module carrying only what the order flow needs — header and
+    /// patterns, no instruments or sample bodies — for measuring a pass
+    /// without decoding audio.
+    #[doc(hidden)]
+    pub fn for_flow(header: ItHeader, patterns: Vec<ItPattern>) -> Self {
+        let num_channels = patterns
+            .iter()
+            .map(|p| p.num_channels)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        ItModule {
+            header,
+            midi_macros: ItMidiMacros::default(),
+            message: None,
+            instruments: Vec::new(),
+            samples: Vec::new(),
+            patterns,
+            num_channels,
+        }
+    }
+}
+
 /// Parse header, message, instruments, samples and patterns.
 pub fn parse_module(bytes: &[u8]) -> Result<ItModule> {
     let header = parse_header(bytes)?;

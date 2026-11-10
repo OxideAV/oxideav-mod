@@ -16,7 +16,12 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   never drift apart. Populates stream metadata (title, sample names, pattern /
   channel counts, plus a `restart_position` key when the +951 restart byte
   is live — see the restart-byte bullet under *Real-world MOD fidelity*)
-  and an upper-bound duration.
+  and the **exact duration of one pass**: all four demuxers (`mod`,
+  `stm`, `xm`, `it`) run their engine once without mixing at open time,
+  so speed / tempo changes, jumps, breaks, pattern loops and delays are
+  followed and the reported duration equals the frames the decoder
+  emits (`tests/duration_exact.rs`). A pass longer than four hours falls
+  back to the header-based estimate.
 - **Decoder**: parses the header, patterns, and raw signed-8-bit sample
   bodies; drives a `PlayerState` (rows → ticks, Paula periods, Protracker
   sine-table vibrato / tremolo, sample-offset, tone portamento, pattern

@@ -444,6 +444,11 @@ pub struct XmPlayerState {
     /// position; clear this to follow it.
     pub stop_on_repeat: bool,
     pass: crate::pass::PassTracker,
+    /// Run the row / tick engine without mixing: `render` then only
+    /// counts frames (the destination buffer is left untouched). Used
+    /// to measure a pass.
+    #[doc(hidden)]
+    pub dry_run: bool,
 
     // -------- round-19 song-level state --------
     /// Global volume 0..=64 (Gxy / Hxy). Multiplies all voice volumes.
@@ -506,6 +511,7 @@ impl XmPlayerState {
             break_row: 0,
             pending_break0: false,
             loops: 0,
+            dry_run: false,
             stop_on_repeat: true,
             pass: {
                 // The opening state: order 0, row 0, no start-row latch,
@@ -1664,79 +1670,81 @@ impl XmPlayerState {
             let remaining = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining as usize);
 
-            // Sample routing and panning only change in `advance_tick`,
-            // so resolve them once per tick block: `(channel, sample
-            // (instrument, index), right-share)` for every channel with
-            // a sample. The per-frame arithmetic and summation order are
-            // unchanged, so the output is byte-identical to the
-            // per-frame form.
-            self.render_slots.clear();
-            for (i, ch) in self.channels.iter().enumerate() {
-                if ch.instrument == 0 {
-                    continue;
-                }
-                let Some(inst) = self.instruments.get(ch.instrument as usize - 1) else {
-                    continue;
-                };
-                if inst.samples.get(ch.sample_in_instr as usize).is_none() {
-                    continue;
-                }
-                // XM's FinalPan formula:
-                //   FinalPan = Pan + (EnvelopePan - 32) *
-                //              (128 - |Pan - 128|) / 32
-                // EnvelopePan is 0..=64 (32 = centre). Pan is 0..=255.
-                let pan_base = ch.base_panning as i32;
-                let env_pan = ch.pan_env_value as i32; // 0..=64
-                let range = 128 - (pan_base - 128).abs();
-                let final_pan = pan_base + (env_pan - 32) * range / 32;
-                let final_pan = final_pan.clamp(0, 255) as f32 / 255.0;
-                // The voice's loop bounds and position step are fixed
-                // for the block too; a voice that cannot sound (empty
-                // sample, no frequency) contributes exactly zero and is
-                // left out.
-                let sample = &inst.samples[ch.sample_in_instr as usize];
-                let Some(block) = ch.voice.resolve_block(sample, out_rate) else {
-                    continue;
-                };
-                self.render_slots.push((
-                    i,
-                    ch.instrument as usize - 1,
-                    ch.sample_in_instr as usize,
-                    final_pan,
-                    block,
-                ));
-            }
-            // Voice-major mixing: each voice runs its whole block in a
-            // tight loop, adding into the per-frame accumulators. Every
-            // frame still receives its voices' contributions in slot
-            // order starting from zero (a voice that has fallen silent
-            // contributes exact zeros either way), so the PCM is
-            // bit-identical to a frame-major loop.
-            acc.clear();
-            acc.resize(want, [0.0f32; 2]);
-            for (i, inst_idx, smp_idx, final_pan, block) in &self.render_slots {
-                let sample = &self.instruments[*inst_idx].samples[*smp_idx];
-                let voice = &mut self.channels[*i].voice;
-                let (gl, gr) = (1.0 - final_pan, *final_pan);
-                for frame in acc.iter_mut() {
-                    if !voice.active {
-                        break;
+            if !self.dry_run {
+                // Sample routing and panning only change in `advance_tick`,
+                // so resolve them once per tick block: `(channel, sample
+                // (instrument, index), right-share)` for every channel with
+                // a sample. The per-frame arithmetic and summation order are
+                // unchanged, so the output is byte-identical to the
+                // per-frame form.
+                self.render_slots.clear();
+                for (i, ch) in self.channels.iter().enumerate() {
+                    if ch.instrument == 0 {
+                        continue;
                     }
-                    let s = voice.render_resolved(sample, block);
-                    frame[0] += s * gl;
-                    frame[1] += s * gr;
+                    let Some(inst) = self.instruments.get(ch.instrument as usize - 1) else {
+                        continue;
+                    };
+                    if inst.samples.get(ch.sample_in_instr as usize).is_none() {
+                        continue;
+                    }
+                    // XM's FinalPan formula:
+                    //   FinalPan = Pan + (EnvelopePan - 32) *
+                    //              (128 - |Pan - 128|) / 32
+                    // EnvelopePan is 0..=64 (32 = centre). Pan is 0..=255.
+                    let pan_base = ch.base_panning as i32;
+                    let env_pan = ch.pan_env_value as i32; // 0..=64
+                    let range = 128 - (pan_base - 128).abs();
+                    let final_pan = pan_base + (env_pan - 32) * range / 32;
+                    let final_pan = final_pan.clamp(0, 255) as f32 / 255.0;
+                    // The voice's loop bounds and position step are fixed
+                    // for the block too; a voice that cannot sound (empty
+                    // sample, no frequency) contributes exactly zero and is
+                    // left out.
+                    let sample = &inst.samples[ch.sample_in_instr as usize];
+                    let Some(block) = ch.voice.resolve_block(sample, out_rate) else {
+                        continue;
+                    };
+                    self.render_slots.push((
+                        i,
+                        ch.instrument as usize - 1,
+                        ch.sample_in_instr as usize,
+                        final_pan,
+                        block,
+                    ));
                 }
-            }
-            for (out, frame) in dst[produced * 2..(produced + want) * 2]
-                .as_chunks_mut::<2>()
-                .0
-                .iter_mut()
-                .zip(acc.iter())
-            {
-                let l = (frame[0] / headroom).clamp(-1.0, 1.0);
-                let r = (frame[1] / headroom).clamp(-1.0, 1.0);
-                out[0] = (l * 32767.0) as i16;
-                out[1] = (r * 32767.0) as i16;
+                // Voice-major mixing: each voice runs its whole block in a
+                // tight loop, adding into the per-frame accumulators. Every
+                // frame still receives its voices' contributions in slot
+                // order starting from zero (a voice that has fallen silent
+                // contributes exact zeros either way), so the PCM is
+                // bit-identical to a frame-major loop.
+                acc.clear();
+                acc.resize(want, [0.0f32; 2]);
+                for (i, inst_idx, smp_idx, final_pan, block) in &self.render_slots {
+                    let sample = &self.instruments[*inst_idx].samples[*smp_idx];
+                    let voice = &mut self.channels[*i].voice;
+                    let (gl, gr) = (1.0 - final_pan, *final_pan);
+                    for frame in acc.iter_mut() {
+                        if !voice.active {
+                            break;
+                        }
+                        let s = voice.render_resolved(sample, block);
+                        frame[0] += s * gl;
+                        frame[1] += s * gr;
+                    }
+                }
+                for (out, frame) in dst[produced * 2..(produced + want) * 2]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(acc.iter())
+                {
+                    let l = (frame[0] / headroom).clamp(-1.0, 1.0);
+                    let r = (frame[1] / headroom).clamp(-1.0, 1.0);
+                    out[0] = (l * 32767.0) as i16;
+                    out[1] = (r * 32767.0) as i16;
+                }
             }
             produced += want;
 

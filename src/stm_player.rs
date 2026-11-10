@@ -167,6 +167,11 @@ pub struct StmPlayerState {
     /// `Loop` counter).
     pub loops: u32,
     visited: Vec<bool>,
+    /// Run the row / tick engine without mixing: `render` then only
+    /// counts frames (the destination buffer is left untouched). Used
+    /// to measure a pass.
+    #[doc(hidden)]
+    pub dry_run: bool,
 }
 
 impl StmPlayerState {
@@ -199,6 +204,7 @@ impl StmPlayerState {
             stop_on_repeat: true,
             loops: 0,
             visited,
+            dry_run: false,
         };
         if !state.order_is_playable(0) {
             state.ended = true;
@@ -462,32 +468,34 @@ impl StmPlayerState {
             let remaining = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining as usize);
 
-            let block = &mut dst[produced * 2..(produced + want) * 2];
-            let samples = &self.samples;
-            // Resolve each channel's body, loop bounds and position
-            // step once per tick block.
-            let mut bodies: [Option<(&StmSampleBody, VoiceBlock)>; STM_CHANNELS] =
-                [None; STM_CHANNELS];
-            for (slot, ch) in bodies.iter_mut().zip(self.channels.iter()) {
-                if ch.voice.active {
-                    *slot = (ch.instrument as usize)
-                        .checked_sub(1)
-                        .and_then(|i| samples.get(i))
-                        .and_then(|body| Some((body, ch.voice.resolve_block(body, out_rate)?)));
-                }
-            }
-            for frame in block.as_chunks_mut::<2>().0 {
-                let mut mix = 0.0f32;
-                for (ch, body) in self.channels.iter_mut().zip(bodies.iter()) {
-                    if let Some((body, voice_block)) = body {
-                        mix += ch.voice.render_resolved(*body, voice_block);
+            if !self.dry_run {
+                let block = &mut dst[produced * 2..(produced + want) * 2];
+                let samples = &self.samples;
+                // Resolve each channel's body, loop bounds and position
+                // step once per tick block.
+                let mut bodies: [Option<(&StmSampleBody, VoiceBlock)>; STM_CHANNELS] =
+                    [None; STM_CHANNELS];
+                for (slot, ch) in bodies.iter_mut().zip(self.channels.iter()) {
+                    if ch.voice.active {
+                        *slot = (ch.instrument as usize)
+                            .checked_sub(1)
+                            .and_then(|i| samples.get(i))
+                            .and_then(|body| Some((body, ch.voice.resolve_block(body, out_rate)?)));
                     }
                 }
-                // Four channels into one output: divide by the channel
-                // count so a full-scale chord cannot clip.
-                let s = ((mix / STM_CHANNELS as f32).clamp(-1.0, 1.0) * 32767.0) as i16;
-                frame[0] = s;
-                frame[1] = s;
+                for frame in block.as_chunks_mut::<2>().0 {
+                    let mut mix = 0.0f32;
+                    for (ch, body) in self.channels.iter_mut().zip(bodies.iter()) {
+                        if let Some((body, voice_block)) = body {
+                            mix += ch.voice.render_resolved(*body, voice_block);
+                        }
+                    }
+                    // Four channels into one output: divide by the channel
+                    // count so a full-scale chord cannot clip.
+                    let s = ((mix / STM_CHANNELS as f32).clamp(-1.0, 1.0) * 32767.0) as i16;
+                    frame[0] = s;
+                    frame[1] = s;
+                }
             }
             produced += want;
 
