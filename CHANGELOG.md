@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-mod/compare/v0.0.11...v0.0.12) - 2026-11-10
+
+### Other
+
+- exact one-pass durations for MOD/STM/XM/IT — the engine runs mix-free at open time
+- per-tick block resolution in every mixer — MOD 2.2x, XM 2x, IT 1.4-1.7x, STM 1.3x, bit-identical PCM
+- resonant filter — Zxx/SFx through the MIDI-macro table (embedded or default), IFC/IFR, staged two-pole low-pass per voice
+- decompress block-compressed (IT 2.14+) sample bodies — 30/30 bodies of the staged tracker-written modules close every block exactly
+- one finite pass for MOD/XM/IT (flow-state repeat detection) + XM Bxx/Dxx asymmetry and restart position per the FT 2.08 trace
+- rebuild on the staged Scream Tracker 2 documents — measured layout, lettered command set, ST 2.21 jump/break trace lockstep
+- Bxx target masked to 7 bits + EEx skips the jump destination row — ProTracker 2.3a resolution facts 3 and 7
+- API hygiene: non_exhaustive parsed-module and player-state records
+
 ### Performance
 
 - Mixer hot loops no longer redo per-tick work per output frame — bit-identical PCM (hash-checked on every benchmark input, plus two unit tests against the per-frame reference paths). MOD: per-frame scratch allocation removed and the LFO / pan / pitch-step / loop-bound derivation resolved once per tick block (2.2–2.3× faster). Shared mixer: `MixerVoice::resolve_block` + `render_resolved` hoist source length, loop bounds and the frequency division (STM 1.3×, IT 1.4–1.7×); XM additionally mixes voice-major (1.95–2.24×). New `benches/throughput.rs` (`cargo bench --bench throughput`) and a README table with the before → after numbers.
