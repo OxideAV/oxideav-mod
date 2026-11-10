@@ -301,6 +301,11 @@ impl PitchModel for AmigaPeriodPitch {
 ///
 /// Note value layout: `note = (octave << 4) | semitone`, `semitone in
 /// 0..=11`. Freq = c3_hz * 2^((octave-3) + semitone/12).
+///
+/// The STM player itself no longer uses this model: the tracker
+/// author's manual defines the instrument rate (C2SPD) as the rate that
+/// sounds as C at octave **2**, which is what [`crate::stm_player`]
+/// implements. The type stays for callers that built on it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StmC3Pitch {
     pub c3_hz: f32,

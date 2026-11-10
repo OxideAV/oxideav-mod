@@ -17,15 +17,13 @@
 //! behaviour oracle whose outputs we compare against. If the dylib is
 //! not present the tests print a clean SKIP and return success.
 //!
-//! STM caveat, recorded up front: the staged STM layout doc
-//! (`docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`) carries **no
-//! effect semantics** and no tempo formula (see
-//! `docs/audio/trackers/stm/stm-effect-semantics-gap.md`), so this
-//! crate's STM pacing is an explicitly-documented heuristic
-//! (`bpm_equiv = tempo * 125 / 0x60`). The STM gate therefore checks
-//! order-level progress and audibility rather than row-exact lockstep —
-//! row-exact assertions would silently encode the oracle's undocumented
-//! tempo mapping into our engine, which the clean-room rules bar.
+//! STM caveat, recorded up front: the reference's own STM playback is
+//! an observation here, not an assertion. This crate's STM flow and
+//! pacing follow the staged Scream Tracker 2.21 material (the author's
+//! manual plus the black-box jump / break trace under
+//! `docs/audio/trackers/stm/`), which `tests/stm_st221_probes.rs` pins
+//! row by row; the gate below checks that the reference accepts the
+//! file layout and that our engine traverses the whole flow audibly.
 
 use std::ffi::c_void;
 use std::fs;
@@ -314,79 +312,51 @@ fn build_flow_xm() -> Vec<u8> {
     out
 }
 
-/// A 3-pattern STM: pattern 0 breaks to the next order at row 32
-/// (D32 in the staged doc's "ProTracker format" effect nibble),
-/// pattern 1 runs its 64 rows naturally, pattern 2 jumps back to
-/// order 0 (B00) at row 16. One looped square-wave instrument, note
-/// C-4 on row 0 of each pattern.
+/// A 3-pattern STM in the layout Scream Tracker 2.21 writes: pattern 0
+/// breaks to the next order at row 32 (`C`), pattern 1 runs its 64
+/// rows naturally, pattern 2 jumps back to order 0 at row 16 (`B00` +
+/// `C` — a `B` alone only replaces the order that follows the
+/// pattern). One looped square-wave instrument, a C note on row 0 of
+/// each pattern.
 fn build_flow_stm() -> Vec<u8> {
-    let mut out = vec![0u8; stm::PATTERN_DATA_OFFSET];
-    out[0..8].copy_from_slice(b"flow-stm");
-    out[0x14..0x1C].copy_from_slice(b"!Scream!");
-    out[0x1C] = 0x1A;
-    out[0x1D] = 2; // module
-    out[0x1E] = 2; // version 2.21-ish
-    out[0x1F] = 21;
-    out[0x20] = 0x60; // tempo
-    out[0x21] = 3; // 3 patterns
-    out[0x22] = 64; // global volume
-
-    // Instrument 0: 64-byte square, looped over the whole body.
-    let inst_off = stm::HEADER_PREFIX_SIZE;
-    out[inst_off..inst_off + 3].copy_from_slice(b"sqr");
-    out[inst_off + 16..inst_off + 18].copy_from_slice(&64u16.to_le_bytes()); // length
-    out[inst_off + 18..inst_off + 20].copy_from_slice(&0u16.to_le_bytes()); // loop start
-    out[inst_off + 20..inst_off + 22].copy_from_slice(&64u16.to_le_bytes()); // loop end
-    out[inst_off + 22] = 64; // volume
-    out[inst_off + 24..inst_off + 26].copy_from_slice(&8448u16.to_le_bytes()); // C3 Hz
-    // "length in paragraphs" (staged doc, record offset +30): 64 bytes
-    // = 4 paragraphs. Our parser doesn't need it, but it is part of
-    // the documented module-file record, so the fixture carries it.
-    out[inst_off + 30..inst_off + 32].copy_from_slice(&4u16.to_le_bytes());
-
-    // Order table: 0, 1, 2, then 255-terminated.
-    out[stm::ORDER_TABLE_OFFSET] = 0;
-    out[stm::ORDER_TABLE_OFFSET + 1] = 1;
-    out[stm::ORDER_TABLE_OFFSET + 2] = 2;
-    for i in 3..stm::ORDER_TABLE_SIZE {
-        out[stm::ORDER_TABLE_OFFSET + i] = 255;
+    use oxideav_mod::stm_player::command;
+    use oxideav_mod::stm_writer::{StmWriter, StmWriterInstrument, StmWriterPattern};
+    let mut w = StmWriter {
+        title: "flow-stm".into(),
+        orders: vec![0, 1, 2],
+        ..StmWriter::default()
+    };
+    w.instruments.push(StmWriterInstrument {
+        name: "sqr".into(),
+        pcm: (0..64).map(|i| if i < 32 { 228u8 } else { 28u8 }).collect(),
+        loop_start: 0,
+        loop_end: 64,
+        volume: 64,
+        c2spd: 8448,
+    });
+    for _ in 0..3 {
+        let mut p = StmWriterPattern::new();
+        p.put(
+            0,
+            0,
+            stm::StmCell {
+                note_raw: 0x30,
+                instrument: 1,
+                volume: 63,
+                ..stm::StmCell::default()
+            },
+        );
+        w.patterns.push(p);
     }
-
-    // Pattern data: 3 patterns × 64 rows × 4 channels × 4 bytes.
-    // Note byte: octave<<4 | semitone; 0x30 = C-3 (octave 3, C).
-    // Cell layout per the staged doc: b1 = (instrument << 3) | vol_lo,
-    // b2 = (vol_hi << 4) | command, b3 = param. Note 251 = empty.
-    let mut pattern_bytes = vec![0u8; 3 * stm::BYTES_PER_PATTERN];
-    {
-        let mut put_cell = |pat: usize, row: usize, ch: usize, cell: [u8; 4]| {
-            let off = pat * stm::BYTES_PER_PATTERN + (row * stm::STM_CHANNELS + ch) * 4;
-            pattern_bytes[off..off + 4].copy_from_slice(&cell);
-        };
-        for pat in 0..3 {
-            for row in 0..stm::PATTERN_ROWS {
-                for ch in 0..stm::STM_CHANNELS {
-                    put_cell(pat, row, ch, [251, 0, 0, 0]); // empty
-                }
-            }
-        }
-        // Row-0 note on channel 0 of each pattern: C-3, instrument 1,
-        // volume 63 (the 6-bit split field's maximum: vol_lo = 7 in
-        // byte 1 bits 0..=2, vol_hi = 7 in byte 2 bits 4..=6).
-        for pat in 0..3 {
-            put_cell(pat, 0, 0, [0x30, (1 << 3) | 0x07, 0x70, 0x00]);
-        }
-        // Pattern 0: D32 on row 32 ch 1 (break to row 32 of next order).
-        put_cell(0, 32, 1, [251, 0, 0x0D, 0x32]);
-        // Pattern 2: B00 on row 16 ch 1 (jump to order 0).
-        put_cell(2, 16, 1, [251, 0, 0x0B, 0x00]);
-    }
-    out.extend_from_slice(&pattern_bytes);
-
-    // Sample body: 64-byte square wave.
-    for i in 0..64 {
-        out.push(if i < 32 { 100u8 } else { 156u8 }); // +100 / -100 as u8
-    }
-    out
+    let fx = |cmd: u8, info: u8| stm::StmCell {
+        command: cmd,
+        command_param: info,
+        ..stm::StmCell::default()
+    };
+    w.patterns[0].put(32, 1, fx(command::BREAK, 0));
+    w.patterns[2].put(16, 1, fx(command::JUMP, 0));
+    w.patterns[2].put(16, 2, fx(command::BREAK, 0));
+    w.build()
 }
 
 // ---------- Steppers ----------
@@ -541,25 +511,15 @@ fn xm_ref_position_lockstep() {
 /// STM two-phase gate.
 ///
 /// Phase 1 (cross-engine, layout-level): the reference must LOAD our
-/// synthetic STM — an independent reader accepting the staged header
-/// layout (it demonstrably validates the layout: flipping the
-/// file-type byte to 1 makes it reject the file). Its PLAYBACK of the
-/// fixture is recorded as an observation but NOT asserted: against
-/// every variant tried in round 451 — fixed 4-byte cells with each
-/// documented marker byte, all-real-cell patterns, a packed reading
-/// of the marker semantics, several version/tempo stampings — the
-/// reference plays the song as ~0.12 s of silence while its order
-/// cursor races to the end, i.e. it assigns every pattern zero
-/// duration regardless of pattern content. With no known-good
-/// real-world STM available to sanity-check the oracle's STM leg
-/// (and the staged docs carrying no effect/tempo semantics to
-/// arbitrate — see `stm-effect-semantics-gap.md`), the divergence is
-/// unattributable and is left as a recorded observation rather than
-/// a gate.
+/// synthetic STM — an independent reader accepting the measured
+/// Scream Tracker 2.21 layout. Its PLAYBACK of the fixture is recorded
+/// as an observation but NOT asserted: the authority for this crate's
+/// STM flow is the staged black-box trace of the original tracker
+/// (`tests/stm_st221_probes.rs`), not a third reader.
 ///
 /// Phase 2 (our engine): a 30-second render must traverse all three
-/// orders (D32 break out of pattern 0, natural run through pattern 1,
-/// B00 loop from pattern 2) and stay audible throughout.
+/// orders (`C` break out of pattern 0, natural run through pattern 1,
+/// `B00` + `C` loop from pattern 2) and stay audible throughout.
 #[test]
 fn stm_ref_order_flow_and_audibility() {
     let Some(mp) = skip_or(RefLib::try_open()) else {
@@ -612,16 +572,15 @@ fn stm_ref_order_flow_and_audibility() {
 
     // ---- Phase 2: our engine traverses the whole flow, audibly. ----
     let mut ours = StmStepper::new(&bytes);
+    // Follow the tracker and keep looping through the backward jump
+    // (the default stops after one pass).
+    ours.p.stop_on_repeat = false;
     let mut our_buf = vec![0i16; chunk_frames * 2];
     let mut our_orders_seen = [false; 3];
     let mut our_rms_sum = 0.0f64;
     for probe in 0..240 {
         let produced = ours.p.render(&mut our_buf);
         assert_eq!(produced, chunk_frames, "our STM render starved at {probe}");
-        // Our engine flags `ended` on the B00 backward wrap; clear it to
-        // keep looping (the public decoder exposes the same choice to
-        // callers via the `ended` flag).
-        ours.p.ended = false;
         our_rms_sum += rms_i16(&our_buf);
         let o = ours.p.order_index;
         if o < 3 {

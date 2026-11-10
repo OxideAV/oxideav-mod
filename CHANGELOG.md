@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **STM rebuilt on the staged first-party Scream Tracker 2 material** (`docs/audio/trackers/stm/`: `TECH.DOC`, the user manual, the measured layout arbitration and the black-box ST 2.21 jump / break trace). The previous reader used a third-party description whose order table and pattern offsets are 64 bytes early for ST 2.21 files, and played the command nibble as ProTracker effects.
+  - Layout: 128-byte order table at `0x410` (99 = unused / end), patterns at `0x490`, one-byte cells for note bytes 251–253 (packed songs), 7-bit volume field with 65 = none, 8-bit **unsigned** sample bodies padded to 16 bytes, type-1 songs carry no bodies (`StmSampleBody::from_unsigned` attaches external instrument files). `stm::parse_patterns_with_end`, `StmHeader::song_length`, `StmHeader::is_st221`, `StmCell::{from_bytes, to_bytes, has_volume}`, `StmInstrument::is_looped` are new; `ORDER_TABLE_OFFSET` / `ORDER_TABLE_SIZE` / `PATTERN_DATA_OFFSET` take the measured values; `StmCell::default()` is the empty cell.
+  - Commands: the lettered set `A`–`O` (tempo with ticks-per-row in the high nibble and 20 ms ticks, deferred `B` jump, `C` break, `D` volume slide, `E` / `F` portamento, `G` note portamento, `H` vibrato, `I` tremor, `J` arpeggio, `K` / `O` combinations, `L` / `M` / `N` no-ops), C2SPD referenced to octave 2, manual cell rules for instrument / volume defaults, all channels centred. The ProTracker `Exy` sub-commands, `9xx` and `Fxx` paths are gone — STM cannot encode them.
+  - Order flow per the ST 2.21 trace: `B` only replaces the order that follows the current pattern, `C` breaks immediately (to a same-row `B`'s target in either channel order), a jump to an unused order restarts at order 0. 7 / 7 staged probe modules replay in row-by-row lockstep (`tests/stm_st221_probes.rs`, fixtures vendored under `tests/fixtures/st221-jump-probes/`), and `STBAUD.STM`'s two pitch regimes each last exactly one 7.68 s pattern.
+  - One finite pass: the song ends when the order list runs out, on a jump to an unused order, or when an order is re-entered (`StmPlayerState::stop_on_repeat`, default on; `loops` counts restarts).
+  - `StmPlayerState` / `StmChannel` fields changed accordingly (`speed`, the ProTracker memories and scheduling fields removed; `tempo` is the raw tempo byte).
+- Container: STM metadata gains `tracker_version` and the file type / order count in `extra_info`; the duration estimate uses the traced 20 ms tick.
+
+### Added
+
+- Hidden `stm_writer` (module and packed-song output) for tests and fuzzing; `stm_player_steered` fuzz target (recipe → always-valid STM → render to the end of the pass); `stm_decode` corpus reseeded with two staged probe modules and a packed song.
+
 ### Fixed
 
 - MOD `Bxx`: the target order is masked to 7 bits before the song-length bound (`B81` behaves as `B01`; `B84` on a 3-order song continues at order 0), per the ProTracker 2.3a resolution staged in `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`. The order-0 wrap for a target at or past the song length is now the documented behaviour rather than a working assumption; residue orders past the song length stay unreachable (pinned with the note's worked example).

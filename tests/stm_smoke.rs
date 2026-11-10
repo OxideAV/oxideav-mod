@@ -1,4 +1,4 @@
-//! End-to-end smoke test for Scream Tracker v1 (`.stm`) support.
+//! End-to-end smoke test for Scream Tracker 2 (`.stm`) support.
 //!
 //! Exercises:
 //!
@@ -9,7 +9,7 @@
 //!   or more interleaved S16 stereo `AudioFrame`s via
 //!   `StmPlayerState::render`.
 //! - `stm::parse_patterns` + `stm::extract_samples` on the packet
-//!   payload emitted by the demuxer, the route callers use today for
+//!   payload emitted by the demuxer, the route callers use for
 //!   structural STM inspection.
 
 use std::io::Cursor;
@@ -17,66 +17,39 @@ use std::io::Cursor;
 use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 use oxideav_core::{CodecRegistry, Decoder};
+use oxideav_mod::stm_writer::{StmWriter, StmWriterInstrument, StmWriterPattern};
 use oxideav_mod::{
     CODEC_ID_STM_STR, container::OUTPUT_SAMPLE_RATE, register_codecs, register_containers, stm,
 };
 
-/// Build a minimal valid STM file with one pattern (mostly zero) and one
-/// instrument carrying a 4-byte body.
+/// A minimal valid module: one pattern with one distinctive cell and
+/// one instrument carrying a 4-byte body, in the layout Scream Tracker
+/// 2.21 writes.
 fn build_minimal_stm() -> Vec<u8> {
-    const HEADER_PREFIX: usize = 0x30;
-    const INST_REC: usize = 32;
-    const INST_COUNT: usize = 31;
-    const ORDER_OFF: usize = 0x3D0;
-    const ORDER_SIZE: usize = 64;
-    const PATTERN_OFF: usize = 0x410;
-    const BYTES_PER_PATTERN: usize = 64 * 4 * 4;
-
-    let n_patterns = 1u8;
-    let mut out = vec![0u8; PATTERN_OFF];
-    out[0..4].copy_from_slice(b"song");
-    out[0x14..0x1C].copy_from_slice(b"!Scream!");
-    out[0x1C] = 0x1A;
-    out[0x1D] = 2; // module
-    out[0x1E] = 2;
-    out[0x1F] = 0;
-    out[0x20] = 0x60; // tempo
-    out[0x21] = n_patterns;
-    out[0x22] = 64;
-
-    // Instrument 0 at offset HEADER_PREFIX.
-    let inst_off = HEADER_PREFIX;
-    out[inst_off..inst_off + 4].copy_from_slice(b"kick");
-    out[inst_off + 16..inst_off + 18].copy_from_slice(&4u16.to_le_bytes());
-    out[inst_off + 22] = 64;
-    out[inst_off + 24..inst_off + 26].copy_from_slice(&8363u16.to_le_bytes());
-
-    // Order table: pattern 0 at index 0, 255 elsewhere.
-    for i in 0..ORDER_SIZE {
-        out[ORDER_OFF + i] = if i == 0 { 0 } else { 255 };
-    }
-
-    // Compile-time sanity — layout values must match crate constants.
-    assert_eq!(stm::HEADER_PREFIX_SIZE, HEADER_PREFIX);
-    assert_eq!(stm::INSTRUMENT_RECORD_SIZE, INST_REC);
-    assert_eq!(stm::INSTRUMENT_COUNT, INST_COUNT);
-    assert_eq!(stm::ORDER_TABLE_OFFSET, ORDER_OFF);
-    assert_eq!(stm::ORDER_TABLE_SIZE, ORDER_SIZE);
-    assert_eq!(stm::PATTERN_DATA_OFFSET, PATTERN_OFF);
-    assert_eq!(stm::BYTES_PER_PATTERN, BYTES_PER_PATTERN);
-
-    // Pattern 0 — mostly zeros, but put a distinctive cell at row 0 / ch 0
-    // so parse_patterns has something interesting to decode.
-    let mut pattern = vec![0u8; BYTES_PER_PATTERN];
-    pattern[0] = 0x40; // octave 4, semitone 0
-    pattern[1] = (1 << 3) | 2; // instrument 1, vol_lo 2
-    pattern[2] = (1 << 4) | 3; // vol_hi 1, command 3
-    pattern[3] = 0x0C;
-    out.extend(pattern);
-
-    // Instrument 0 body.
-    out.extend([0x10, 0xF0, 0x40, 0xC0]);
-    out
+    let mut w = StmWriter {
+        title: "song".into(),
+        orders: vec![0],
+        ..StmWriter::default()
+    };
+    w.instruments.push(StmWriterInstrument {
+        name: "kick".into(),
+        pcm: vec![0x90, 0x70, 0xC0, 0x40],
+        ..StmWriterInstrument::default()
+    });
+    let mut p = StmWriterPattern::new();
+    p.put(
+        0,
+        0,
+        stm::StmCell {
+            note_raw: 0x40, // octave 4, C
+            instrument: 1,
+            volume: 10,
+            command: 4, // D
+            command_param: 0x0C,
+        },
+    );
+    w.patterns.push(p);
+    w.build()
 }
 
 #[test]
@@ -111,8 +84,15 @@ fn open_stm_populates_metadata_and_emits_one_packet() {
     let md = demux.metadata();
     assert!(md.iter().any(|(k, v)| k == "title" && v == "song"));
     assert!(md.iter().any(|(k, v)| k == "tracker" && v == "!Scream!"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "tracker_version" && v == "2.21")
+    );
     assert!(md.iter().any(|(k, _)| k == "sample"));
-    assert!(md.iter().any(|(k, _)| k == "extra_info"));
+    assert!(
+        md.iter()
+            .any(|(k, v)| k == "extra_info" && v.starts_with("module, 1 orders"))
+    );
 
     // First packet carries the whole file.
     let pkt = demux.next_packet().expect("first packet available");
@@ -127,12 +107,6 @@ fn open_stm_populates_metadata_and_emits_one_packet() {
 
 #[test]
 fn stm_decoder_emits_pcm_through_codec_pipeline() {
-    // The STM decoder now drives `StmPlayerState::render` through the
-    // codec pipeline, mirroring the MOD decoder shape. We accept the
-    // packet, pull at least one audio frame whose sample buffer has the
-    // expected stereo-interleaved width, and confirm the decoder reports
-    // the audio sample rate that matches `OUTPUT_SAMPLE_RATE` via the
-    // codec's contract.
     let mut reg = CodecRegistry::new();
     register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STM_STR));
@@ -144,29 +118,27 @@ fn stm_decoder_emits_pcm_through_codec_pipeline() {
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
     dec.send_packet(&pkt).expect("stm send_packet must succeed");
 
-    // Drain a few frames; the minimal STM file has only one note on row 0,
-    // so we don't require silence to be non-zero — only that the decoder
-    // produces an audio frame of the right shape, then either continues or
-    // terminates with `Eof`.
-    let mut got_frame = false;
-    for _ in 0..4 {
+    // The whole song is one 64-row pattern at tempo 0x60: the decoder
+    // must emit exactly 7.68 s and then report Eof on its own.
+    let mut total = 0u64;
+    loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                got_frame = true;
-                // One interleaved S16 stereo plane = 4 bytes per sample.
                 assert_eq!(a.data.len(), 1, "stm decoder emits interleaved stereo");
                 assert_eq!(
                     a.data[0].len(),
                     a.samples as usize * 4,
                     "S16 stereo plane must be `samples * 4` bytes"
                 );
+                total += a.samples as u64;
+                assert!(total < 44_100 * 60, "the decoder must terminate");
             }
             Ok(other) => panic!("expected Audio frame, got {other:?}"),
             Err(Error::Eof) => break,
             Err(e) => panic!("unexpected decode error: {e:?}"),
         }
     }
-    assert!(got_frame, "stm decoder must emit at least one Audio frame");
+    assert_eq!(total, 64 * 6 * 882);
 }
 
 #[test]
@@ -179,7 +151,7 @@ fn stm_decoder_rejects_non_stm_blob_as_invalid() {
         .expect("stm decoder constructible");
 
     // Zero blob — no 0x1A id byte, so is_stm returns false.
-    let bytes = vec![0u8; 0x410];
+    let bytes = vec![0u8; 0x490];
     let pkt = Packet::new(0, TimeBase::new(1, OUTPUT_SAMPLE_RATE as i64), bytes);
     match dec.send_packet(&pkt) {
         Err(Error::InvalidData(_)) => {}
@@ -216,7 +188,8 @@ fn parse_patterns_and_samples_off_demuxed_packet() {
         },
     );
     assert_eq!(cell.instrument, 1);
-    assert_eq!(cell.command, 3);
+    assert_eq!(cell.volume, 10);
+    assert_eq!(cell.command, 4);
     assert_eq!(cell.command_param, 0x0C);
 
     let samples = stm::extract_samples(&hdr, &pkt.data);

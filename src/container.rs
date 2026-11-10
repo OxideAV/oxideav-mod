@@ -29,7 +29,7 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("mod", "mod");
     reg.register_probe("mod", probe);
 
-    // Scream Tracker v1 (.stm) registration — handled by a separate
+    // Scream Tracker 2 (.stm) registration — handled by a separate
     // demuxer / probe that emits a single packet under the "stm" codec.
     reg.register_demuxer("stm", open_stm);
     reg.register_extension("stm", "stm");
@@ -198,7 +198,7 @@ impl Demuxer for ModDemuxer {
     }
 }
 
-/// Scream Tracker v1 probe: the only rock-solid byte-level signature is
+/// Scream Tracker 2 probe: the only rock-solid byte-level signature is
 /// `0x1A` at offset `0x1C` combined with a plausible file-type byte
 /// (1 = song, 2 = module) at `0x1D`. The tracker-name field at
 /// `0x14..0x1C` is informational but commonly `"!Scream!"`; we require
@@ -230,14 +230,14 @@ fn open_stm(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     input.read_to_end(&mut blob)?;
     if blob.len() < stm::ORDER_TABLE_OFFSET + stm::ORDER_TABLE_SIZE {
         return Err(Error::invalid(
-            "STM: file shorter than 0x410-byte header+order block",
+            "STM: file shorter than the 0x490-byte header + instrument + order block",
         ));
     }
     let header = stm::parse_header(&blob)?;
 
     let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STM_STR));
     params.media_type = MediaType::Audio;
-    params.channels = Some(2); // mixed stereo output (once playback lands)
+    params.channels = Some(2); // interleaved stereo (all channels centred)
     params.sample_rate = Some(OUTPUT_SAMPLE_RATE);
     params.sample_format = Some(SampleFormat::S16);
     params.extradata = blob.clone();
@@ -276,11 +276,22 @@ fn build_stm_metadata(h: &stm::StmHeader) -> Vec<(String, String)> {
             out.push(("sample".into(), inst.name.clone()));
         }
     }
+    out.push((
+        "tracker_version".into(),
+        format!("{}.{:02}", h.version_major, h.version_minor),
+    ));
     let n_nonempty_insts = h.instruments.iter().filter(|i| i.length > 0).count();
+    let kind = match h.file_type {
+        stm::StmFileType::Song => "song (no sample bodies)",
+        stm::StmFileType::Module => "module",
+        stm::StmFileType::Other(_) => "unknown file type",
+    };
     out.push((
         "extra_info".into(),
         format!(
-            "{} patterns, {} channels (fixed), {}/{} instruments, tempo=0x{:02X}",
+            "{}, {} orders, {} patterns, {} channels (fixed), {}/{} instruments, tempo=0x{:02X}",
+            kind,
+            h.song_length(),
             h.n_patterns,
             stm::STM_CHANNELS,
             n_nonempty_insts,
@@ -362,7 +373,7 @@ fn open_xm(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<
 
     let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_XM_STR));
     params.media_type = MediaType::Audio;
-    params.channels = Some(2); // mixed stereo output (once playback lands)
+    params.channels = Some(2); // interleaved stereo (all channels centred)
     params.sample_rate = Some(OUTPUT_SAMPLE_RATE);
     params.sample_format = Some(SampleFormat::S16);
     params.extradata = blob.clone();

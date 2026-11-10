@@ -54,7 +54,7 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 
     // STM — full playback decoder. Drives `StmPlayerState` over the
-    // 4-channel Scream Tracker v1 pattern engine and emits interleaved
+    // 4-channel Scream Tracker 2 pattern engine and emits interleaved
     // S16 stereo at OUTPUT_SAMPLE_RATE, matching the MOD decoder shape.
     let stm_caps = CodecCapabilities::audio("stm_sw")
         .with_lossy(false)
@@ -317,7 +317,7 @@ impl Decoder for XmDecoder {
     }
 }
 
-/// STM (Scream Tracker v1) decoder. Consumes the whole-file packet from
+/// STM (Scream Tracker 2) decoder. Consumes the whole-file packet from
 /// the STM container, parses the header / patterns / sample bodies, and
 /// drives a [`StmPlayerState`] forward, emitting interleaved S16 stereo
 /// PCM at [`OUTPUT_SAMPLE_RATE`] until the song ends. Mirrors the
@@ -356,7 +356,7 @@ impl Decoder for StmDecoder {
         // an arbitrary buffer).
         if !crate::stm::is_stm(&packet.data) {
             return Err(Error::invalid(
-                "STM: packet does not carry a valid Scream Tracker v1 header",
+                "STM: packet does not carry a valid Scream Tracker 2 header",
             ));
         }
         let header = crate::stm::parse_header(&packet.data)?;

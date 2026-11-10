@@ -1,249 +1,63 @@
-//! STM playback integration test.
+//! STM playback integration tests: audible output, the per-step
+//! commands heard in the PCM, and the staged example song.
 //!
-//! Round-4 milestone: the shared tracker mixer core (pitch trait,
-//! sample-source trait, generic voice) is wired through STM's row/tick
-//! engine. We build a tiny hand-crafted STM file that:
-//!   - Declares one instrument with a 64-sample square-wave body.
-//!   - Sets its C3 reference to 8363 Hz (the canonical sampler rate).
-//!   - Puts a single C-4 / instrument-1 note at row 0, channel 0.
-//!
-//! Then we drive the new `StmPlayerState` for ~0.1s and assert:
-//!   - The run produces exactly the frames we asked for.
-//!   - There are many non-zero samples (the square wave is audible).
-//!   - The peak stays within a reasonable range (the mixer clamps to
-//!     ±1.0 before the int16 conversion, so we should never see
-//!     saturation throughout — but some hefty energy must be present).
+//! Fixtures are built with the crate's hidden `stm_writer` in the
+//! layout Scream Tracker 2.21 writes
+//! (`docs/audio/trackers/stm/stm-pattern-packing-and-order-table.md`).
 
 use oxideav_mod::{
-    stm::{extract_samples, parse_header, parse_patterns},
-    stm_player::StmPlayerState,
+    stm::{StmCell, StmSampleBody, extract_samples, parse_header, parse_patterns_with_end},
+    stm_player::{StmPlayerState, command},
+    stm_writer::{StmWriter, StmWriterInstrument, StmWriterPattern},
 };
 
-fn build_c4_square_stm() -> Vec<u8> {
-    const HEADER_PREFIX: usize = 0x30;
-    const ORDER_OFF: usize = 0x3D0;
-    const ORDER_SIZE: usize = 64;
-    const PATTERN_OFF: usize = 0x410;
-    const BYTES_PER_PATTERN: usize = 64 * 4 * 4;
-
-    let n_patterns = 1u8;
-    let mut out = vec![0u8; PATTERN_OFF];
-    out[0..4].copy_from_slice(b"pbck");
-    out[0x14..0x1C].copy_from_slice(b"!Scream!");
-    out[0x1C] = 0x1A;
-    out[0x1D] = 2; // module
-    out[0x1E] = 2;
-    out[0x1F] = 0;
-    out[0x20] = 0x60; // tempo
-    out[0x21] = n_patterns;
-    out[0x22] = 64; // global volume
-
-    // Instrument 0.
-    let inst_off = HEADER_PREFIX;
-    out[inst_off..inst_off + 3].copy_from_slice(b"sqr");
-    // Sample length = 64 bytes. Forward loop 0..64 so the square
-    // wave keeps going for the entire render window (without this the
-    // note's audible tail is only ~337 frames).
-    out[inst_off + 16..inst_off + 18].copy_from_slice(&64u16.to_le_bytes());
-    out[inst_off + 18..inst_off + 20].copy_from_slice(&0u16.to_le_bytes());
-    out[inst_off + 20..inst_off + 22].copy_from_slice(&64u16.to_le_bytes());
-    // Default volume + C3 frequency.
-    out[inst_off + 22] = 64;
-    out[inst_off + 24..inst_off + 26].copy_from_slice(&8363u16.to_le_bytes());
-
-    // Order table.
-    for i in 0..ORDER_SIZE {
-        out[ORDER_OFF + i] = if i == 0 { 0 } else { 255 };
+/// 256-byte sine, unsigned 8-bit, looped over its whole length.
+fn sine_instrument() -> StmWriterInstrument {
+    let pcm: Vec<u8> = (0..256)
+        .map(|i| {
+            let phi = (i as f32) * std::f32::consts::TAU / 256.0;
+            (128.0 + phi.sin() * 100.0) as u8
+        })
+        .collect();
+    StmWriterInstrument {
+        name: "SINE.SMP".into(),
+        pcm,
+        loop_start: 0,
+        loop_end: 256,
+        volume: 64,
+        c2spd: 8363,
     }
-
-    // Pattern 0.
-    let mut pattern = vec![0u8; BYTES_PER_PATTERN];
-    // Row 0 / channel 0: note byte 0x40 (octave 4, semitone 0 → C-4).
-    pattern[0] = 0x40;
-    // Byte 1: instrument 1 (high 5 bits) | vol_lo 0 = 0x08.
-    pattern[1] = (1u8) << 3;
-    pattern[2] = 0;
-    pattern[3] = 0;
-    out.extend(pattern);
-
-    // Square-wave body: 32 samples at +100, 32 samples at -100.
-    for i in 0..64 {
-        let v: i8 = if i < 32 { 100 } else { -100 };
-        out.push(v as u8);
-    }
-    out
 }
 
-#[test]
-fn stm_player_renders_audible_square_wave() {
-    let bytes = build_c4_square_stm();
+fn writer(n_patterns: usize) -> StmWriter {
+    let mut w = StmWriter::default();
+    w.instruments.push(sine_instrument());
+    for _ in 0..n_patterns {
+        w.patterns.push(StmWriterPattern::new());
+    }
+    w.orders = (0..n_patterns as u8).collect();
+    w
+}
+
+fn cell(note_raw: u8, instrument: u8, cmd: u8, info: u8) -> StmCell {
+    StmCell {
+        note_raw,
+        instrument,
+        command: cmd,
+        command_param: info,
+        ..StmCell::default()
+    }
+}
+
+fn player(w: &StmWriter) -> StmPlayerState {
+    let bytes = w.build();
     let hdr = parse_header(&bytes).expect("stm header");
-    let pats = parse_patterns(&hdr, &bytes);
+    let (pats, _) = parse_patterns_with_end(&hdr, &bytes);
     let samples = extract_samples(&hdr, &bytes);
-
-    let mut p = StmPlayerState::new(&hdr, samples, pats, 44_100);
-    let n_frames = 4410; // 0.1 s
-    let mut buf = vec![0i16; n_frames * 2];
-    let produced = p.render(&mut buf);
-    assert_eq!(produced, n_frames, "must fill the requested frames");
-
-    // The sample is a 64-point one-shot played at C-4 (≈ 8363 Hz),
-    // output at 44_100 Hz → ~337 output frames worth of audible signal
-    // before the one-shot ends. We assert at least ~half of that in
-    // non-zero samples (interpolation introduces some zero crossings at
-    // the square-wave transitions).
-    let nonzero = buf.iter().filter(|&&x| x != 0).count();
-    assert!(
-        nonzero > 100,
-        "expected audible square wave (>~100 non-zero samples), got {nonzero}"
-    );
-
-    // Peak must lie in a sensible post-volume range: with headroom
-    // scaling dividing by 2 and a square ±100/128, we expect |peak| ≈
-    // 0.39 → ~12800 in i16. Give a wide tolerance.
-    let peak = buf.iter().map(|&s| s.unsigned_abs() as u32).max().unwrap();
-    assert!(
-        peak > 1000 && peak < 32767,
-        "expected peak within (1000, 32767), got {peak}"
-    );
+    StmPlayerState::new(&hdr, samples, pats, 44_100)
 }
 
-#[test]
-fn stm_player_silent_on_empty_pattern() {
-    // Same header as above but without the note trigger. No note, no
-    // instrument — the voice never starts, so the buffer must be all
-    // zeros.
-    let mut bytes = build_c4_square_stm();
-    // Clear the single live cell to "empty" (note byte 251 per spec).
-    // Pattern starts at offset 0x410 + row0/ch0 = 0x410.
-    bytes[0x410] = 251;
-    bytes[0x411] = 0;
-    bytes[0x412] = 0;
-    bytes[0x413] = 0;
-
-    let hdr = parse_header(&bytes).unwrap();
-    let pats = parse_patterns(&hdr, &bytes);
-    let samples = extract_samples(&hdr, &bytes);
-    let mut p = StmPlayerState::new(&hdr, samples, pats, 44_100);
-
-    let mut buf = vec![0i16; 4410 * 2];
-    let produced = p.render(&mut buf);
-    assert_eq!(produced, 4410);
-    assert!(
-        buf.iter().all(|&x| x == 0),
-        "expected pure silence on no-trigger pattern"
-    );
-}
-
-// ---- Round 9: vibrato / tone porta / pattern break tests ----
-
-const STM_HEADER_PREFIX: usize = 0x30;
-const STM_ORDER_OFF: usize = 0x3D0;
-const STM_ORDER_SIZE: usize = 64;
-const STM_PATTERN_OFF: usize = 0x410;
-const STM_BYTES_PER_PATTERN: usize = 64 * 4 * 4;
-
-/// Write an STM cell into an in-memory pattern block at `(row, ch)`.
-///
-/// `note_raw` is the raw note byte (0x40 = C-4, 251 = empty, etc.).
-/// `instrument` is 1-based (0 = no change).
-/// `volume` is 0..=64 (0 = no override).
-/// `command` + `command_param` are ProTracker-style 0..=F and 0..=FF.
-#[allow(clippy::too_many_arguments)]
-fn write_cell(
-    block: &mut [u8],
-    row: usize,
-    ch: usize,
-    note_raw: u8,
-    instrument: u8,
-    volume: u8,
-    command: u8,
-    command_param: u8,
-) {
-    let off = row * 4 * 4 + ch * 4;
-    block[off] = note_raw;
-    // b1 = (instrument << 3) | (vol_lo & 0x07)
-    block[off + 1] = (instrument << 3) | (volume & 0x07);
-    // b2 = ((vol_hi & 0x07) << 4) | (command & 0x0F)
-    block[off + 2] = (((volume >> 3) & 0x07) << 4) | (command & 0x0F);
-    block[off + 3] = command_param;
-}
-
-/// Build a 256-sample sine body as an STM sample (signed i8).
-fn make_sine_body_256() -> Vec<u8> {
-    let mut out = Vec::with_capacity(256);
-    for i in 0..256 {
-        let t = (i as f32) / 256.0;
-        let v = (96.0 * (2.0 * std::f32::consts::PI * t).sin()) as i8;
-        out.push(v as u8);
-    }
-    out
-}
-
-/// Build an STM with `n_patterns` patterns, a single sine instrument
-/// (looped 0..=256 forward), and optional command/param on row 0 ch 0
-/// alongside a note.
-///
-/// `build_row0_cell` receives the 1024-byte pattern block for pattern 0
-/// and writes into it; later patterns / rows are zero-filled.
-fn build_stm_with_pattern<F>(n_patterns: u8, build_row0_cell: F) -> Vec<u8>
-where
-    F: FnOnce(&mut [u8]),
-{
-    let mut out = vec![0u8; STM_PATTERN_OFF];
-    out[0..4].copy_from_slice(b"test");
-    out[0x14..0x1C].copy_from_slice(b"!Scream!");
-    out[0x1C] = 0x1A;
-    out[0x1D] = 2; // module
-    out[0x1E] = 2;
-    out[0x1F] = 0;
-    out[0x20] = 0x60; // tempo
-    out[0x21] = n_patterns;
-    out[0x22] = 64; // global volume
-
-    // Instrument 0: sample length = 256 bytes, forward loop full body.
-    let inst_off = STM_HEADER_PREFIX;
-    out[inst_off..inst_off + 3].copy_from_slice(b"sin");
-    out[inst_off + 16..inst_off + 18].copy_from_slice(&256u16.to_le_bytes());
-    out[inst_off + 18..inst_off + 20].copy_from_slice(&0u16.to_le_bytes());
-    out[inst_off + 20..inst_off + 22].copy_from_slice(&256u16.to_le_bytes());
-    out[inst_off + 22] = 64;
-    out[inst_off + 24..inst_off + 26].copy_from_slice(&8363u16.to_le_bytes());
-
-    // Order: pattern 0, 1, ... up to n_patterns; the rest 0xFF-terminated.
-    for i in 0..STM_ORDER_SIZE {
-        out[STM_ORDER_OFF + i] = if (i as u8) < n_patterns { i as u8 } else { 255 };
-    }
-
-    // Build patterns. Pattern 0 gets the caller-supplied row-0 setup.
-    // Default-fill every cell with note_raw=251 ("empty") so any row
-    // the caller doesn't overwrite doesn't accidentally retrigger the
-    // note_raw=0 (= C-0) cell.
-    let mut pat0 = vec![0u8; STM_BYTES_PER_PATTERN];
-    for row in 0..64usize {
-        for ch in 0..4usize {
-            pat0[row * 16 + ch * 4] = 251;
-        }
-    }
-    build_row0_cell(&mut pat0);
-    out.extend(pat0);
-    for _ in 1..n_patterns {
-        let mut patn = vec![0u8; STM_BYTES_PER_PATTERN];
-        for row in 0..64usize {
-            for ch in 0..4usize {
-                patn[row * 16 + ch * 4] = 251;
-            }
-        }
-        out.extend(patn);
-    }
-
-    // Sample body: 256-sample sine.
-    out.extend(make_sine_body_256());
-    out
-}
-
-/// Approximate DFT magnitude at a target frequency. Good enough for
-/// correctness checks (not a FFT — O(N) per frequency).
+/// Approximate DFT magnitude at a target frequency.
 fn dft_mag(signal: &[f32], sample_rate: f32, freq_hz: f32) -> f32 {
     let n = signal.len() as f32;
     if n < 1.0 {
@@ -260,131 +74,163 @@ fn dft_mag(signal: &[f32], sample_rate: f32, freq_hz: f32) -> f32 {
     (re * re + im * im).sqrt() / n
 }
 
-/// Extract the left channel of interleaved stereo i16 as f32.
 fn left_channel(buf: &[i16]) -> Vec<f32> {
     buf.as_chunks::<2>().0.iter().map(|c| c[0] as f32).collect()
 }
 
-/// Vibrato (4xy) on a single sustained note must produce detectable
-/// off-carrier energy compared with the same note played dry. Mirrors
-/// the round-6 XM vibrato spectral probe.
+#[test]
+fn stm_player_renders_an_audible_note_at_the_c2spd_pitch() {
+    let mut w = writer(1);
+    w.patterns[0].put(0, 0, cell(0x40, 1, 0, 0)); // C octave 4
+    let mut p = player(&w);
+    let n_frames = 22_050;
+    let mut buf = vec![0i16; n_frames * 2];
+    assert_eq!(p.render(&mut buf), n_frames);
+    let signal = left_channel(&buf);
+    // C2SPD 8363 Hz is C-2; C-4 is two octaves up: 33452 Hz through a
+    // 256-byte cycle = 130.67 Hz.
+    let f0 = 8363.0 * 4.0 / 256.0;
+    let on = dft_mag(&signal, 44_100.0, f0);
+    let off = dft_mag(&signal, 44_100.0, f0 * 1.5);
+    assert!(on > 1000.0 && on > off * 20.0, "on {on}, off {off}");
+    // One channel of four, centred: peak = 100/128 / 4 of full scale.
+    let peak = buf.iter().map(|&s| s.unsigned_abs() as u32).max().unwrap();
+    assert!((5800..=6600).contains(&peak), "peak {peak}");
+}
+
+#[test]
+fn stm_player_silent_on_empty_pattern() {
+    let w = writer(1);
+    let mut p = player(&w);
+    let mut buf = vec![0i16; 4410 * 2];
+    assert_eq!(p.render(&mut buf), 4410);
+    assert!(buf.iter().all(|&x| x == 0));
+}
+
+/// Vibrato (`H`) on a sustained note must push energy off the carrier
+/// compared with the same note played dry.
 #[test]
 fn stm_player_vibrato_produces_spectral_sidebands() {
-    // Row 0, ch 0: note C-6 (octave 6, semitone 0 → note_raw 0x60),
-    // instrument 1, effect 4 (vibrato), param 0x6F (speed 6, depth F).
-    // Expected carrier: 8363 Hz native, played at C-6 (+3 octaves from
-    // C-3) → 66904 Hz sample step, through a 256-sample loop → 261 Hz
-    // output fundamental at 44_100 Hz rendering. Aliasing in the output
-    // is OK — the test measures *relative* energy at a single probe.
-    let vib_bytes = build_stm_with_pattern(1, |pat| {
-        // note 0x60 = octave 6, semitone 0 (C-6).
-        write_cell(pat, 0, 0, 0x60, 1, 0, 0x4, 0x6F);
-    });
-    let hdr = parse_header(&vib_bytes).expect("stm header");
-    let pats = parse_patterns(&hdr, &vib_bytes);
-    let samples = extract_samples(&hdr, &vib_bytes);
-    let mut p = StmPlayerState::new(&hdr, samples, pats, 44_100);
-
-    // Render ~0.5 s.
-    let n_frames = 22_050;
-    let mut buf_vib = vec![0i16; n_frames * 2];
-    let produced = p.render(&mut buf_vib);
-    assert_eq!(produced, n_frames);
-    let signal_vib = left_channel(&buf_vib);
-    let rms_vib = (signal_vib.iter().map(|&x| x * x).sum::<f32>() / signal_vib.len() as f32).sqrt();
-    assert!(rms_vib > 100.0, "vibrato signal RMS too low: {rms_vib}");
-
-    // Control: same note, no effect.
-    let dry_bytes = build_stm_with_pattern(1, |pat| {
-        write_cell(pat, 0, 0, 0x60, 1, 0, 0, 0);
-    });
-    let hdr2 = parse_header(&dry_bytes).expect("stm header");
-    let pats2 = parse_patterns(&hdr2, &dry_bytes);
-    let samples2 = extract_samples(&hdr2, &dry_bytes);
-    let mut p2 = StmPlayerState::new(&hdr2, samples2, pats2, 44_100);
-    let mut buf_dry = vec![0i16; n_frames * 2];
-    p2.render(&mut buf_dry);
-    let signal_dry = left_channel(&buf_dry);
-
-    // Carrier frequency for C-6 at 8363 Hz C-3 reference: 8363 * 2^3 =
-    // 66904 Hz sample-rate, looped in a 256-frame table → fundamental
-    // 66904 / 256 ≈ 261.3 Hz (modulo output-rate aliasing).
-    let carrier: f32 = 8363.0 * 8.0 / 256.0;
-    // Probe ~30 Hz below the carrier — vibrato at speed 6 / depth 15
-    // should push substantial energy here.
-    let probe_off: f32 = (carrier - 30.0).max(10.0);
-    let sb_vib = dft_mag(&signal_vib, 44_100.0, probe_off);
-    let sb_dry = dft_mag(&signal_dry, 44_100.0, probe_off);
+    let render = |cmd: u8, info: u8| {
+        let mut w = writer(1);
+        w.patterns[0].put(0, 0, cell(0x40, 1, cmd, info));
+        for row in 1..64 {
+            w.patterns[0].put(row, 0, cell(255, 0, cmd, info));
+        }
+        let mut p = player(&w);
+        let mut buf = vec![0i16; 22_050 * 2];
+        assert_eq!(p.render(&mut buf), 22_050);
+        left_channel(&buf)
+    };
+    let vib = render(command::VIBRATO, 0x6F);
+    let dry = render(0, 0);
+    let carrier = 8363.0 * 4.0 / 256.0;
+    let probe = carrier - 12.0;
+    let sb_vib = dft_mag(&vib, 44_100.0, probe);
+    let sb_dry = dft_mag(&dry, 44_100.0, probe);
     assert!(
         sb_vib > sb_dry * 1.5,
-        "expected vibrato to boost off-carrier energy (with={sb_vib}, without={sb_dry}, carrier={carrier}, probe={probe_off})"
+        "vibrato must boost off-carrier energy (with {sb_vib}, without {sb_dry})"
     );
 }
 
-/// Tone portamento: row 0 triggers C-4, row 1 fires 3FF toward G-4.
-/// After a row of 6 ticks at speed 0xFF the channel's `cur_semis`
-/// should have snapped to the G-4 target without retriggering the
-/// voice.
+/// Note portamento: row 0 triggers C-4, row 1 glides toward G-4 with a
+/// large `G` amount; the pitch lands on G-4 without a retrigger.
 #[test]
-fn stm_player_tone_porta_reaches_target() {
-    // Row 0 ch 0: note C-4 (octave 4, semitone 0 → 0x40), inst 1.
-    // Row 1 ch 0: note G-4 (octave 4, semitone 7 → 0x47), command 3,
-    // param 0xFF (very large porta speed).
-    let bytes = build_stm_with_pattern(1, |pat| {
-        write_cell(pat, 0, 0, 0x40, 1, 0, 0, 0);
-        write_cell(pat, 1, 0, 0x47, 0, 0, 0x3, 0xFF);
-    });
-    let hdr = parse_header(&bytes).expect("stm header");
-    let pats = parse_patterns(&hdr, &bytes);
-    let samples = extract_samples(&hdr, &bytes);
-    let mut p = StmPlayerState::new(&hdr, samples, pats, 44_100);
-
-    // Render past row 1. STM samples-per-tick ≈ 44_100 * 2.5 / bpm ≈
-    // 882 at tempo 0x60 (bpm_equiv 125). 12 ticks × 882 ≈ 10_584.
-    let n_frames = 12_000;
-    let mut buf = vec![0i16; n_frames * 2];
+fn stm_player_note_portamento_reaches_target() {
+    let mut w = writer(1);
+    w.patterns[0].put(0, 0, cell(0x40, 1, 0, 0));
+    w.patterns[0].put(1, 0, cell(0x47, 0, command::NOTE_PORTA, 0xFF));
+    let mut p = player(&w);
+    let mut buf = vec![0i16; 12_000 * 2];
     p.render(&mut buf);
-
-    // Expect the channel's current semitone to equal G-4 (4*12 + 7 = 55).
     let ch = &p.channels[0];
-    let target = 4.0 * 12.0 + 7.0;
-    assert!(
-        (ch.cur_semis - target).abs() < 0.1,
-        "expected tone porta to reach G-4 semitone {target}, got {}",
-        ch.cur_semis
-    );
-    // Voice should still be active — tone porta must not retrigger.
-    assert!(ch.voice.active, "tone-porta must not kill the voice");
+    assert!((ch.cur_semis - 55.0).abs() < 0.01, "got {}", ch.cur_semis);
+    assert!(ch.voice.active, "the glide must not stop the voice");
+    assert!(ch.voice.pos > 256.0 || ch.voice.pos > 0.0);
 }
 
-/// Pattern break (Dxy) on row 0 of pattern 0 must advance to row
-/// `x*10 + y` of pattern 1 (FT2-style decimal, mirrors XM parity).
+/// `C` breaks to row 0 of the next order — Scream Tracker's break has
+/// no row argument ("plays the next one in orderlist").
 #[test]
-fn stm_player_pattern_break_lands_on_correct_row() {
-    // Pattern 0: row 0 fires D04 (jump to row 4 of next pattern).
-    // Two-pattern order so we can observe the landing in-song.
-    let bytes = build_stm_with_pattern(2, |pat| {
-        // No note — pure control cell.
-        write_cell(pat, 0, 0, 251, 0, 0, 0xD, 0x04);
-    });
-    let hdr = parse_header(&bytes).expect("stm header");
-    let pats = parse_patterns(&hdr, &bytes);
-    let samples = extract_samples(&hdr, &bytes);
-    let mut p = StmPlayerState::new(&hdr, samples, pats, 44_100);
-
-    // Render 7 ticks worth — enough for row 0 (6 ticks) to complete
-    // and next_row to fire the pattern break.
-    let n_frames = 7 * 882;
-    let mut buf = vec![0i16; n_frames * 2];
+fn stm_player_break_lands_on_row_zero_of_the_next_order() {
+    let mut w = writer(2);
+    w.patterns[0].put(0, 0, cell(255, 0, command::BREAK, 0x04));
+    let mut p = player(&w);
+    let mut buf = vec![0i16; 7 * 882 * 2];
     p.render(&mut buf);
+    assert_eq!((p.order_index, p.row), (1, 0));
+}
+
+/// The song example shipped with Scream Tracker 2.21, read from the
+/// staged docs tree when it is checked out next to this crate. The file
+/// is a type-1 *song*: packed cells, no sample bodies — the five
+/// instrument files sit beside it. Skips (passing) when absent.
+#[test]
+fn st221_example_song_parses_exactly_and_plays_one_finite_pass() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/audio/trackers/stm/fixtures/st221-shareware-example");
+    let Ok(bytes) = std::fs::read(dir.join("SONG.STS")) else {
+        eprintln!("[stm] SKIP: staged SONG.STS not found");
+        return;
+    };
+    let hdr = parse_header(&bytes).expect("header");
+    assert_eq!(hdr.title, "Example song");
+    assert!(hdr.is_st221());
     assert_eq!(
-        p.order_index, 1,
-        "Dxy should advance to next order (got {})",
-        p.order_index
+        (hdr.tempo, hdr.n_patterns, hdr.global_volume),
+        (0x60, 6, 64)
     );
-    assert_eq!(
-        p.row, 4,
-        "Dxy row=04 should land on row 4 of next pattern (got {})",
-        p.row
-    );
+    assert_eq!(&hdr.order[..8], &[5, 0, 1, 2, 2, 3, 4, 99]);
+    assert_eq!(hdr.song_length(), 7);
+    // The packed pattern data consumes the file exactly.
+    let (pats, end) = parse_patterns_with_end(&hdr, &bytes);
+    assert_eq!(end, bytes.len());
+    assert_eq!(pats.len(), 6);
+    // Pattern 4's last row carries `B01` on channel 2: the loop back
+    // past the intro.
+    let b = pats[4].rows[63][1];
+    assert_eq!((b.command, b.command_param), (command::JUMP, 1));
+
+    // Attach the external instrument files and play.
+    let mut samples = extract_samples(&hdr, &bytes);
+    assert!(samples.iter().all(|s| s.pcm.is_empty()));
+    let mut attached = 0;
+    for (i, inst) in hdr.instruments.iter().enumerate() {
+        if inst.name.is_empty() {
+            continue;
+        }
+        let path = dir.join("INS").join(inst.name.to_uppercase());
+        if let Ok(raw) = std::fs::read(path) {
+            samples[i] = StmSampleBody::from_unsigned(inst, &raw);
+            assert_eq!(samples[i].pcm.len(), inst.length as usize);
+            attached += 1;
+        }
+    }
+    assert_eq!(attached, 5);
+    let mut p = StmPlayerState::new(&hdr, samples, pats, 44_100);
+    let mut buf = vec![0i16; 8192 * 2];
+    let mut frames = 0usize;
+    let mut energy = 0f64;
+    loop {
+        let n = p.render(&mut buf);
+        if n == 0 {
+            break;
+        }
+        frames += n;
+        energy += buf[..n * 2]
+            .iter()
+            .map(|&s| (s as f64).powi(2))
+            .sum::<f64>();
+        assert!(frames < 44_100 * 600, "the pass must be finite");
+    }
+    assert!(p.ended);
+    // The `B01` loop-back re-enters order 1: one pass is orders 0..=6.
+    assert_eq!(p.order_index, 1);
+    let rms = (energy / (frames as f64 * 2.0)).sqrt();
+    assert!(rms > 300.0, "the song must be audible (rms {rms:.0})");
+    // Seven patterns, minus the rows the intro's `C` skips, at tempos
+    // between 0x30 and 0x60: between 20 s and 60 s.
+    let secs = frames as f64 / 44_100.0;
+    assert!((20.0..60.0).contains(&secs), "{secs:.2} s");
 }

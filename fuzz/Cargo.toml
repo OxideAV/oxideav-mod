@@ -68,22 +68,26 @@ cargo-fuzz = true
 #                       1-pole IIR mid-render must not produce
 #                       non-finite samples.
 #
-#  * `stm_decode` — feed arbitrary bytes to the STM (Scream Tracker v1)
-#                   parsing pipeline (`stm::is_stm` →
-#                   `stm::parse_header` →
-#                   `stm::extract_samples` →
-#                   `stm::parse_patterns` →
+#  * `stm_decode` — feed arbitrary bytes to the STM (Scream Tracker 2)
+#                   parsing pipeline (`stm::parse_header` →
+#                   `stm::parse_patterns` → `stm::extract_samples` →
 #                   `stm_player::StmPlayerState::new` → a short render
 #                   burst) and assert it always returns. STM has a
-#                   fixed 4-channel layout, 31-instrument table, and a
-#                   "P" signature byte at offset 20 — but the order
-#                   table, sample headers, and pattern data still come
-#                   from attacker input. The fuzz target must drive
-#                   the same fragile paths as MOD: instrument C3 Hz
-#                   driving pitch (zero must not divide-by-zero), the
-#                   per-channel `[0, 64]` volume clamp, and the
-#                   "0xy arpeggio" / "4xy vibrato" / "7xy tremolo"
-#                   per-tick LFO arithmetic.
+#                   fixed 4-channel layout and 31-instrument table, but
+#                   the 128-byte order table, the instrument records
+#                   and the pattern data (with its data-dependent
+#                   one-byte cells) all come from attacker input:
+#                   C2SPD driving pitch (zero must not divide by
+#                   zero), the `[0, 64]` volume clamp, loop pairs past
+#                   the body, and the lettered commands' per-tick
+#                   arithmetic.
+#
+#  * `stm_player_steered` — fuzz bytes read as a recipe for the hidden
+#                   `stm_writer` (always-valid module or packed song),
+#                   rendered to the end of the pass: the deferred `B`
+#                   jump / `C` break state machine and the
+#                   one-finite-pass stop get the budget the raw parser
+#                   target spends on sample bytes.
 #
 #  * `xm_decode` — feed arbitrary bytes to the XM (FastTracker 2
 #                  Extended Module) parsing pipeline
@@ -176,5 +180,11 @@ doc = false
 [[bin]]
 name = "it_player_steered"
 path = "fuzz_targets/it_player_steered.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "stm_player_steered"
+path = "fuzz_targets/stm_player_steered.rs"
 test = false
 doc = false

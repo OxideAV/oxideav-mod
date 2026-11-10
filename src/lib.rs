@@ -1,5 +1,6 @@
 //! Amiga ProTracker / SoundTracker module ("MOD") support, plus a
-//! structural parser for Scream Tracker v1 (`.stm`) files.
+//! Scream Tracker 2 (`.stm`), FastTracker 2 (`.xm`) and Impulse Tracker
+//! (`.it`) playback.
 //!
 //! MOD files are self-contained song data: a 20-byte title, 31 sample
 //! descriptors, a pattern order list, a 4-character signature that
@@ -26,23 +27,19 @@
 //!   pre-pan/pre-mix. Consumers that need independent channel streams
 //!   (DAWs, visualisers, per-instrument remastering) select this codec
 //!   id instead of `"mod"`.
-//! - A **container** (`stm`) that recognises Scream Tracker v1 modules
-//!   (pre-S3M, 4-channel-fixed), parses the header + instrument table +
-//!   pattern data + sample bodies, and exposes them for downstream
-//!   consumers. The associated codec id [`CODEC_ID_STM_STR`] = `"stm"`
-//!   is a **full playback decoder**: it parses the packet, builds an
-//!   [`stm_player::StmPlayerState`] over the shared [`mixer::MixerVoice`]
-//!   core + [`mixer::StmC3Pitch`] pitch model, and emits interleaved
-//!   `S16` stereo PCM at the same output rate as the MOD decoder.
-//!   Honours every effect that the Scream Tracker v1 spec lists as "in
-//!   ProTracker format" — `0xy` arpeggio, `1xy` / `2xy` portamento up /
-//!   down, `3xy` / `5xy` tone portamento (with volume slide), `4xy` /
-//!   `6xy` vibrato (with volume slide), `7xy` tremolo, `Axy` volume
-//!   slide, `Bxy` position jump, `Cxx` set volume, `Dxy` pattern break,
-//!   `Fxx` speed/tempo split, and the `E1x` / `E2x` / `EAx` / `EBx` /
-//!   `ECx` / `EDx` Exy subcommands. Callers that need structural-only
-//!   access (no PCM) can still reach for [`stm::parse_header`] /
-//!   [`stm::parse_patterns`] / [`stm::extract_samples`] directly.
+//! - A **container** (`stm`) that recognises Scream Tracker 2 modules
+//!   and songs (pre-S3M, 4-channel-fixed). The associated codec id
+//!   [`CODEC_ID_STM_STR`] = `"stm"` is a **full playback decoder**: it
+//!   parses the packet, builds an [`stm_player::StmPlayerState`] over
+//!   the shared [`mixer::MixerVoice`] core, and emits interleaved `S16`
+//!   stereo PCM at the same output rate as the MOD decoder. The layout
+//!   and the lettered command set (`A` tempo … `O` note portamento +
+//!   volume slide) follow the tracker author's own documents and the
+//!   black-box Scream Tracker 2.21 trace staged under
+//!   `docs/audio/trackers/stm/` — see [`stm`] and [`stm_player`].
+//!   Callers that need structural-only access (no PCM) can reach for
+//!   [`stm::parse_header`] / [`stm::parse_patterns`] /
+//!   [`stm::extract_samples`] directly.
 //! - A **container** (`xm`) that recognises FastTracker 2 Extended
 //!   Module files by the 17-byte `"Extended Module: "` ASCII banner at
 //!   offset 0. Parses the 336-byte file header (banner, module/tracker
@@ -103,6 +100,8 @@ pub mod player;
 pub mod samples;
 pub mod stm;
 pub mod stm_player;
+#[doc(hidden)]
+pub mod stm_writer;
 pub mod xm;
 pub mod xm_player;
 #[doc(hidden)]
@@ -118,7 +117,7 @@ pub const CODEC_ID_STR: &str = "mod";
 /// Codec id for the planar per-channel MOD decoder.
 pub const CODEC_ID_PLANAR_STR: &str = "mod_planar";
 
-/// Codec id for the STM (Scream Tracker v1) parsing-only decoder.
+/// Codec id for the STM (Scream Tracker 2) playback decoder.
 pub const CODEC_ID_STM_STR: &str = "stm";
 
 /// Codec id for the XM (FastTracker 2 Extended Module) playback decoder.

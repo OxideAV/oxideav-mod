@@ -36,7 +36,7 @@ Three decoder implementations are registered with distinct codec IDs:
 | ------------ | -------------------------------------------------------------- | -------------------------------------- |
 | `mod`        | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Drop-in playback                       |
 | `mod_planar` | Planar `S16P` at 44.1 kHz, one plane per MOD tracker channel   | Per-channel mixing, analysis, DAW export |
-| `stm`        | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Scream Tracker v1 playback             |
+| `stm`        | Interleaved `S16` at 44.1 kHz, all channels centred            | Scream Tracker 2 playback              |
 | `xm`         | Mixed stereo, interleaved `S16` at 44.1 kHz                    | FastTracker 2 playback                 |
 | `it`         | Mixed stereo, interleaved `S16` at 44.1 kHz                    | Impulse Tracker playback               |
 
@@ -648,83 +648,100 @@ discarded tail sample. Ping-pong loops reflect at the same `loop_end`
 edge. Unit tests in `mixer::tests` poison the tail with an out-of-band
 sentinel and assert no tail frame is ever emitted for either loop mode.
 
-## Scream Tracker v1 (.stm) playback coverage
+## Scream Tracker 2 (.stm) playback coverage
 
-`oxideav-mod` also drives a Scream Tracker v1 (`.stm`) playback engine
-(`stm_player::StmPlayerState`), now wired through the codec registry as
-codec id `"stm"`. The decoder accepts the whole-file packet emitted by
-the `stm` container, parses the header / patterns / sample bodies, and
-emits interleaved S16 stereo PCM at 44.1 kHz — the same output shape as
-the `"mod"` codec id, so a generic player can swap between MOD and STM
-without reshaping its audio pipeline.
+`oxideav-mod` also drives a Scream Tracker 2 (`.stm` module / `.sts`
+song) playback engine (`stm_player::StmPlayerState`), wired through the
+codec registry as codec id `"stm"`. The decoder accepts the whole-file
+packet emitted by the `stm` container, parses the header / patterns /
+sample bodies, and emits interleaved S16 stereo PCM at 44.1 kHz — the
+same output shape as the `"mod"` codec id.
 
-STM declares its effects as "in ProTracker format" per
-[`docs/audio/trackers/stm/ScreamTracker-v1.0-stm.txt`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/stm),
-so the implemented columns track the ProTracker semantics documented under
-`docs/audio/trackers/mod/`:
+Everything here follows the first-party material staged under
+[`docs/audio/trackers/stm/`](https://github.com/OxideAV/oxideav-workspace/tree/master/docs/audio/trackers/stm):
+the tracker author's `TECH.DOC` file-structure note and user manual
+(`ST.DOC` §2.3, §6.2, §6.4), the measured layout arbitration
+(`stm-pattern-packing-and-order-table.md`) and the black-box Scream
+Tracker 2.21 jump / break trace (`stm-effect-semantics-gap.md`,
+`fixtures/st221-jump-probes/`).
 
-| Slot | Effect | Status |
-| ---- | ------ | ------ |
-| 0xy  | Arpeggio | implemented (note / note+x / note+y half-steps cycling on `counter mod 3`; pure additive offset, inert at param 0) |
-| 1xy / 2xy | Portamento up / down | implemented (semitone-space, shared last-param memory) |
-| 3xy / 5xy | Tone portamento, with volume slide | implemented |
-| 4xy / 6xy | Vibrato, with volume slide | implemented (shared waveform LFO; sine default, shape set by E4x) |
-| 7xy | Tremolo | implemented (independent `trem_pos` register; volume offset clamped to `[0, 64]`; per-nibble memory; shape set by E7x) |
-| 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk); `900` reuses the latched `xx` per the canonical PT memory reading |
-| Axy | Volume slide | implemented |
-| Bxy | Position jump | implemented |
-| Cxx | Set volume | implemented |
-| Dxy | Pattern break (FT2-style decimal landing row) | implemented |
-| Fxx | Speed / tempo split (≤$1F = speed, ≥$20 = tempo) | implemented |
-| E1x / E2x | Fine portamento up / down | implemented |
-| E3x | Glissando control (snap tone-porta to nearest semitone) | implemented |
-| E4x / E7x | Vibrato / tremolo waveform (sine / ramp-down / square / +4 no-retrigger bit) | implemented (shared `waveform_lfo` shape catalogue; the +4 bit keeps the LFO phase across note-ons, note-delay triggers, and E9x retrigs) |
-| E6x | Pattern loop (per-channel start + count) | implemented |
-| E9x | Retrigger note every *x* ticks | implemented (cursor rewind + vibrato/tremolo phase reset on each retrig; row-scoped period; gated on `voice.active` so an idle channel isn't resurrected) |
-| EAx / EBx | Fine volume slide up / down | implemented |
-| ECx | Note cut | implemented |
-| EDx | Note delay | implemented |
-| EEx | Pattern delay (row repeats without retrigger) | implemented |
+### File layout
 
-Pitch effects operate in a fractional **semitone** domain (STM has no
-Amiga periods — pitch is derived from each instrument's C3 Hz), so the
-arpeggio offset is a direct semitone addition on top of the live pitch.
-The 0xy walk follows the canonical algorithm in
-`docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` 0:Arpeggio
-("if (counter mod 3) = 0/1/2 then play note / note+x / note+y").
+| Block | Reading |
+| ----- | ------- |
+| Header | 48 bytes: name, tracker id (`!Scream!`), `0x1A`, file type (1 song / 2 module), version (2.21 → `StmHeader::is_st221()`), tempo, pattern count, global volume |
+| Instruments | 31 × 32 bytes at `0x30`: name, disk, length, loop start / end (`0` / `65535` = no loop), default volume, C2SPD |
+| Orders | **128** bytes at `0x410`; `99` = unused, the first one ends the song (`StmHeader::song_length()`) |
+| Patterns | at `0x490`, 64 rows × 4 channels. A cell is four bytes — note (`octave << 4 \| note`), `instrument << 3 \| volume low`, `volume high << 4 \| command`, info — unless its note byte is 251 / 252 / 253, which is a **one-byte** cell. Modules written by ST 2.21 never use the one-byte forms (1 024 bytes per pattern); songs do, and the reader honours them for both types |
+| Samples | modules only: 8-bit **unsigned** bodies in instrument order, each padded to 16 bytes; the instrument record's last word is not used for placement. A song stores none — attach the external instrument files with `StmSampleBody::from_unsigned` |
 
-Tremolo (7xy) follows the same MOD/PT contract: a sine LFO modulates the
-output volume around the current `ch.volume` baseline (Cxx / Axy /
-EAx / EBx set the baseline; tremolo does not write back to it), the
-result is clamped to the spec's `[0, 64]` range before the global-volume
-scale, and the per-nibble memory (`trem_speed` from a non-zero `x`,
-`trem_depth` from a non-zero `y`) is independent of vibrato's so an
-LFO on volume can stack with an LFO on pitch on the same channel
-without phase-bleed. Cited in
-`docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` 7:Tremolo
-("If either xxxx or yyyy are 0, then values from the most recent prior
-tremolo will be used") and `multimedia-cx-protracker.html` 7xy ("Like
-vibrato, except we modify the output volume … clamped to 0 <= vol <=
-64").
+The volume field is seven bits wide: 0–64 is a volume, anything above
+(the tracker writes 65) means "none given". The third-party
+`ScreamTracker-v1.0-stm.txt` offsets (orders at `0x3D0`, patterns at
+`0x410`) are 64 bytes early for ST 2.21 files and are not used.
 
-Pattern loop (`E6x`) and pattern delay (`EEx`) round out the structural
-side of the PT extended-command set. `E60` records the current row as
-the channel's loop-start; a later `E6y` (y > 0) seeds an iteration
-counter and schedules a rewind back to the recorded start row inside
-the *same* pattern, decrementing on each visit until exhausted (per
-`Protracker-effects-MODFIL12.txt` E6 — "If yyyy=0 … specifies the
-loop's start point. Otherwise, it specifies the number of times to
-play this line and the preceding lines from the start point"). Loop
-state is per-channel, so two voices can drive independent loops
-without trampling each other's counters. `EEx` stalls `next_row` by
-`y` additional row-equivalents while a `in_pattern_delay_repeat` flag
-suppresses `enter_row` on the looped tick-0 — so held notes don't
-retrigger, tick-0 effects don't re-fire, and fine-volume slides don't
-compound across the delay (per `Protracker-effects-MODFIL12.txt` EE —
-"All notes and effects continue during this delay"). Per-tick effects
-(vibrato, volume slides, arpeggio, tone porta) keep animating
-underneath, which is what gives EE its characteristic
-held-note-with-LFO-still-running texture on real-world rips.
+### Commands
+
+The command nibble is Scream Tracker's own letter set (1 = `A` … 15 =
+`O`), not ProTracker numbering:
+
+| Letter | Command | Behaviour |
+| ------ | ------- | --------- |
+| `A` | Tempo | high nibble = ticks per row; one tick is 20 ms (the trace measures 0.12 s per row at `60`); `A00` ignored |
+| `B` | Jump | per the ST 2.21 trace, does **not** break the pattern — it replaces the order that follows it (the manual's "breaks the current pattern" is contradicted by the tracker); an unused / out-of-range target restarts the song at order 0 |
+| `C` | Break | next order — or a `B`'s target, with the `B` in either channel — at row 0, right after this row; no row argument |
+| `D` | Volume slide | per slide step: high nibble up, else low nibble down. Slide steps run `ticks − 1` times per row (manual: `D02` at tempo `60` = −10 per row) |
+| `E` / `F` | Portamento up / down | per slide step |
+| `G` | Note portamento | glides to the cell's note without retriggering, stops there; info 0 reuses the previous info |
+| `H` | Vibrato | high nibble speed, low nibble size; info 0 reuses the previous info |
+| `I` | Tremor | sound on / off for the two nibbles' times, carried across consecutive `I` rows |
+| `J` | Arpeggio | note, note + low nibble, note + high nibble |
+| `K` / `O` | Vibrato / note portamento (remembered) + volume slide | |
+| `L` `M` `N` | — | "converted, but not implemented": no-ops |
+
+Notes follow the manual's cell rules: an instrument number without a
+note has no effect; a note without one reuses the channel's last
+instrument; a note without a volume takes the instrument's default
+(also on a `G` row); a volume on its own changes the playing note.
+C2SPD is the rate that sounds as C at octave 2. The note forms `-0-`
+(252 / 254) and `...` (253 / 255) carry no note event — the example
+song shipped with ST 2.21 fills the rows under its sustained,
+volume-faded notes with 252 cells. Scream Tracker 2 mixes its four
+channels into one output device, so every channel plays centred.
+
+**One finite pass**: the song ends when the order list runs out, when a
+jump names an unused order (the tracker's `Loop` counter, exposed as
+`StmPlayerState::loops`), or when the flow re-enters an order it has
+already played (the example song loops with a `B01` on its last row).
+Clear `StmPlayerState::stop_on_repeat` to keep looping like the tracker.
+
+### Trace lockstep
+
+`tests/stm_st221_probes.rs` plays the seven staged probe modules
+(byte-identical copies under `tests/fixtures/st221-jump-probes/`) and
+asserts the row-by-row `(order, row)` flow the original tracker showed:
+**7 / 7 probes in lockstep** (`C` immediate; `B` alone / with a note
+deferred to the pattern end; `B` + `C` in both channel orders; `B` to an
+unused order), plus the audio cross-check — each pitch regime of
+`STBAUD.STM` lasts exactly one 7.68 s pattern. The real ST 2.21 example
+song (`SONG.STS`, read from the docs tree when present) parses to the
+last byte and plays one finite 7-order pass.
+
+### Not settled by the staged documents
+
+These are this engine's own conventions, pending a trace:
+
+- the unit of the `E` / `F` / `G` amounts (1/16 half note per step
+  here) and of the vibrato size, and the vibrato waveform (sine);
+- the tempo byte's low nibble (ignored: ticks stay 20 ms);
+- whether `E` is up and `F` down as the manual states (followed as
+  written);
+- the tremor step counts (a nibble of *n* lasts *n* + 1 steps here,
+  the only reading under which the example song's `I10` gates anything);
+- `D` with both nibbles set (up wins), and what the `-0-` note form
+  does in the tracker itself;
+- files from Scream Tracker 1.x / 2.0, said to carry a 64-entry order
+  table — none was obtainable, so only the 128-entry layout is read.
 
 ## Impulse Tracker (.it) playback coverage
 
@@ -864,17 +881,14 @@ against ours — the tests skip cleanly when the dylib is absent):
   decimal row), order jump (`Bxx`), and a mid-song speed change (`Fxx`):
   - the **XM** gate asserts `(order, row, speed)` **lockstep at all 240
     probes** of a 30-second trace (measured: 0 mismatches);
-  - the **STM** gate asserts the reference *accepts* the staged header
-    layout (it demonstrably validates the file-type byte) and that our
-    engine traverses the whole 3-order flow audibly. The reference's own
-    STM *playback* is recorded as an observation, not asserted: it
-    renders every variant we tried (fixed cells with each documented
-    marker byte, packed marker reading, several version/tempo stampings)
-    as ~0.12 s of silence with the order cursor racing to the end, and
-    with no known-good real-world STM available and no staged
-    effect/tempo semantics to arbitrate
-    (`docs/audio/trackers/stm/stm-effect-semantics-gap.md`), the
-    divergence is unattributable.
+  - the **STM** gate asserts the reference *accepts* the measured
+    Scream Tracker 2.21 layout and that our engine traverses the whole
+    3-order flow audibly. The reference's own STM playback is recorded
+    as an observation, not asserted — the authority for STM flow is the
+    staged trace of the original tracker (see *Trace lockstep* above).
+    With the corrected layout the reference plays the fixture for its
+    full length (it rendered the previous, 64-byte-early layout as
+    ~0.12 s of silence).
 
 ## Fuzz harness
 
@@ -887,13 +901,14 @@ aborting / OOMing.
 | ------ | --------------- |
 | `mod_decode` | `header::parse_header` → `player::parse_patterns` → `samples::extract_samples` → `player::PlayerState::new` → 2048-frame `render` |
 | `stm_decode` | `stm::parse_header` → `stm::parse_patterns` → `stm::extract_samples` → `stm_player::StmPlayerState::new` → 2048-frame `render` |
+| `stm_player_steered` | fuzz bytes read as a recipe for the hidden `stm_writer` (module or packed song, any tempo byte, order lists naming unused / unstored / repeated orders, every command letter and info byte, out-of-range notes / instruments / volumes / loop pairs) → rendered to the end of the pass, so the deferred-`B` / `C` state machine and the one-finite-pass stop are what the budget buys |
 | `xm_decode`  | `xm::parse_header` → `xm::parse_patterns` → `xm::parse_instruments` → `xm::extract_sample_bodies` → `xm_player::XmPlayerState::new` → 2048-frame `render` |
 | `it_decode`  | `it::parse_module` (header + message + instruments + samples + patterns) → `it_player::ItPlayerState::new` → 2048-frame `render` |
 | `xm_player_steered` | fuzz bytes read as a *recipe* for the hidden `xm_writer` (channels, tempo, instruments with arbitrary envelope / autovibrato / keymap bytes, samples with any loop bounds, cells with every effect byte) → always-valid module → 8192-frame `render`, so the player's state machines (loops / jumps, delays, envelopes, retrig, tremor, offsets) get the budget the raw parser target rejects |
 | `it_player_steered` | the same recipe idea through `it_writer`: NNA / DCT / DCA combinations, envelopes and sustain loops in any order, keymaps, every command letter and volume-column value → 8192-frame `render` |
 
 Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`;
-`.github/workflows/fuzz.yml` runs all six targets daily through the
+`.github/workflows/fuzz.yml` runs all seven targets daily through the
 org-level reusable workflow (30-minute budget). Round 458: the two
 steered targets ran 3.4 M / 6.4 M executions in 420 s each and the raw
 `xm_decode` / `it_decode` targets 3.7 M / 4.5 M in 300 s each on the
