@@ -647,6 +647,11 @@ impl Channel {
 
     /// Mix one sample from this channel into the float accumulator.
     /// Returns the post-volume signal in `-1.0..=1.0`.
+    ///
+    /// This is the per-frame reference form; playback goes through
+    /// [`Self::resolve_mix`] + [`Self::mix_resolved`], and a unit test
+    /// holds the two bit-identical.
+    #[cfg(test)]
     fn mix_one(
         &mut self,
         samples: &[SampleBody],
@@ -764,6 +769,142 @@ impl Channel {
         let step = chan_rate / out_rate;
         self.sample_pos += step;
 
+        out
+    }
+}
+
+/// Per-channel mixing constants for one tick block. Everything here
+/// only changes in `advance_tick` (period, vibrato / tremolo position,
+/// volume, pan, the triggered sample and — through `EFx` — the sample
+/// bytes), so it is resolved once per block instead of once per output
+/// frame. The values are computed with exactly the arithmetic the
+/// per-frame path used, so the PCM is unchanged.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChannelMix {
+    /// Channel sounding at the start of the block.
+    live: bool,
+    /// Index into `PlayerState::samples`.
+    body: usize,
+    pcm_len: usize,
+    looped: bool,
+    /// Loop end (looped) or body end, as the float and index bounds.
+    end_f: f32,
+    end_idx: usize,
+    loop_start_f: f32,
+    loop_start_idx: usize,
+    /// Tremolo-adjusted volume as a gain.
+    vol: f32,
+    /// Sample-position increment per output frame.
+    step: f32,
+    /// Pan gains.
+    gl: f32,
+    gr: f32,
+}
+
+impl Channel {
+    /// Resolve this channel's [`ChannelMix`] for the coming block.
+    fn resolve_mix(
+        &self,
+        samples: &[SampleBody],
+        out_rate: f32,
+        vib_offset: i16,
+        trem_offset: i16,
+        separation: f32,
+    ) -> ChannelMix {
+        let (gl, gr) = pan_gains(self.pan, separation);
+        let mut m = ChannelMix {
+            gl,
+            gr,
+            ..ChannelMix::default()
+        };
+        if !self.active || self.period == 0 {
+            return m;
+        }
+        let idx = self.sample_index as usize;
+        if idx == 0 || idx > samples.len() {
+            return m;
+        }
+        let body = &samples[idx - 1];
+        if body.pcm.is_empty() {
+            return m;
+        }
+        m.live = true;
+        m.body = idx - 1;
+        m.pcm_len = body.pcm.len();
+        m.looped = body.is_looped();
+        m.end_f = if m.looped {
+            ((body.loop_start as usize + body.loop_length as usize).min(m.pcm_len)) as f32
+        } else {
+            m.pcm_len as f32
+        };
+        m.end_idx = m.end_f as usize;
+        m.loop_start_f = body.loop_start as f32;
+        m.loop_start_idx = body.loop_start as usize;
+        let eff_vol = (self.volume as i16 + trem_offset).clamp(0, 64);
+        m.vol = eff_vol as f32 / 64.0;
+        let eff_period = self.effective_period(vib_offset) as f32;
+        let chan_rate = PAULA_CLOCK / eff_period;
+        m.step = chan_rate / out_rate;
+        m
+    }
+
+    /// One output frame of this channel under the block's resolved
+    /// constants — the per-frame remainder of [`Self::mix_one`]: loop
+    /// wrap, linear interpolation, the trigger ramp and the position
+    /// advance.
+    #[inline]
+    fn mix_resolved(&mut self, pcm: &[i8], m: &ChannelMix) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+        let pos = self.sample_pos;
+        if pos >= m.end_f {
+            if m.looped {
+                let span = m.end_f - m.loop_start_f;
+                if span > 0.0 {
+                    let over = pos - m.loop_start_f;
+                    self.sample_pos = m.loop_start_f + over.rem_euclid(span);
+                } else {
+                    self.active = false;
+                    return 0.0;
+                }
+            } else {
+                self.active = false;
+                return 0.0;
+            }
+        }
+
+        let last = m.pcm_len - 1;
+        let i = self.sample_pos as usize;
+        let frac = self.sample_pos - i as f32;
+        let s0_idx = i.min(last);
+        let s0 = pcm[s0_idx] as f32 / 128.0;
+        let s1_idx = if i + 1 < m.end_idx {
+            i + 1
+        } else if m.looped {
+            m.loop_start_idx
+        } else {
+            s0_idx
+        };
+        let s1 = pcm[s1_idx.min(last)] as f32 / 128.0;
+        let interp = s0 + (s1 - s0) * frac;
+        let out_raw = interp * m.vol;
+
+        let out = if self.ramp_remaining_frames > 0 {
+            let total = PlayerState::RAMP_FRAMES as f32;
+            let consumed = total - self.ramp_remaining_frames as f32;
+            let t = (consumed / total).clamp(0.0, 1.0);
+            let mixed = self.ramp_prev_sample * (1.0 - t) + out_raw * t;
+            self.ramp_remaining_frames -= 1;
+            if self.ramp_remaining_frames == 0 {
+                self.ramp_prev_sample = 0.0;
+            }
+            mixed
+        } else {
+            out_raw
+        };
+        self.last_mixed_sample = out;
+        self.sample_pos += m.step;
         out
     }
 }
@@ -901,6 +1042,8 @@ pub struct PlayerState {
     /// per MOD channel. Don't mix `render` and `render_per_channel`
     /// calls on the same instance — the slot semantics differ and the
     /// filter state would smear across modes.
+    /// Per-channel mixing constants of the current tick block.
+    mix_params: Vec<ChannelMix>,
     led_filter_state: Vec<f32>,
     /// Second filter pole (only applied when LED is ON). Same slot
     /// shape as `led_filter_state`.
@@ -1012,6 +1155,7 @@ impl PlayerState {
             // toggles it off. See `Protracker-v1.1B-mod.txt` Cmd E0
             // ("C-300E00 connects filter (turns power LED on)").
             led_filter: true,
+            mix_params: Vec::new(),
             led_filter_state: Vec::new(),
             led_filter_state2: Vec::new(),
             led_filter_alpha: f32::NAN,
@@ -1828,6 +1972,7 @@ impl PlayerState {
     /// right-panned voices (e.g. "hallucinations" by ???) sound
     /// broken to a listener whose left ear receives no signal at
     /// all for several seconds.
+    #[cfg(test)]
     fn sample_all_channels(&mut self, per_channel: &mut [f32]) -> (f32, f32) {
         let out_rate = self.sample_rate as f32;
         let mut l = 0.0f32;
@@ -1907,6 +2052,7 @@ impl PlayerState {
     /// hard pan to keep intros that only use one side audible on
     /// both ears. Set to `1.0` for strict spec-faithful Amiga
     /// hard pan.
+    #[cfg(test)]
     fn render_one(&mut self, out: &mut [i16]) {
         let mut per_channel = vec![0.0f32; self.channels.len()];
         let (l, r) = self.sample_all_channels(&mut per_channel);
@@ -1921,6 +2067,124 @@ impl PlayerState {
         let r = r.clamp(-1.0, 1.0);
         out[0] = (l * 32767.0) as i16;
         out[1] = (r * 32767.0) as i16;
+    }
+
+    /// The pre-block-mixer render loop (per-frame parameter resolution),
+    /// kept as the reference the block mixer is tested against.
+    #[cfg(test)]
+    fn render_reference(&mut self, dst: &mut [i16]) -> usize {
+        let mut produced = 0usize;
+        let total_frames = dst.len() / 2;
+        while produced < total_frames {
+            if self.ended {
+                break;
+            }
+            if self.tick_sample_cursor == 0 {
+                self.advance_tick();
+            }
+            let spt = self.samples_per_tick().max(1);
+            let remaining_in_tick = spt.saturating_sub(self.tick_sample_cursor);
+            let want = (total_frames - produced).min(remaining_in_tick as usize);
+            for _ in 0..want {
+                let off = produced * 2;
+                self.render_one(&mut dst[off..off + 2]);
+                produced += 1;
+            }
+            self.tick_sample_cursor += want as u32;
+            if self.tick_sample_cursor >= spt {
+                self.tick_sample_cursor = 0;
+                self.tick += 1;
+                if self.tick >= self.speed {
+                    self.tick = 0;
+                    self.next_row();
+                }
+            }
+        }
+        produced
+    }
+
+    /// Mix one tick block: either `stereo.len() / 2` interleaved frames
+    /// into `stereo`, or `count` frames into each per-channel plane
+    /// starting at `offset`.
+    ///
+    /// The per-channel constants (pitch step, tremolo-adjusted volume,
+    /// pan gains, loop bounds) are resolved once here; the frame loop
+    /// keeps the arithmetic and the summation order of the per-frame
+    /// path ([`Self::sample_all_channels`] + [`Self::render_one`]), so
+    /// the PCM is bit-identical to it.
+    fn mix_block(&mut self, stereo: &mut [i16], planar: Option<(&mut [&mut [i16]], usize, usize)>) {
+        let out_rate = self.sample_rate as f32;
+        let n_ch = self.channels.len();
+        let separation = self.pan_separation;
+        let mut params = std::mem::take(&mut self.mix_params);
+        params.clear();
+        for ch in &self.channels {
+            let vib = Self::vibrato_offset(ch);
+            let trem = Self::tremolo_offset(ch);
+            params.push(ch.resolve_mix(&self.samples, out_rate, vib, trem, separation));
+        }
+        let norm = ((n_ch as f32 / 2.0) + 1.0).max(1.0);
+        let led = self.led_filter;
+
+        match planar {
+            None => {
+                self.ensure_led_filter(2);
+                let (a1, a2) = (self.led_filter_alpha, self.led_filter_alpha2);
+                let mut s1 = [self.led_filter_state[0], self.led_filter_state[1]];
+                let mut s2 = [self.led_filter_state2[0], self.led_filter_state2[1]];
+                // Frame-major on purpose: each channel's position /
+                // ramp state is a serial chain, and interleaving the
+                // channels lets those chains overlap (a channel-major
+                // loop measured three times slower here).
+                let samples = &self.samples;
+                let channels = &mut self.channels;
+                for frame in stereo.as_chunks_mut::<2>().0 {
+                    let mut l = 0.0f32;
+                    let mut r = 0.0f32;
+                    for (ch, m) in channels.iter_mut().zip(params.iter()) {
+                        let smp = if m.live {
+                            ch.mix_resolved(&samples[m.body].pcm, m)
+                        } else {
+                            0.0
+                        };
+                        l += smp * m.gl;
+                        r += smp * m.gr;
+                    }
+                    let bus = [l / norm, r / norm];
+                    for side in 0..2 {
+                        // Stage 1 (always on), then the LED-gated stage.
+                        let y1 = a1 * bus[side] + (1.0 - a1) * s1[side];
+                        s1[side] = y1;
+                        let y = if led {
+                            let y2 = a2 * y1 + (1.0 - a2) * s2[side];
+                            s2[side] = y2;
+                            y2
+                        } else {
+                            y1
+                        };
+                        frame[side] = (y.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    }
+                }
+                self.led_filter_state[..2].copy_from_slice(&s1);
+                self.led_filter_state2[..2].copy_from_slice(&s2);
+            }
+            Some((planes, offset, count)) => {
+                self.ensure_led_filter(planes.len());
+                for n in offset..offset + count {
+                    for (ch_idx, plane) in planes.iter_mut().enumerate() {
+                        let m = &params[ch_idx];
+                        let raw = if m.live {
+                            self.channels[ch_idx].mix_resolved(&self.samples[m.body].pcm, m)
+                        } else {
+                            0.0
+                        };
+                        let filtered = self.led_filter_step(ch_idx, raw);
+                        plane[n] = (filtered.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    }
+                }
+            }
+        }
+        self.mix_params = params;
     }
 
     /// Render `n_frames` stereo samples into `dst` (interleaved S16,
@@ -1942,11 +2206,8 @@ impl PlayerState {
             let remaining_in_tick = spt.saturating_sub(self.tick_sample_cursor);
             let want = (total_frames - produced).min(remaining_in_tick as usize);
 
-            for _ in 0..want {
-                let off = produced * 2;
-                self.render_one(&mut dst[off..off + 2]);
-                produced += 1;
-            }
+            self.mix_block(&mut dst[produced * 2..(produced + want) * 2], None);
+            produced += want;
 
             self.tick_sample_cursor += want as u32;
             if self.tick_sample_cursor >= spt {
@@ -1978,7 +2239,6 @@ impl PlayerState {
         }
 
         let mut produced = 0usize;
-        let mut scratch = vec![0.0f32; self.channels.len()];
 
         while produced < n_frames {
             if self.ended {
@@ -1994,21 +2254,10 @@ impl PlayerState {
             // For per-channel output the Amiga LED filter is applied
             // independently on each plane — a downstream consumer that
             // re-mixes the planes still sees the same global filter
-            // shape that mixed playback would produce. We allocate one
-            // filter slot per plane.
-            let n_planes = planes.len();
-            for _ in 0..want {
-                // Discard the stereo mix; we only need per-channel here.
-                let _ = self.sample_all_channels(&mut scratch);
-                self.ensure_led_filter(n_planes);
-                for (ch_idx, plane) in planes.iter_mut().enumerate() {
-                    let raw = scratch[ch_idx];
-                    let filtered = self.led_filter_step(ch_idx, raw);
-                    let v = filtered.clamp(-1.0, 1.0);
-                    plane[produced] = (v * 32767.0) as i16;
-                }
-                produced += 1;
-            }
+            // shape that mixed playback would produce. One filter slot
+            // per plane.
+            self.mix_block(&mut [], Some((planes, produced, want)));
+            produced += want;
 
             self.tick_sample_cursor += want as u32;
             if self.tick_sample_cursor >= spt {
@@ -5996,6 +6245,64 @@ pub mod tests {
             assert!(frames < 44_100 * 600);
         }
         assert_eq!(frames, 8 * 6 * 882);
+    }
+
+    #[test]
+    fn block_mixer_is_bit_identical_to_the_per_frame_reference() {
+        // A busy 4-channel pattern: notes on every channel, looped and
+        // one-shot playback, vibrato, tremolo, arpeggio, slides, sample
+        // offset, retrigger, pan commands, LED filter toggles and an
+        // invert-loop — rendered through the block mixer (odd chunk
+        // sizes, so blocks start mid-tick) and through the per-frame
+        // reference loop.
+        let mut cells = Vec::new();
+        let fxs = [
+            fx(0x4, 0x46),
+            fx(0x7, 0x47),
+            fx(0x0, 0x37),
+            fx(0x1, 0x03),
+            fx(0x2, 0x03),
+            fx(0xA, 0x02),
+            fx(0x9, 0x01),
+            fx(0xE, 0x93),
+            fx(0x8, 0x40),
+            fx(0xE, 0x01),
+            fx(0xE, 0x00),
+            fx(0xE, 0xF3),
+            fx(0xC, 0x20),
+            fx(0x3, 0x08),
+        ];
+        let periods = [428u16, 340, 285, 214, 170, 143];
+        for row in 0..64usize {
+            for ch in 0..4usize {
+                let k = row * 4 + ch;
+                let mut cell = fxs[(k * 7 + row) % fxs.len()];
+                if k % 3 == 0 {
+                    cell.period = periods[k % periods.len()];
+                    cell.sample = 1;
+                }
+                cells.push((row, ch, cell));
+            }
+        }
+        let bytes = synth_mod_with_pattern(&cells);
+        let mut reference = make_player(&bytes);
+        let mut want = vec![0i16; 2 * 64 * 6 * 882];
+        let n = reference.render_reference(&mut want);
+        assert_eq!(n, 64 * 6 * 882);
+        assert!(want.iter().any(|&v| v != 0));
+
+        let mut block = make_player(&bytes);
+        let mut got = Vec::with_capacity(want.len());
+        let mut chunk = vec![0i16; 2 * 1009];
+        loop {
+            let n = block.render(&mut chunk);
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n * 2]);
+        }
+        assert_eq!(got.len(), want.len());
+        assert!(got == want, "block mixer diverged from the reference");
     }
 
     #[test]

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Mixer hot loops no longer redo per-tick work per output frame — bit-identical PCM (hash-checked on every benchmark input, plus two unit tests against the per-frame reference paths). MOD: per-frame scratch allocation removed and the LFO / pan / pitch-step / loop-bound derivation resolved once per tick block (2.2–2.3× faster). Shared mixer: `MixerVoice::resolve_block` + `render_resolved` hoist source length, loop bounds and the frequency division (STM 1.3×, IT 1.4–1.7×); XM additionally mixes voice-major (1.95–2.24×). New `benches/throughput.rs` (`cargo bench --bench throughput`) and a README table with the before → after numbers.
+
 ### Changed
 
 - **STM rebuilt on the staged first-party Scream Tracker 2 material** (`docs/audio/trackers/stm/`: `TECH.DOC`, the user manual, the measured layout arbitration and the black-box ST 2.21 jump / break trace). The previous reader used a third-party description whose order table and pattern offsets are 64 bytes early for ST 2.21 files, and played the command nibble as ProTracker effects.

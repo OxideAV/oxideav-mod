@@ -110,6 +110,21 @@ pub struct MixerVoice {
     pub active: bool,
 }
 
+/// Per-block constants of a voice over a sample source — see
+/// [`MixerVoice::resolve_block`].
+#[derive(Clone, Copy, Debug)]
+pub struct VoiceBlock {
+    len: usize,
+    loop_start: usize,
+    loop_end: usize,
+    ping_pong: bool,
+    forward: bool,
+    looping: bool,
+    wrap_at: f32,
+    step: f32,
+    out_rate: f32,
+}
+
 impl MixerVoice {
     /// Trigger a fresh note. Resets the cursor to 0 and sets the
     /// frequency + volume. Direction is forward.
@@ -193,6 +208,86 @@ impl MixerVoice {
         // Advance (forward-only paths reach here).
         self.pos += self.freq / out_rate;
 
+        interp * self.volume
+    }
+
+    /// Resolve the per-block constants of this voice over `source`:
+    /// everything [`Self::render_one`] derives afresh on every frame
+    /// from values that only change between ticks (the source's length
+    /// and loop bounds, the loop kind, the position step). `None` when
+    /// the pair cannot sound at all (empty source, no frequency).
+    ///
+    /// [`Self::render_resolved`] then produces exactly the frames
+    /// `render_one` would, as long as `freq` and the source stay
+    /// untouched for the duration of the block.
+    pub fn resolve_block<S: SampleSource + ?Sized>(
+        &self,
+        source: &S,
+        out_rate: f32,
+    ) -> Option<VoiceBlock> {
+        if source.is_empty() || self.freq <= 0.0 || out_rate <= 0.0 {
+            return None;
+        }
+        let len = source.len();
+        let loop_start = source.loop_start().min(len.saturating_sub(1));
+        let loop_end = source.loop_end().min(len);
+        let kind = source.loop_kind();
+        let has_span = loop_end > loop_start;
+        let forward = matches!(kind, LoopKind::Forward) && has_span;
+        Some(VoiceBlock {
+            len,
+            loop_start,
+            loop_end,
+            ping_pong: matches!(kind, LoopKind::PingPong) && has_span,
+            forward,
+            looping: !matches!(kind, LoopKind::None) && has_span,
+            wrap_at: if forward { loop_end as f32 } else { len as f32 },
+            step: self.freq / out_rate,
+            out_rate,
+        })
+    }
+
+    /// One frame under constants from [`Self::resolve_block`] —
+    /// bit-identical to [`Self::render_one`] on the same voice / source.
+    #[inline]
+    pub fn render_resolved<S: SampleSource + ?Sized>(&mut self, source: &S, b: &VoiceBlock) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+        if b.ping_pong {
+            return self.render_ping_pong(source, b.len, b.loop_start, b.loop_end, b.out_rate);
+        }
+        if self.pos < 0.0 {
+            self.active = false;
+            return 0.0;
+        }
+        if self.pos >= b.wrap_at {
+            if b.forward {
+                let span = (b.loop_end - b.loop_start) as f32;
+                let over = self.pos - b.loop_start as f32;
+                self.pos = b.loop_start as f32 + over.rem_euclid(span);
+            } else {
+                self.active = false;
+                return 0.0;
+            }
+        }
+        let i = (self.pos as usize).min(b.len - 1);
+        let frac = self.pos - (i as f32);
+        let s0 = source.at(i);
+        let s1_idx = if b.looping {
+            if i + 1 < b.loop_end {
+                i + 1
+            } else {
+                b.loop_start
+            }
+        } else if i + 1 < b.len {
+            i + 1
+        } else {
+            i
+        };
+        let s1 = source.at(s1_idx);
+        let interp = s0 + (s1 - s0) * frac;
+        self.pos += b.step;
         interp * self.volume
     }
 
@@ -778,5 +873,75 @@ mod tests {
         let mut v = MixerVoice::default();
         v.trigger(0.0, 1.0);
         assert_eq!(v.render_one(&src, 44100.0), 0.0);
+    }
+    #[test]
+    fn resolved_block_rendering_is_bit_identical_to_render_one() {
+        // Every loop kind, loop regions shorter than the body, a pitch
+        // above and below the output rate, positions starting inside
+        // and past the loop — frame by frame against `render_one`.
+        struct Src {
+            pcm: Vec<f32>,
+            ls: usize,
+            le: usize,
+            kind: LoopKind,
+        }
+        impl SampleSource for Src {
+            fn len(&self) -> usize {
+                self.pcm.len()
+            }
+            fn loop_start(&self) -> usize {
+                self.ls
+            }
+            fn loop_end(&self) -> usize {
+                self.le
+            }
+            fn loop_kind(&self) -> LoopKind {
+                self.kind
+            }
+            fn at(&self, idx: usize) -> f32 {
+                self.pcm[idx]
+            }
+        }
+        let pcm: Vec<f32> = (0..97)
+            .map(|i| ((i * 37 % 61) as f32 - 30.0) / 31.0)
+            .collect();
+        for kind in [LoopKind::None, LoopKind::Forward, LoopKind::PingPong] {
+            for (ls, le) in [(0usize, 97usize), (10, 60), (50, 50), (90, 200)] {
+                for freq in [3000.0f32, 44_100.0, 97_531.0] {
+                    for start in [0.0f32, 55.5, 96.9] {
+                        let src = Src {
+                            pcm: pcm.clone(),
+                            ls,
+                            le,
+                            kind,
+                        };
+                        let mut a = MixerVoice::default();
+                        a.trigger(freq, 0.7);
+                        a.pos = start;
+                        let mut b = a.clone();
+                        let block = b.resolve_block(&src, 44_100.0).unwrap();
+                        for n in 0..700 {
+                            let x = a.render_one(&src, 44_100.0);
+                            let y = b.render_resolved(&src, &block);
+                            assert!(
+                                x.to_bits() == y.to_bits() && a.pos.to_bits() == b.pos.to_bits(),
+                                "{kind:?} {ls}..{le} f{freq} s{start} frame {n}: {x} vs {y}"
+                            );
+                            assert_eq!(a.active, b.active);
+                        }
+                    }
+                }
+            }
+        }
+        // Nothing to resolve for a silent pair.
+        let empty = Src {
+            pcm: Vec::new(),
+            ls: 0,
+            le: 0,
+            kind: LoopKind::None,
+        };
+        let mut v = MixerVoice::default();
+        v.trigger(1000.0, 1.0);
+        assert!(v.resolve_block(&empty, 44_100.0).is_none());
     }
 }

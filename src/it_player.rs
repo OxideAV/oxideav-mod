@@ -30,7 +30,7 @@ use crate::it::{
     IT_VOLCOL_PORTA_SLIDE_TABLE, ItCell, ItDca, ItDct, ItEnvelope, ItFilterMessage, ItFrozenView,
     ItInstrument, ItLoopView, ItModule, ItNna, ItPattern, ItSample, ItVibratoWave, ItVolumeColumn,
 };
-use crate::mixer::MixerVoice;
+use crate::mixer::{MixerVoice, VoiceBlock};
 
 // ============================================================================
 // Tables — §"Internal Tables"
@@ -2105,7 +2105,7 @@ impl ItPlayerState {
             // walk only the sounding voices per frame. The per-voice
             // arithmetic and the summation order are unchanged, so the
             // output is byte-identical to the per-frame form.
-            let mut slots: Vec<(usize, f32, ItFrozenView<'_>)> = Vec::new();
+            let mut slots: Vec<(usize, f32, ItFrozenView<'_>, Option<VoiceBlock>)> = Vec::new();
             for (idx, v) in self.voices.iter_mut().enumerate() {
                 if !v.active {
                     continue;
@@ -2126,17 +2126,30 @@ impl ItPlayerState {
                     sustain: !v.released,
                 }
                 .frozen();
-                slots.push((idx, pf, view));
+                // Loop bounds and the position step are fixed for the
+                // block as well.
+                let block = v.mixer.resolve_block(&view, out_rate);
+                slots.push((idx, pf, view, block));
             }
-            for _ in 0..want {
+            // Frame-major on purpose: a filtered voice is a serial
+            // recurrence (each output needs the previous two), and
+            // interleaving the voices lets those chains overlap — a
+            // voice-major loop measured slower on filter-heavy songs.
+            for frame in dst[produced * 2..(produced + want) * 2]
+                .as_chunks_mut::<2>()
+                .0
+            {
                 let mut l = 0.0f32;
                 let mut r = 0.0f32;
-                for (idx, pf, view) in &slots {
+                for (idx, pf, view, block) in &slots {
                     let v = &mut self.voices[*idx];
                     if !v.active {
                         continue;
                     }
-                    let mut s = v.mixer.render_one(view, out_rate);
+                    let mut s = match block {
+                        Some(block) => v.mixer.render_resolved(view, block),
+                        None => 0.0,
+                    };
                     if let Some([a, b, c]) = v.filter {
                         // K[n] = a·S[n] + b·K[n-1] + c·K[n-2]
                         let k = a * s + b * v.filter_k[0] + c * v.filter_k[1];
@@ -2152,11 +2165,10 @@ impl ItPlayerState {
                 }
                 let l = (l * mix_vol).clamp(-1.0, 1.0);
                 let r = (r * mix_vol).clamp(-1.0, 1.0);
-                let off = produced * 2;
-                dst[off] = (l * 32767.0) as i16;
-                dst[off + 1] = (r * 32767.0) as i16;
-                produced += 1;
+                frame[0] = (l * 32767.0) as i16;
+                frame[1] = (r * 32767.0) as i16;
             }
+            produced += want;
 
             self.tick_sample_cursor += want as u32;
             if self.tick_sample_cursor >= spt {

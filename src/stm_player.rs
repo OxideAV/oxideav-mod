@@ -47,7 +47,7 @@
 //! Scream Tracker 2 mixes its four channels to one output (PC speaker,
 //! Covox or Sound Blaster DAC), so every channel plays centred.
 
-use crate::mixer::MixerVoice;
+use crate::mixer::{MixerVoice, VoiceBlock};
 use crate::stm::{
     ORDER_UNUSED, PATTERN_ROWS, STM_CHANNELS, StmCell, StmHeader, StmNoteKind, StmPattern,
     StmSampleBody,
@@ -464,20 +464,23 @@ impl StmPlayerState {
 
             let block = &mut dst[produced * 2..(produced + want) * 2];
             let samples = &self.samples;
-            // Resolve each channel's body once per tick block.
-            let mut bodies: [Option<&StmSampleBody>; STM_CHANNELS] = [None; STM_CHANNELS];
+            // Resolve each channel's body, loop bounds and position
+            // step once per tick block.
+            let mut bodies: [Option<(&StmSampleBody, VoiceBlock)>; STM_CHANNELS] =
+                [None; STM_CHANNELS];
             for (slot, ch) in bodies.iter_mut().zip(self.channels.iter()) {
                 if ch.voice.active {
                     *slot = (ch.instrument as usize)
                         .checked_sub(1)
-                        .and_then(|i| samples.get(i));
+                        .and_then(|i| samples.get(i))
+                        .and_then(|body| Some((body, ch.voice.resolve_block(body, out_rate)?)));
                 }
             }
             for frame in block.as_chunks_mut::<2>().0 {
                 let mut mix = 0.0f32;
                 for (ch, body) in self.channels.iter_mut().zip(bodies.iter()) {
-                    if let Some(body) = body {
-                        mix += ch.voice.render_one(*body, out_rate);
+                    if let Some((body, voice_block)) = body {
+                        mix += ch.voice.render_resolved(*body, voice_block);
                     }
                 }
                 // Four channels into one output: divide by the channel

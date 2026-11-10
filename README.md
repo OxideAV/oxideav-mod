@@ -989,6 +989,59 @@ against ours — the tests skip cleanly when the dylib is absent):
     full length (it rendered the previous, 64-byte-early layout as
     ~0.12 s of silence).
 
+## Render throughput
+
+`cargo bench --bench throughput` (plain `main`, no harness) renders one
+full pass per input at 44.1 kHz stereo S16, several times, and prints
+the best wall time, the "× realtime" factor and an FNV-1a hash of the
+PCM. Inputs: the Scream Tracker 2.21 example song and the two Impulse
+Tracker 2.14p5 example songs from the staged docs tree (real,
+tracker-written files; skipped when the tree is absent), plus dense
+synthetic modules for every format — MOD and XM have no real module
+staged, so theirs are synthetic only (every row of every channel
+carries a note or an effect). `OXIDEAV_MOD_BENCH=<file>` adds any
+module.
+
+Round 486 mixer work, measured on an Apple-silicon laptop with the
+before / after binaries run interleaved (best of 14 runs each; the PCM
+hash is identical before and after for every input):
+
+| Input | Audio | Before | After | Speed-up |
+| ----- | ----: | -----: | ----: | -------: |
+| MOD synthetic, 4 channels × 32 patterns | 245.8 s | 323.9 ms (759×) | 149.5 ms (1 644×) | 2.17× |
+| MOD synthetic, 8 channels × 32 patterns | 245.8 s | 467.6 ms (526×) | 202.9 ms (1 211×) | 2.30× |
+| STM ST 2.21 example song | 45.7 s | 30.0 ms (1 523×) | 22.7 ms (2 013×) | 1.32× |
+| STM synthetic, 32 patterns | 245.8 s | 162.5 ms (1 513×) | 121.4 ms (2 025×) | 1.34× |
+| XM synthetic, 16 channels × 24 patterns | 184.3 s | 559.1 ms (330×) | 286.7 ms (643×) | 1.95× |
+| XM synthetic, 32 channels × 24 patterns | 184.3 s | 1 104.3 ms (167×) | 493.9 ms (373×) | 2.24× |
+| IT `CHRIS31B.IT` (IT 2.14p5 example) | 398.4 s | 1 695.3 ms (235×) | 1 007.8 ms (395×) | 1.68× |
+| IT `JEFF93.IT` (IT 2.14p5 example, filters) | 148.9 s | 715.2 ms (208×) | 481.3 ms (309×) | 1.49× |
+| IT synthetic, 64 channels with NNA (up to 256 voices) | 122.9 s | 5 159.5 ms (24×) | 3 753.9 ms (33×) | 1.37× |
+
+What changed (all of it keeps the arithmetic and the per-frame
+summation order, so the output is bit-identical — pinned by
+`player::tests::block_mixer_is_bit_identical_to_the_per_frame_reference`
+and `mixer::tests::resolved_block_rendering_is_bit_identical_to_render_one`):
+
+- **MOD**: the per-frame path allocated a scratch `Vec` for every output
+  frame and re-derived, per channel per frame, the vibrato / tremolo
+  LFO values, the pan gains, the Paula-period → step division and the
+  loop bounds. `PlayerState::mix_block` resolves those once per tick
+  block (`ChannelMix`) and the frame loop only interpolates, ramps and
+  advances.
+- **Shared mixer (STM / XM / IT)**: `MixerVoice::resolve_block` hoists
+  the source length, loop bounds, loop kind and the `freq / rate`
+  division out of the frame loop; `render_resolved` is the per-frame
+  remainder. XM's sample-header loop accessors were being re-evaluated
+  three times per voice per frame.
+- **XM** mixes voice-major (each voice runs its block in a tight loop
+  into per-frame accumulators — same additions in the same order).
+  The same restructuring was measured *slower* for MOD (×3) and for
+  filter-heavy IT (×1.6): there each voice is a serial recurrence
+  (position / ramp state, the IIR filter), and a frame-major loop lets
+  the voices' chains overlap. They stay frame-major, with a comment
+  saying why.
+
 ## Fuzz harness
 
 A `cargo-fuzz` harness under `fuzz/` drives the four parser

@@ -31,3 +31,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # the test if the reference dylib isn't installed — there is no
 # compile-time link.
 dlsym = "0.0.2"
+
+# Render-throughput measurement (plain `main`, no bench harness):
+# `cargo bench --bench throughput`.
+[[bench]]
+name = "throughput"
+harness = false
