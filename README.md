@@ -847,8 +847,8 @@ from
   (`SC0` immediately), `SDx` delay, `SEx` row delay; `S00` reuses the
   last `Sxx`), `Txx` (`T0x`/`T1x` tempo slides per tick), `Vxx` /
   `Wxy` global volume, `Xxx` pan (0–255 → 0–64), `Yxy` panbrello
-  (4× table, random-shape delay), `Zxx` MIDI macro = documented no-op
-  (the text pins no macro semantics). Volume column: volume, pan
+  (4× table, random-shape delay), `Zxx` / `SFx` MIDI macros read as
+  resonant-filter control (see *Resonant filter* below). Volume column: volume, pan
   (`128–192`), fine / normal volume slides with their own shared memory,
   pitch slides (`x×4` into the `E`/`F` memory), portamento via the
   `SlideTable` into the `G` memory, vibrato depth into the `H` memory.
@@ -859,7 +859,7 @@ from
 
 ### Black-box oracle gates
 
-`tests/it_oracle_compare.rs` renders 18 synthetic fixtures (built with
+`tests/it_oracle_compare.rs` renders 19 synthetic fixtures (built with
 the crate's own writer) through this engine and through an installed
 command-line player — `openmpt123 --render` or `xmp -o`, invoked as
 opaque binaries whose PCM alone is read — and asserts per-row dominant
@@ -872,6 +872,44 @@ behaviour, sample vibrato sweep, `Sxx` memory and the absolute mix level
 residual RMS deltas (2–7%, growing toward silence) are the oracle's
 half-tick volume ramp, not an engine difference. The tests print a
 clean SKIP when no oracle binary is on `PATH`, so CI stays green.
+
+### Resonant filter
+
+Impulse Tracker's drivers filter a note when they see one of two MIDI
+messages, `F0 F0 00 <cutoff>` and `F0 F0 01 <resonance>` (`FILTERS.TXT`),
+and `Zxx` is how a pattern sends them (`MIDI.TXT`): `Z00`–`Z7F`
+substitute their value for `z` in the parameterised macro selected by
+`SFx` (`SF0` on every channel at start), `Z80`–`ZFF` send a fixed macro.
+`it::ItMidiMacros` holds the table — the file's embedded configuration
+when `Special` bit 3 is set (153 × 32-byte fields after the offset
+tables and the bit-1 record block, as measured on the tracker-written
+`JEFF93.IT`), else the shipped default (`SF0 = F0F000z`: cutoff;
+`Z80`–`Z8F = F0F001 00 … 78`: resonance in steps of 8) — and
+`ItMidiMacros::filter_message` interprets a macro as one of the two
+messages (values above `7F` ignored). Instruments start their notes
+from `IFC` / `IFR` when bit 7 of the byte is set (`initial_cutoff()` /
+`initial_resonance()`; the enable bit is measured on the same file).
+Cutoff `7F` with resonance 0 is "no filters are applied".
+
+The per-voice filter is the two-pole form staged in
+`multimedia-cx-impulse-tracker.html`, `K[n] = a·S[n] + b·K[n−1] +
+c·K[n−2]` with `a = 1/(1+d+e)`, `b = (d+2e)·a`, `c = −e·a`,
+`d = 2p(r+1) − 1`, `e = r²`, `p = 10^(−resonance·24/(128·20))`. The page
+prints `r` as `rate · (2π·110·2^0.25) / 2^(cutoff/24)`, which is not a
+frequency ratio (it would silence every setting); `it_player::
+filter_coefficients` uses the dimensionally consistent `r = rate /
+(2π·fc)`, `fc = 110 · 2^(0.25 + cutoff/24)` Hz — unity DC gain, corner
+at 131 Hz for cutoff 0 and 5.1 kHz for 127. Coefficients are resolved
+once per tick per sounding voice.
+
+`tests/it_oracle_compare.rs::oracle_resonant_filter_cutoff_and_resonance`
+asserts what this engine and the black-box oracle agree on (low-pass
+ordering, `Z00` removes most of a 261 Hz square's level, `Z84`…`Z8F`
+raise the level step by step) and prints the disagreement: the oracle
+leaves that tone's level untouched from `Z70` down to `Z20`, i.e. it
+places the corner far higher than the staged formula for the same
+cutoff value. No first-party text arbitrates, so the documented law
+stands — flagged for a trace.
 
 ### IT214 sample decompression
 
@@ -903,10 +941,15 @@ from the exact block closure, not compared.
 ### Known gaps (docs asks filed by the round parent)
 
 - **Stereo sample layout**: the text says "not supported yet".
-- **Resonant filter** (`IFC` / `IFR`, filter envelopes): fields parsed,
-  no filter is applied — no cutoff / resonance formula is staged.
-- **Envelope carry flags**, `S9x` values other than 0/1, `Zxx` macros
-  and MIDI configuration: no staged semantics; parsed / no-op.
+- **Filter envelopes** (pitch envelope with flag bit 7): the envelope
+  no longer bends the pitch, but how it scales the cutoff is not in the
+  staged texts, so it is not applied. The **cutoff-value → frequency
+  law** follows the one staged formula; the black-box oracle places the
+  corner differently (see *Resonant filter*).
+- **Envelope carry flags** and `S9x` values other than 0/1: not
+  Impulse Tracker features per the author's texts; parsed / no-op.
+  MIDI macros other than the two filter messages have no meaning
+  without MIDI output.
 - **Compatible `Gxx` observation**: the black-box oracle keeps the old
   sample on a `Gxx` row with a new instrument and does not feed `Fxx`
   into `G00`; the staged text states both the `NewC5/OldC5` retune and

@@ -122,6 +122,20 @@ fn it214_distribution_songs_decompress_exactly_and_play_one_pass() {
             return;
         };
         let module = it::parse_module(&bytes).expect("module");
+        if name == "JEFF93.IT" {
+            // Embedded MIDI configuration (Special bit 3): the default
+            // SF0 cutoff macro, read from the file itself.
+            assert_eq!(module.midi_macros.parameterised[0], "F0F000z");
+            assert_eq!(
+                module.midi_macros.filter_message(0, 0x60),
+                Some(it::ItFilterMessage::Cutoff(0x60))
+            );
+            // Instruments carry initial filter settings (bit 7 = use).
+            assert_eq!(module.instruments[0].initial_cutoff(), Some(0x7F));
+            assert_eq!(module.instruments[0].initial_resonance(), Some(0x60));
+            assert_eq!(module.instruments[5].initial_cutoff(), None);
+            assert!(module.instruments[0].pitch_envelope.is_filter_envelope());
+        }
         let mut compressed = 0;
         let mut sixteen = 0;
         for s in &module.samples {

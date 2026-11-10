@@ -27,8 +27,8 @@
 
 use crate::it::{
     IT_FADEOUT_COUNT, IT_MAX_NOTE, IT_ORDER_END, IT_ORDER_SKIP, IT_PAN_SURROUND,
-    IT_VOLCOL_PORTA_SLIDE_TABLE, ItCell, ItDca, ItDct, ItEnvelope, ItFrozenView, ItInstrument,
-    ItLoopView, ItModule, ItNna, ItPattern, ItSample, ItVibratoWave, ItVolumeColumn,
+    IT_VOLCOL_PORTA_SLIDE_TABLE, ItCell, ItDca, ItDct, ItEnvelope, ItFilterMessage, ItFrozenView,
+    ItInstrument, ItLoopView, ItModule, ItNna, ItPattern, ItSample, ItVibratoWave, ItVolumeColumn,
 };
 use crate::mixer::MixerVoice;
 
@@ -334,6 +334,44 @@ pub struct ItVoice {
     pub final_pan: u8,
     /// Frequency actually mixed this tick.
     pub play_freq: f64,
+    /// Resonant-filter cutoff `0..=127` and resonance `0..=127` of this
+    /// note. Cutoff 127 with resonance 0 is "no filter".
+    pub cutoff: u8,
+    pub resonance: u8,
+    /// Filter coefficients for the current tick and the two past
+    /// outputs (`K[n-1]`, `K[n-2]`).
+    filter: Option<[f32; 3]>,
+    filter_k: [f32; 2],
+}
+
+/// Coefficients `[a, b, c]` of the resonant low-pass
+/// `K[n] = a·S[n] + b·K[n-1] + c·K[n-2]` for a cutoff / resonance pair
+/// (`0..=127` each) at the mixing rate, or `None` for "cutoff 7F and Q
+/// 0: no filters are applied" (`FILTERS.TXT`).
+///
+/// From the closed form staged in
+/// `docs/audio/trackers/it/multimedia-cx-impulse-tracker.html`
+/// ("Resonant filters"): `a = 1/(1+d+e)`, `b = (d+2e)·a`, `c = -e·a`
+/// with `d = 2p(r+1) - 1`, `e = r²`,
+/// `p = 10^(-resonance·24 / (128·20))`. The page prints `r` as
+/// `rate · (2π·110·2^0.25) / 2^(cutoff/24)`, which is not a ratio of
+/// frequencies and silences everything; the form used here is the
+/// dimensionally consistent one, `r = rate / (2π · fc)` with the
+/// cutoff frequency `fc = 110 · 2^0.25 · 2^(cutoff/24)` Hz — unity
+/// gain at DC for every setting, 131 Hz at cutoff 0 and 5.1 kHz at 127.
+pub fn filter_coefficients(cutoff: u8, resonance: u8, rate: f32) -> Option<[f32; 3]> {
+    let cutoff = cutoff.min(127);
+    let resonance = resonance.min(127);
+    if (cutoff == 127 && resonance == 0) || rate <= 0.0 {
+        return None;
+    }
+    let fc = 110.0f64 * 2f64.powf(0.25 + cutoff as f64 / 24.0);
+    let r = rate as f64 / (std::f64::consts::TAU * fc);
+    let p = 10f64.powf(-(resonance as f64) * 24.0 / (128.0 * 20.0));
+    let d = 2.0 * p * (r + 1.0) - 1.0;
+    let e = r * r;
+    let a = 1.0 / (1.0 + d + e);
+    Some([a as f32, ((d + 2.0 * e) * a) as f32, (-e * a) as f32])
 }
 
 // ============================================================================
@@ -344,6 +382,12 @@ pub struct ItVoice {
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct ItChannel {
+    /// `SFx`: the parameterised MIDI macro `Z00`..`Z7F` go through.
+    pub macro_select: u8,
+    /// Filter cutoff / resonance last set on this channel (by `Zxx` or
+    /// an instrument's `IFC` / `IFR`); new notes start from them.
+    pub filter_cutoff: u8,
+    pub filter_resonance: u8,
     /// Index of the foreground voice.
     pub voice: Option<usize>,
     /// Last note / instrument seen in the pattern (for cells that
@@ -439,6 +483,9 @@ impl ItChannel {
             pan,
             muted,
             volcol: ItVolumeColumn::None,
+            // Filter fully open, no resonance: "no filters are applied".
+            filter_cutoff: 127,
+            filter_resonance: 0,
             ..ItChannel::default()
         }
     }
@@ -937,6 +984,24 @@ impl ItPlayerState {
             v.pan_env = EnvState::start(&ins.panning_envelope);
             v.pitch_env = EnvState::start(&ins.pitch_envelope);
         }
+        // Resonant filter: an instrument's initial cutoff / resonance
+        // (`IFC` / `IFR`) replace the channel's values; the note then
+        // starts from the channel's current pair with a clean history.
+        let (ifc, ifr) = ins.as_ref().map_or((None, None), |i| {
+            (i.initial_cutoff(), i.initial_resonance())
+        });
+        let c = &mut self.channels[ch];
+        if let Some(cutoff) = ifc {
+            c.filter_cutoff = cutoff;
+        }
+        if let Some(resonance) = ifr {
+            c.filter_resonance = resonance;
+        }
+        let v = &mut self.voices[vi];
+        v.cutoff = c.filter_cutoff;
+        v.resonance = c.filter_resonance;
+        v.filter = None;
+        v.filter_k = [0.0; 2];
     }
 
     /// Retrigger envelopes (compatible-Gxx tone portamento with an
@@ -1381,8 +1446,24 @@ impl ItPlayerState {
                 }
             }
             FX_Z => {
-                // Zxx MIDI macro: the staged text pins no macro
-                // semantics; documented no-op.
+                // Zxx sends a MIDI macro (`MIDI.TXT`); the two messages
+                // the tracker's drivers intercept set the resonant
+                // filter (`FILTERS.TXT`). Anything else has no meaning
+                // without MIDI output.
+                let selected = self.channels[ch].macro_select;
+                if let Some(msg) = self.module.midi_macros.filter_message(selected, param) {
+                    let c = &mut self.channels[ch];
+                    match msg {
+                        ItFilterMessage::Cutoff(v) => c.filter_cutoff = v,
+                        ItFilterMessage::Resonance(v) => c.filter_resonance = v,
+                    }
+                    let (cutoff, resonance) = (c.filter_cutoff, c.filter_resonance);
+                    if let Some(vi) = c.voice {
+                        let v = &mut self.voices[vi];
+                        v.cutoff = cutoff;
+                        v.resonance = resonance;
+                    }
+                }
             }
             _ => {}
         }
@@ -1430,6 +1511,8 @@ impl ItPlayerState {
                 }
             }
             0xA => self.channels[ch].high_offset = y,
+            // SFx: select the parameterised macro Z00..Z7F use.
+            0xF => self.channels[ch].macro_select = y,
             0xB => {
                 // Pattern loop: SB0 sets the loop row; SBx (x>0) jumps
                 // back x times.
@@ -1904,7 +1987,14 @@ impl ItPlayerState {
                 // fine-slide units under the 768/octave linear system.
                 if v.pitch_env.enabled {
                     let pe = v.pitch_env.step(&ins.pitch_envelope, !v.released);
-                    freq = linear_slide(freq, pe as f64 * 32.0 / 256.0);
+                    // "Use pitch envelope as filter envelope instead"
+                    // (envelope flag bit 7): the envelope then leaves
+                    // the pitch alone. How it scales the cutoff is not
+                    // in the staged texts, so it is stepped (its end
+                    // still fades the note) but not applied.
+                    if !ins.pitch_envelope.is_filter_envelope() {
+                        freq = linear_slide(freq, pe as f64 * 32.0 / 256.0);
+                    }
                 }
                 // Random volume variation.
                 fv = fv * v.random_vol_x256 as i64 / 256;
@@ -2020,6 +2110,7 @@ impl ItPlayerState {
                 if !v.active {
                     continue;
                 }
+                v.filter = filter_coefficients(v.cutoff, v.resonance, out_rate);
                 let Some(sample) = self.module.samples.get(v.sample as usize - 1) else {
                     v.active = false;
                     continue;
@@ -2045,7 +2136,14 @@ impl ItPlayerState {
                     if !v.active {
                         continue;
                     }
-                    let s = v.mixer.render_one(view, out_rate) * v.amp;
+                    let mut s = v.mixer.render_one(view, out_rate);
+                    if let Some([a, b, c]) = v.filter {
+                        // K[n] = a·S[n] + b·K[n-1] + c·K[n-2]
+                        let k = a * s + b * v.filter_k[0] + c * v.filter_k[1];
+                        v.filter_k = [k, v.filter_k[0]];
+                        s = k;
+                    }
+                    let s = s * v.amp;
                     if !v.mixer.active {
                         v.active = false;
                     }
@@ -2662,6 +2760,141 @@ pub(crate) mod tests {
         assert!(p.ended);
         // rows 0,1,2,(1,2)x3,3 = 10 rows.
         assert_eq!(pcm.len() / 2, 10 * 6 * 882);
+    }
+
+    #[test]
+    fn filter_coefficients_have_unity_dc_gain_and_a_bypass() {
+        // "if filter cutoff is set to 7F and Q is set to 0, then no
+        // filters are applied".
+        assert!(filter_coefficients(127, 0, 44_100.0).is_none());
+        assert!(filter_coefficients(127, 1, 44_100.0).is_some());
+        for (cutoff, resonance) in [(0u8, 0u8), (64, 0), (126, 0), (40, 127), (127, 127)] {
+            let [a, b, c] = filter_coefficients(cutoff, resonance, 44_100.0).unwrap();
+            assert!((a + b + c - 1.0).abs() < 1e-4, "{cutoff}/{resonance}");
+        }
+    }
+
+    /// Steady-state gain of the filter for a sine at `hz`.
+    fn filter_gain(cutoff: u8, resonance: u8, hz: f32) -> f32 {
+        let [a, b, c] = filter_coefficients(cutoff, resonance, 44_100.0).unwrap();
+        let (mut k1, mut k2) = (0.0f32, 0.0f32);
+        let mut peak = 0.0f32;
+        for n in 0..44_100 {
+            let s = (n as f32 * hz * std::f32::consts::TAU / 44_100.0).sin();
+            let k = a * s + b * k1 + c * k2;
+            k2 = k1;
+            k1 = k;
+            if n > 22_050 {
+                peak = peak.max(k.abs());
+            }
+        }
+        peak
+    }
+
+    #[test]
+    fn filter_is_a_low_pass_whose_corner_rises_with_the_cutoff_value() {
+        // Cutoff value v puts the corner at 110 * 2^(0.25 + v/24) Hz:
+        // 131 Hz at 0, one octave up every 24 steps.
+        assert!(filter_gain(0, 0, 40.0) > 0.9, "passband");
+        assert!(filter_gain(0, 0, 2000.0) < 0.02, "two poles, 4 octaves up");
+        // At the corner a resonance-free two-pole section is about
+        // 6 dB down.
+        let at_corner = filter_gain(96, 0, 2093.0);
+        assert!((0.3..0.6).contains(&at_corner), "corner gain {at_corner}");
+        let gains: Vec<f32> = [0u8, 24, 48, 72, 96, 120]
+            .iter()
+            .map(|&v| filter_gain(v, 0, 1000.0))
+            .collect();
+        assert!(gains.windows(2).all(|w| w[1] > w[0]), "{gains:?}");
+        // Resonance peaks the response near the corner.
+        let corner = 110.0 * 2f32.powf(0.25 + 48.0 / 24.0);
+        assert!(filter_gain(48, 100, corner) > 2.0 * filter_gain(48, 0, corner));
+    }
+
+    #[test]
+    fn zxx_sets_cutoff_and_resonance_through_the_default_macros() {
+        // Default configuration: SF0 = F0F000z (Z00..Z7F = cutoff),
+        // Z80..Z8F = resonance in steps of 8; SFx selects the macro.
+        let pat = build_pattern(
+            8,
+            &[
+                (0, 0, note_cell(60, 1)),
+                (1, 0, cmd_cell('Z', 0x40)),
+                (2, 0, cmd_cell('Z', 0x8F)),
+                (3, 0, cmd_cell('Z', 0x90)), // empty macro: nothing
+                (4, 0, cmd_cell('S', 0xF1)), // SF1 is empty by default
+                (5, 0, cmd_cell('Z', 0x10)), // …so this does nothing
+                (6, 0, cmd_cell('S', 0xF0)),
+                (7, 0, cmd_cell('Z', 0x7F)),
+            ],
+        );
+        let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[pat], &[0]);
+        let mut p = player(&m);
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            p.render(&mut [0i16; 2]);
+            let v = p.voices.iter().find(|v| v.active).expect("voice");
+            seen.push((v.cutoff, v.resonance));
+            render_all_frames(&mut p, 6 * 882 - 1);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (127, 0),
+                (0x40, 0),
+                (0x40, 0x78),
+                (0x40, 0x78),
+                (0x40, 0x78),
+                (0x40, 0x78),
+                (0x40, 0x78),
+                (0x7F, 0x78)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_low_cutoff_darkens_the_rendered_square_wave() {
+        // The 64-frame square at C-5 is 130.7 Hz with strong odd
+        // harmonics; Z00 puts the corner on the fundamental, so the
+        // energy of the sample-to-sample steps (the high end) collapses.
+        let render = |cells: &[(u16, u8, ItCell)]| {
+            let pat = build_pattern(8, cells);
+            let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[pat], &[0]);
+            let mut p = player(&m);
+            let pcm = render_all(&mut p, 40_000);
+            pcm.as_chunks::<2>()
+                .0
+                .windows(2)
+                .map(|w| (w[1][0] as f64 - w[0][0] as f64).powi(2))
+                .sum::<f64>()
+        };
+        let mut filtered = note_cell(60, 1);
+        filtered.mask |= IT_CELL_COMMAND;
+        filtered.command = FX_Z;
+        filtered.param = 0x00;
+        let dry = render(&[(0, 0, note_cell(60, 1))]);
+        let wet = render(&[(0, 0, filtered)]);
+        assert!(dry > 0.0 && wet > 0.0);
+        assert!(wet < dry * 0.05, "dry {dry:.0}, wet {wet:.0}");
+    }
+
+    #[test]
+    fn instrument_initial_filter_and_filter_envelope_flag() {
+        use crate::it::{IT_ENV_FILTER, ItInstrument};
+        let ins = ItInstrument {
+            filter_cutoff: 0x80 | 0x30,
+            filter_resonance: 0x20, // bit 7 clear: not used
+            ..ItInstrument::default()
+        };
+        assert_eq!(ins.initial_cutoff(), Some(0x30));
+        assert_eq!(ins.initial_resonance(), None);
+        let env = ItEnvelope {
+            flags: IT_ENV_FILTER | 1,
+            nodes: vec![(0, 0), (32, 10)],
+            ..ItEnvelope::default()
+        };
+        assert!(env.is_filter_envelope());
+        assert!(!ItEnvelope::default().is_filter_envelope());
     }
 
     #[test]

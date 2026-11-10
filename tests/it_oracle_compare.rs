@@ -1761,3 +1761,88 @@ fn oracle_note_off_with_looping_volume_envelope() {
         "looping-envelope note-off drift: {ra:?} vs {rb:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 486: resonant filter (Zxx through the default MIDI macros)
+// ---------------------------------------------------------------------------
+
+/// One held square-wave note; `Zxx` steps the filter cutoff down the
+/// range, then adds resonance.
+fn case_filter() -> Case {
+    let mut w = base_writer();
+    let mut p = ItWriterPattern::new(16);
+    p.note(0, 0, 60, 1);
+    for (row, z) in [
+        (2u16, 0x70u8),
+        (3, 0x60),
+        (4, 0x50),
+        (5, 0x40),
+        (6, 0x30),
+        (7, 0x20),
+        (8, 0x10),
+        (9, 0x00),
+        (10, 0x38),
+        (11, 0x84),
+        (12, 0x88),
+        (13, 0x8C),
+        (14, 0x8F),
+    ] {
+        p.effect(row, 0, 'Z', z);
+    }
+    w.patterns.push(p);
+    w.orders = vec![0, 255];
+    Case {
+        name: "filter",
+        bytes: w.build(),
+        rows: 16,
+    }
+}
+
+/// Resonant filter: what both engines agree on is asserted, the rest is
+/// a recorded observation.
+///
+/// Agreed (asserted on both renders): `Z00`..`Z7F` is a low-pass whose
+/// lowest setting removes most of a 261 Hz square wave's level, and
+/// `Z80`..`Z8F` raise the level of a tone sitting near the corner
+/// (resonance), monotonically.
+///
+/// Not agreed (printed, not asserted): where the corner sits for a
+/// given cutoff value. This engine follows the closed form staged in
+/// `docs/audio/trackers/it/multimedia-cx-impulse-tracker.html`
+/// (`fc = 110 · 2^(0.25 + cutoff/24)` Hz: 131 Hz at `Z00`, 5.1 kHz at
+/// `Z7F`), under which every step from `Z70` down audibly darkens the
+/// square; the black-box oracle leaves the tone's level untouched down
+/// to `Z20` and only cuts at `Z10` / `Z00`. No staged first-party text
+/// arbitrates, so the engine keeps the documented law.
+#[test]
+fn oracle_resonant_filter_cutoff_and_resonance() {
+    let Some(o) = oracle() else {
+        return skip("filter");
+    };
+    let case = case_filter();
+    let Some((ours, theirs)) = run_case(&o, &case) else {
+        return skip("filter (render failed)");
+    };
+    let ra = rms_profile(&ours, case.rows);
+    let rb = rms_profile(&theirs, case.rows);
+    report(case.name, "rms", &ra, &rb);
+    eprintln!(
+        "[filter] cutoff-law observation: max row level difference {:.3} (not asserted)",
+        max_rms_diff(&ra, &rb)
+    );
+    for (who, r) in [("ours", &ra), ("oracle", &rb)] {
+        assert!(r[9] < 0.4 * r[1], "{who}: Z00 must cut the tone: {r:?}");
+        assert!(
+            r[9] < r[8] && r[8] < r[2],
+            "{who}: lower cutoff, lower level: {r:?}"
+        );
+        assert!(
+            r[11] < r[12] && r[12] < r[13] && r[13] < r[14],
+            "{who}: resonance raises the level step by step: {r:?}"
+        );
+        assert!(
+            r[14] > 1.15 * r[10],
+            "{who}: Z8F resonates at the Z38 corner: {r:?}"
+        );
+    }
+}

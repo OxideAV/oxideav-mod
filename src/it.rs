@@ -1036,6 +1036,10 @@ pub const IT_ENV_LOOP: u8 = 1 << 1;
 /// Envelope `Flg` bit 2: sustain loop on.
 pub const IT_ENV_SUSTAIN_LOOP: u8 = 1 << 2;
 
+/// Envelope `Flg` bit 7 (pitch envelope only): the envelope drives the
+/// filter instead of the pitch.
+pub const IT_ENV_FILTER: u8 = 1 << 7;
+
 /// One instrument envelope (volume, panning or pitch), in the 2.x node
 /// model. Old-format volume envelopes are converted into this model at
 /// parse time.
@@ -1058,6 +1062,12 @@ pub struct ItEnvelope {
 impl ItEnvelope {
     pub fn is_on(&self) -> bool {
         self.flags & IT_ENV_ON != 0 && !self.nodes.is_empty()
+    }
+    /// Bit 7 of `Flg`, meaningful on the pitch envelope only: "Use
+    /// pitch envelope as filter envelope instead" (`ITTECH.TXT`, final
+    /// revision).
+    pub fn is_filter_envelope(&self) -> bool {
+        self.flags & IT_ENV_FILTER != 0
     }
     pub fn has_loop(&self) -> bool {
         self.flags & IT_ENV_LOOP != 0
@@ -1125,8 +1135,8 @@ pub struct ItInstrument {
     pub tracker_version: u16,
     /// `NoS` (instrument files only).
     pub num_samples: u8,
-    /// `IFC` / `IFR` bytes of the 2.x layout (present in the layout
-    /// table; no semantics are given in the staged text).
+    /// Raw `IFC` / `IFR` bytes of the 2.x layout: initial filter
+    /// cutoff / resonance — see [`ItInstrument::initial_cutoff`].
     pub filter_cutoff: u8,
     pub filter_resonance: u8,
     /// `MCh` / `MPr` / `MIDIBnk`.
@@ -1177,6 +1187,18 @@ impl Default for ItInstrument {
 }
 
 impl ItInstrument {
+    /// `IFC`, the initial filter cutoff: `Some(0..=127)` when bit 7 is
+    /// set. (The enable bit is measured, not documented: the
+    /// tracker-written `JEFF93.IT` stores either 0 or a value with bit
+    /// 7 set in these bytes, independently for the two.)
+    pub fn initial_cutoff(&self) -> Option<u8> {
+        (self.filter_cutoff & 0x80 != 0).then_some(self.filter_cutoff & 0x7F)
+    }
+    /// `IFR`, the initial filter resonance: `Some(0..=127)` when bit 7
+    /// is set.
+    pub fn initial_resonance(&self) -> Option<u8> {
+        (self.filter_resonance & 0x80 != 0).then_some(self.filter_resonance & 0x7F)
+    }
     /// Instrument default pan, `Some(0..=64)` unless bit 7 ("Don't
     /// use") is set.
     pub fn pan(&self) -> Option<u8> {
@@ -1650,12 +1672,139 @@ pub fn parse_patterns(header: &ItHeader, bytes: &[u8]) -> Vec<ItPattern> {
 #[non_exhaustive]
 pub struct ItModule {
     pub header: ItHeader,
+    /// The MIDI-macro table `Zxx` / `SFx` go through: the file's
+    /// embedded configuration when `Special` bit 3 is set, else the
+    /// default one.
+    pub midi_macros: ItMidiMacros,
     pub message: Option<String>,
     pub instruments: Vec<ItInstrument>,
     pub samples: Vec<ItSample>,
     pub patterns: Vec<ItPattern>,
     /// Highest channel index touched by any pattern + 1 (at least 1).
     pub num_channels: u8,
+}
+
+/// `Special` bit 1: the block of 8-byte records after the offset
+/// tables is present (measured on tracker-written files; the text
+/// lists the bit as reserved).
+pub const IT_SPECIAL_RECORD_BLOCK: u16 = 1 << 1;
+/// Size of a MIDI configuration: 153 fields of 32 NUL-padded bytes —
+/// 9 global strings, `SF0`..`SFF`, `Z80`..`ZFF`.
+pub const IT_MIDI_CONFIG_SIZE: usize = 153 * 32;
+
+/// What a MIDI macro means to a player without MIDI output: the two
+/// messages the tracker's own drivers intercept (`FILTERS.TXT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItFilterMessage {
+    /// `F0 F0 00 <value>`: set the filter cutoff.
+    Cutoff(u8),
+    /// `F0 F0 01 <value>`: set the filter resonance (Q).
+    Resonance(u8),
+}
+
+/// The `SFx` / `Zxx` macro strings (`MIDI.TXT`, `ITMIDI.CFG`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ItMidiMacros {
+    /// `SF0`..`SFF`: parameterised macros; `Z00`..`Z7F` substitute
+    /// their value for the letter `z` in the selected one.
+    pub parameterised: Vec<String>,
+    /// `Z80`..`ZFF`: fixed macros.
+    pub fixed: Vec<String>,
+}
+
+impl Default for ItMidiMacros {
+    /// The configuration shipped with the tracker (`ITMIDI.CFG`):
+    /// `SF0 = F0F000z` (cutoff), `Z80`..`Z8F = F0F001 00, 08 .. 78`
+    /// (resonance in steps of 8), everything else empty.
+    fn default() -> Self {
+        let mut parameterised = vec![String::new(); 16];
+        parameterised[0] = "F0F000z".into();
+        let mut fixed = vec![String::new(); 128];
+        for (i, slot) in fixed.iter_mut().take(16).enumerate() {
+            *slot = format!("F0F001{:02X}", i * 8);
+        }
+        ItMidiMacros {
+            parameterised,
+            fixed,
+        }
+    }
+}
+
+impl ItMidiMacros {
+    /// Interpret the macro a `Zxx` with this parameter sends, with
+    /// `selected` the channel's current `SFx` choice. `None` when the
+    /// macro is empty, is not one of the two filter messages, or
+    /// carries a value above `7F` ("Values above 7Fh are ignored").
+    pub fn filter_message(&self, selected: u8, param: u8) -> Option<ItFilterMessage> {
+        let (text, z) = if param < 0x80 {
+            (self.parameterised.get(selected as usize & 0x0F)?, param)
+        } else {
+            (self.fixed.get(param as usize - 0x80)?, 0)
+        };
+        let mut chars = text.chars().filter(|c| !c.is_whitespace());
+        let mut head = String::new();
+        for _ in 0..6 {
+            head.push(chars.next()?.to_ascii_uppercase());
+        }
+        let rest: String = chars.collect();
+        let value = if rest == "z" {
+            if param >= 0x80 {
+                return None;
+            }
+            z
+        } else if rest.len() == 2 {
+            u8::from_str_radix(&rest, 16).ok()?
+        } else {
+            return None;
+        };
+        if value > 0x7F {
+            return None;
+        }
+        match head.as_str() {
+            "F0F000" => Some(ItFilterMessage::Cutoff(value)),
+            "F0F001" => Some(ItFilterMessage::Resonance(value)),
+            _ => None,
+        }
+    }
+}
+
+/// Read the embedded MIDI configuration (`Special` bit 3), else the
+/// default table. The block sits after the three offset tables and —
+/// when `Special` bit 1 is set — after a 16-bit count `N` plus `N`
+/// 8-byte records (layout measured on the tracker-written
+/// `JEFF93.IT`, see the staged fixture notes).
+pub fn parse_midi_macros(header: &ItHeader, bytes: &[u8]) -> ItMidiMacros {
+    let mut macros = ItMidiMacros::default();
+    if header.special & IT_SPECIAL_MIDI_CONFIG == 0 {
+        return macros;
+    }
+    let mut pos = 0xC0
+        + header.orders.len()
+        + 4 * (header.instrument_offsets.len()
+            + header.sample_offsets.len()
+            + header.pattern_offsets.len());
+    if header.special & IT_SPECIAL_RECORD_BLOCK != 0 {
+        let Some(count) = bytes.get(pos..pos + 2) else {
+            return macros;
+        };
+        pos += 2 + 8 * u16::from_le_bytes([count[0], count[1]]) as usize;
+    }
+    let Some(block) = bytes.get(pos..pos + IT_MIDI_CONFIG_SIZE) else {
+        return macros;
+    };
+    let field = |index: usize| -> String {
+        let raw = &block[index * 32..index * 32 + 32];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(32);
+        String::from_utf8_lossy(&raw[..end]).trim().to_string()
+    };
+    for i in 0..16 {
+        macros.parameterised[i] = field(9 + i);
+    }
+    for i in 0..128 {
+        macros.fixed[i] = field(25 + i);
+    }
+    macros
 }
 
 /// Parse header, message, instruments, samples and patterns.
@@ -1671,8 +1820,10 @@ pub fn parse_module(bytes: &[u8]) -> Result<ItModule> {
         .max()
         .unwrap_or(0)
         .max(1);
+    let midi_macros = parse_midi_macros(&header, bytes);
     Ok(ItModule {
         header,
+        midi_macros,
         message,
         instruments,
         samples,
@@ -1955,6 +2106,81 @@ pub(crate) mod tests {
             out.extend(self.bytes);
             out
         }
+    }
+
+    #[test]
+    fn default_midi_macros_are_the_shipped_configuration() {
+        let m = ItMidiMacros::default();
+        assert_eq!(m.parameterised[0], "F0F000z");
+        assert!(m.parameterised[1..].iter().all(|s| s.is_empty()));
+        assert_eq!(m.fixed[0], "F0F00100");
+        assert_eq!(m.fixed[15], "F0F00178");
+        assert!(m.fixed[16..].iter().all(|s| s.is_empty()));
+        // Z00..Z7F = cutoff through SF0; Z80..Z8F = resonance.
+        assert_eq!(
+            m.filter_message(0, 0x35),
+            Some(ItFilterMessage::Cutoff(0x35))
+        );
+        assert_eq!(
+            m.filter_message(0, 0x83),
+            Some(ItFilterMessage::Resonance(0x18))
+        );
+        assert_eq!(m.filter_message(0, 0x90), None, "empty macro");
+        assert_eq!(m.filter_message(1, 0x35), None, "SF1 is empty");
+    }
+
+    #[test]
+    fn midi_macro_strings_are_interpreted_as_filter_messages_only() {
+        let mut m = ItMidiMacros::default();
+        m.parameterised[1] = "F0 F0 01 z".into();
+        m.parameterised[2] = "9c n v".into();
+        m.fixed[0x10] = "f0f0003F".into();
+        m.fixed[0x11] = "F0F00090".into(); // value above 7F: ignored
+        m.fixed[0x12] = "F0F000z".into(); // no z in a fixed macro
+        assert_eq!(
+            m.filter_message(1, 0x50),
+            Some(ItFilterMessage::Resonance(0x50))
+        );
+        assert_eq!(m.filter_message(2, 0x50), None);
+        assert_eq!(
+            m.filter_message(0, 0x90),
+            Some(ItFilterMessage::Cutoff(0x3F))
+        );
+        assert_eq!(m.filter_message(0, 0x91), None);
+        assert_eq!(m.filter_message(0, 0x92), None);
+    }
+
+    #[test]
+    fn embedded_midi_configuration_is_read_after_the_record_block() {
+        // Header with no orders / tables, Special bits 1 + 3: a 2-record
+        // block (2 + 16 bytes) and then the 153-field configuration.
+        let mut bytes = vec![0u8; 0xC0];
+        bytes[..4].copy_from_slice(b"IMPM");
+        bytes[0x2E..0x30]
+            .copy_from_slice(&(IT_SPECIAL_RECORD_BLOCK | IT_SPECIAL_MIDI_CONFIG).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&[0xEE; 16]);
+        let mut cfg = vec![0u8; IT_MIDI_CONFIG_SIZE];
+        cfg[9 * 32..9 * 32 + 7].copy_from_slice(b"F0F001z"); // SF0
+        cfg[(9 + 3) * 32..(9 + 3) * 32 + 7].copy_from_slice(b"F0F000z"); // SF3
+        cfg[25 * 32..25 * 32 + 8].copy_from_slice(b"F0F00011"); // Z80
+        bytes.extend_from_slice(&cfg);
+        let header = parse_header(&bytes).unwrap();
+        let m = parse_midi_macros(&header, &bytes);
+        assert_eq!(m.parameterised[0], "F0F001z");
+        assert_eq!(m.parameterised[3], "F0F000z");
+        assert_eq!(m.fixed[0], "F0F00011");
+        assert!(
+            m.fixed[1].is_empty(),
+            "embedded tables replace the defaults"
+        );
+        // Truncated configuration: the defaults stay.
+        let m = parse_midi_macros(&header, &bytes[..bytes.len() - 1]);
+        assert_eq!(m, ItMidiMacros::default());
+        // Without the flag the block is not looked for.
+        bytes[0x2E] = 0;
+        let header = parse_header(&bytes).unwrap();
+        assert_eq!(parse_midi_macros(&header, &bytes), ItMidiMacros::default());
     }
 
     #[test]
