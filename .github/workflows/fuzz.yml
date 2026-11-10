@@ -2,9 +2,10 @@ name: Fuzz
 
 # Daily scheduled run of the cargo-fuzz harnesses under fuzz/ via the
 # OxideAV org-level reusable workflow (see OxideAV/.github). The
-# 30-minute budget is split evenly across the seven targets (mod_decode,
-# stm_decode, xm_decode, it_decode, stm_player_steered,
-# xm_player_steered, it_player_steered — ~4 min each).
+# 30-minute budget is split evenly across the eight targets (mod_decode,
+# stm_decode, xm_decode, it_decode, it214_decompress,
+# stm_player_steered, xm_player_steered, it_player_steered — under
+# 4 min each).
 
 on:
   schedule:

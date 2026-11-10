@@ -799,7 +799,7 @@ from
 | Block | Coverage |
 | ----- | -------- |
 | Header | counts, `Cwt` / `Cmwt`, flags (stereo, instruments-vs-samples, linear-vs-Amiga slides, old effects, compatible `Gxx`, MIDI bits), `Special` (message), global / mix volume, speed / tempo, pan separation, 64 channel pans (incl. surround `100` and the `+128` disabled bit) + volumes, order list (`254` skip / `255` end), the three offset tables, song message (`0Dh` → `\n`) |
-| Samples | 8/16-bit, signed / unsigned (`Cvt` bit 0), Intel / Motorola order, delta storage, global + default volume, default pan (bit 7 = use), `C5Speed`, normal + sustain loops (forward / ping-pong) validated against the decoded body, sample vibrato (speed / depth / rate / waveform), truncation tolerance. **Compressed bodies (flag bit 3) are recognised and left silent** — the staged text names the flag but not the scheme. Stereo bodies (flag bit 2, "not supported yet" in the text) decode their first `Length` frames. |
+| Samples | 8/16-bit, signed / unsigned (`Cvt` bit 0), Intel / Motorola order, delta storage, global + default volume, default pan (bit 7 = use), `C5Speed`, normal + sustain loops (forward / ping-pong) validated against the decoded body, sample vibrato (speed / depth / rate / waveform), truncation tolerance. **Block-compressed bodies (flag bit 3, written by Impulse Tracker 2.14+) are decompressed** — `it::decompress_it214`, including the double-delta "IT215" variant; see *IT214 sample decompression* below. Stereo bodies (flag bit 2, "not supported yet" in the text) decode their first `Length` frames. |
 | Instruments | old 1.x layout (flag byte, node-number loop points, 200-byte per-tick table + node pairs, fadeout 0–64/512 rescaled to the 2.x count) and 2.x layout (NNA / DCT / DCA, fadeout, pitch-pan separation + centre, global volume, default pan, random volume / pan, filter + MIDI bytes, 120-entry note→sample keymap, volume / panning / pitch envelopes with 25 `(y, tick)` nodes, loop + sustain-loop points) |
 | Patterns | channel-marker / mask-byte walk with the per-channel previous-mask and last-note / instrument / volume / command memories; `Rows` clamped to `1..=200`; truncated data leaves the rest empty; offset `0` = empty 64-row pattern |
 
@@ -873,10 +873,35 @@ residual RMS deltas (2–7%, growing toward silence) are the oracle's
 half-tick volume ramp, not an engine difference. The tests print a
 clean SKIP when no oracle binary is on `PATH`, so CI stays green.
 
+### IT214 sample decompression
+
+Impulse Tracker 2.14 and later store sample bodies block-compressed.
+`it::decompress_it214` implements the scheme from the prose description
+staged in `docs/audio/trackers/it/multimedia-cx-impulse-tracker.html`
+("IT214 sample compression" — a community write-up; `ITTECH.TXT` itself
+only names the flag): blocks of a 16-bit length plus an LSB-first bit
+stream, each decoding to `0x8000` bytes of sample data; values read at
+a running bit width that starts at 9 / 17 per block; three forms of
+width-change code (widths 1–6, 7–n, n + 1); per-block delta summing;
+the "IT215" variant (delta convert flag) sums twice.
+
+The prose is loose in two places — the exact escape band of the middle
+widths and the "skip the current width" rule (printed as `v+1` in both
+branches). Both were settled by measurement on the two modules shipped
+with Impulse Tracker 2.14 patch 5 (`fixtures/it214v5-distribution/`,
+written by the tracker itself): with the band read as the *n* values
+centred on the top-bit boundary and the skip as `v + 2`, **all 30
+compressed bodies (29 8-bit, 1 16-bit; 36 blocks) decode with every
+block's bit stream ending exactly on its declared byte length** — the
+off-by-one band reading that was also tried selects an invalid width
+within a few hundred frames on 13 of the first 14 bodies. `tests/it_smoke.rs` asserts that exactness on both
+files when the docs tree is present, and plays each song through one
+finite pass (398 s and 149 s). No independent decoded reference is
+staged, so bit-exactness against the tracker's own loader is inferred
+from the exact block closure, not compared.
+
 ### Known gaps (docs asks filed by the round parent)
 
-- IT 2.14/2.15 **compressed samples**: the staged text has only the flag
-  bit; bodies stay silent until the decompression scheme is staged.
 - **Stereo sample layout**: the text says "not supported yet".
 - **Resonant filter** (`IFC` / `IFR`, filter envelopes): fields parsed,
   no filter is applied — no cutoff / resonance formula is staged.
@@ -935,11 +960,12 @@ aborting / OOMing.
 | `stm_player_steered` | fuzz bytes read as a recipe for the hidden `stm_writer` (module or packed song, any tempo byte, order lists naming unused / unstored / repeated orders, every command letter and info byte, out-of-range notes / instruments / volumes / loop pairs) → rendered to the end of the pass, so the deferred-`B` / `C` state machine and the one-finite-pass stop are what the budget buys |
 | `xm_decode`  | `xm::parse_header` → `xm::parse_patterns` → `xm::parse_instruments` → `xm::extract_sample_bodies` → `xm_player::XmPlayerState::new` → 2048-frame `render` |
 | `it_decode`  | `it::parse_module` (header + message + instruments + samples + patterns) → `it_player::ItPlayerState::new` → 2048-frame `render` |
+| `it214_decompress` | fuzz bytes as a raw compressed sample body (first byte picks 8 / 16-bit, the double-delta variant and the frame count) → `it::decompress_it214`, asserting the output stays bounded by the request and by the data |
 | `xm_player_steered` | fuzz bytes read as a *recipe* for the hidden `xm_writer` (channels, tempo, instruments with arbitrary envelope / autovibrato / keymap bytes, samples with any loop bounds, cells with every effect byte) → always-valid module → 8192-frame `render`, so the player's state machines (loops / jumps, delays, envelopes, retrig, tremor, offsets) get the budget the raw parser target rejects |
 | `it_player_steered` | the same recipe idea through `it_writer`: NNA / DCT / DCA combinations, envelopes and sustain loops in any order, keymaps, every command letter and volume-column value → 8192-frame `render` |
 
 Run with `cargo +nightly fuzz run <target>` from `crates/oxideav-mod/`;
-`.github/workflows/fuzz.yml` runs all seven targets daily through the
+`.github/workflows/fuzz.yml` runs all eight targets daily through the
 org-level reusable workflow (30-minute budget). Round 458: the two
 steered targets ran 3.4 M / 6.4 M executions in 420 s each and the raw
 `xm_decode` / `it_decode` targets 3.7 M / 4.5 M in 300 s each on the

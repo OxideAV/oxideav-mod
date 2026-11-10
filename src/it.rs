@@ -459,9 +459,8 @@ pub struct ItSample {
     /// `ViT`: vibrato waveform.
     pub vibrato_wave: ItVibratoWave,
     /// Decoded body, one `i16` per frame (8-bit bodies are scaled by
-    /// 256). Empty when the header has no body, the body is compressed
-    /// (see [`ItSample::compressed`]) or the file is truncated before
-    /// the body.
+    /// 256). Empty when the header has no body or the file is truncated
+    /// before the body.
     pub pcm: Vec<i16>,
     /// True when the file was cut short of the declared body (the body
     /// was clamped to what was present).
@@ -478,9 +477,8 @@ impl ItSample {
     pub fn is_stereo(&self) -> bool {
         self.flags & IT_SMP_STEREO != 0
     }
-    /// Bit 3 of `Flg`. The staged format text names the flag but does
-    /// not describe the compression scheme, so compressed bodies are
-    /// left empty (`pcm` is empty) rather than guessed at.
+    /// Bit 3 of `Flg`: the body is stored in the block-compressed form
+    /// Impulse Tracker 2.14 writes (see [`decompress_it214`]).
     pub fn compressed(&self) -> bool {
         self.flags & IT_SMP_COMPRESSED != 0
     }
@@ -677,16 +675,40 @@ pub fn parse_sample_header(bytes: &[u8], off: usize) -> Result<ItSample> {
 /// treated as plain PCM. Stereo bodies are decoded as the first
 /// `Length` frames of the stored data (the staged text declares stereo
 /// "not supported yet" and gives no channel layout). Compressed bodies
-/// are left empty.
+/// (`Flg` bit 3) go through [`decompress_it214`]; with the delta
+/// convert flag set they are the "IT215" variant (a second delta
+/// pass).
 pub fn decode_sample_body(sample: &mut ItSample, bytes: &[u8]) {
     sample.pcm.clear();
     sample.truncated = false;
-    if !sample.has_sample() || sample.length == 0 || sample.compressed() {
+    if !sample.has_sample() || sample.length == 0 {
         return;
     }
     let start = sample.sample_pointer as usize;
     if start >= bytes.len() {
         sample.truncated = true;
+        return;
+    }
+    if sample.compressed() {
+        let sixteen = sample.is_16_bit();
+        let report = decompress_it214(
+            &bytes[start..],
+            sample.length as usize,
+            sixteen,
+            sample.convert & IT_CVT_DELTA != 0,
+        );
+        sample.truncated = report.frames.len() < sample.length as usize || report.short_blocks > 0;
+        let signed = sample.is_signed();
+        sample.pcm = report
+            .frames
+            .into_iter()
+            .map(|v| match (sixteen, signed) {
+                (true, true) => v,
+                (true, false) => (v as u16 ^ 0x8000) as i16,
+                (false, true) => ((v as i8) as i16) << 8,
+                (false, false) => (((v as u8) ^ 0x80) as i8 as i16) << 8,
+            })
+            .collect();
         return;
     }
     let width = if sample.is_16_bit() { 2 } else { 1 };
@@ -735,6 +757,176 @@ pub fn decode_sample_body(sample: &mut ItSample, bytes: &[u8]) {
         }
     }
     sample.pcm = out;
+}
+
+/// Result of [`decompress_it214`].
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct It214Output {
+    /// Decoded frames in the sample's own width (8-bit values occupy
+    /// the low byte, sign-extended), after delta decoding and before
+    /// the signed / unsigned conversion.
+    pub frames: Vec<i16>,
+    /// Number of blocks read.
+    pub blocks: usize,
+    /// Blocks whose bit stream ended exactly at the declared block
+    /// length (to the byte) with every frame decoded.
+    pub exact_blocks: usize,
+    /// Blocks that ran out of bits or selected an invalid bit width;
+    /// their remaining frames repeat the last value.
+    pub short_blocks: usize,
+    /// Compressed bytes consumed, block length words included.
+    pub consumed: usize,
+}
+
+/// Decode an Impulse Tracker 2.14 block-compressed sample body.
+///
+/// The scheme, as described in
+/// `docs/audio/trackers/it/multimedia-cx-impulse-tracker.html` ("IT214
+/// sample compression"), with the two points that prose leaves open
+/// fixed by measurement on the 30 compressed bodies of the staged
+/// Impulse-Tracker-written modules (every block's bit stream must end
+/// exactly on its declared length):
+///
+/// - The data is a run of blocks. A block is a 16-bit length followed
+///   by that many bytes read as a bit stream, least significant bit
+///   first, and decodes to `0x8000` bytes of sample data (`0x8000`
+///   8-bit frames or `0x4000` 16-bit frames), fewer in the last block.
+/// - Values are read at a current bit width, starting at 9 (8-bit) or
+///   17 (16-bit) in every block, and are signed deltas — unless they
+///   are one of the width-change codes:
+///   - widths 1..=6: the value with only its top bit set; the next 3
+///     (8-bit) or 4 (16-bit) bits give the new width;
+///   - widths 7..=n (n = 8 or 16): the n values centred on the top-bit
+///     boundary, `2^(width-1) - n/2 ..= 2^(width-1) + n/2 - 1`; the
+///     offset into that band gives the new width;
+///   - width n + 1: any value with the top bit set; its low 8 bits
+///     give the new width directly.
+///
+///   A new width `v` (0-based) selects `v + 1`, or `v + 2` when that
+///   would not be below the current width — the current width is never
+///   a target, so the code skips it (for the top width the low byte
+///   plus one is used as is). A width above n + 1 is invalid: the rest
+///   of the block is left at zero deltas.
+/// - Deltas are summed in the sample's width (wrapping), per block;
+///   `double_delta` (the "IT215" variant, flagged by the delta convert
+///   bit) sums the result once more.
+///
+/// At most `frames` frames are produced; fewer when `data` runs out.
+pub fn decompress_it214(
+    data: &[u8],
+    frames: usize,
+    sixteen: bool,
+    double_delta: bool,
+) -> It214Output {
+    let n: u32 = if sixteen { 16 } else { 8 };
+    let block_frames = if sixteen { 0x4000 } else { 0x8000 };
+    let escape_bits = if sixteen { 4 } else { 3 };
+    // Every decoded frame costs at least one bit, so the data bounds
+    // what a hostile length field can make us allocate.
+    let frames = frames.min(data.len().saturating_mul(8));
+    let mut out = It214Output {
+        frames: Vec::with_capacity(frames),
+        ..It214Output::default()
+    };
+    let mut pos = 0usize;
+    while out.frames.len() < frames {
+        if pos + 2 > data.len() {
+            break;
+        }
+        let block_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        let block = &data[pos..(pos + block_len).min(data.len())];
+        pos += block.len();
+        out.blocks += 1;
+        let count = block_frames.min(frames - out.frames.len());
+
+        let total_bits = block.len() * 8;
+        let mut bit = 0usize;
+        // Read `k <= 17` bits, LSB first; None past the block end.
+        let mut read = |k: u32| -> Option<u32> {
+            if bit + k as usize > total_bits {
+                return None;
+            }
+            let byte = bit >> 3;
+            let mut word = 0u32;
+            for (i, &b) in block[byte..block.len().min(byte + 4)].iter().enumerate() {
+                word |= (b as u32) << (8 * i);
+            }
+            let v = (word >> (bit & 7)) & ((1u32 << k) - 1);
+            bit += k as usize;
+            Some(v)
+        };
+
+        let mut width = n + 1;
+        let mut d1: i16 = 0;
+        let mut d2: i16 = 0;
+        let mut produced = 0usize;
+        let mut complete = true;
+        while produced < count {
+            let Some(v) = read(width) else {
+                complete = false;
+                break;
+            };
+            if width <= 6 {
+                if v == 1 << (width - 1) {
+                    let Some(code) = read(escape_bits) else {
+                        complete = false;
+                        break;
+                    };
+                    let target = code + 1;
+                    width = if target < width { target } else { target + 1 };
+                    continue;
+                }
+            } else if width <= n {
+                let low = (1u32 << (width - 1)) - n / 2;
+                if v >= low && v < low + n {
+                    let target = v - low + 1;
+                    width = if target < width { target } else { target + 1 };
+                    continue;
+                }
+            } else if v & (1 << n) != 0 {
+                width = (v & 0xFF) + 1;
+                if width > n + 1 {
+                    complete = false;
+                    break;
+                }
+                continue;
+            }
+            // Sign-extend from the current width (a top-width value has
+            // its top bit clear and is a plain n-bit two's complement
+            // number).
+            let shift = 32 - width.min(n);
+            let delta = (((v << shift) as i32) >> shift) as i16;
+            d1 = d1.wrapping_add(delta);
+            if !sixteen {
+                d1 = d1 as i8 as i16;
+            }
+            d2 = d2.wrapping_add(d1);
+            if !sixteen {
+                d2 = d2 as i8 as i16;
+            }
+            out.frames.push(if double_delta { d2 } else { d1 });
+            produced += 1;
+        }
+        if complete && bit.div_ceil(8) == block_len {
+            out.exact_blocks += 1;
+        }
+        if !complete {
+            out.short_blocks += 1;
+            // "leaves all the remaining values as 0 before delta
+            // decoding": zero deltas hold the running sums.
+            for _ in produced..count {
+                d2 = d2.wrapping_add(d1);
+                if !sixteen {
+                    d2 = d2 as i8 as i16;
+                }
+                out.frames.push(if double_delta { d2 } else { d1 });
+            }
+        }
+    }
+    out.consumed = pos;
+    out
 }
 
 /// Parse every sample header named by the offset table and decode its
@@ -1738,17 +1930,175 @@ pub(crate) mod tests {
         assert!(s2.pcm.is_empty() && s2.truncated);
     }
 
+    /// LSB-first bit writer for hand-built IT214 blocks.
+    #[derive(Default)]
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit: usize,
+    }
+
+    impl BitWriter {
+        fn put(&mut self, value: u32, width: u32) {
+            for i in 0..width {
+                if self.bit.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                if value >> i & 1 != 0 {
+                    *self.bytes.last_mut().unwrap() |= 1 << (self.bit % 8);
+                }
+                self.bit += 1;
+            }
+        }
+        /// The finished block: 16-bit length + payload.
+        fn block(self) -> Vec<u8> {
+            let mut out = (self.bytes.len() as u16).to_le_bytes().to_vec();
+            out.extend(self.bytes);
+            out
+        }
+    }
+
     #[test]
-    fn compressed_and_absent_bodies_stay_empty() {
+    fn it214_top_width_values_are_plain_deltas() {
+        // 8-bit, width 9 throughout: deltas +10, +10, -5, -128 (wraps).
+        let mut w = BitWriter::default();
+        for d in [10i8, 10, -5, -128] {
+            w.put(d as u8 as u32, 9);
+        }
+        let out = decompress_it214(&w.block(), 4, false, false);
+        assert_eq!(out.frames, vec![10, 20, 15, -113]);
+        assert_eq!((out.blocks, out.exact_blocks, out.short_blocks), (1, 1, 0));
+        assert_eq!(out.consumed, 2 + 5);
+    }
+
+    #[test]
+    fn it214_width_changes_through_all_three_code_forms() {
+        let mut w = BitWriter::default();
+        // Width 9 -> 4: top bit set, low byte = new width - 1.
+        w.put(0x100 | 3, 9);
+        // Width 4 values: +3, -2 (two's complement in 4 bits).
+        w.put(3, 4);
+        w.put(0b1110, 4);
+        // Width 4 -> 7: the top-bit-only value, then 3 bits. Code 5
+        // means width 6, but 6 >= 4 skips the current width: 7.
+        w.put(0b1000, 4);
+        w.put(5, 3);
+        // Width 7 values: +40, -40.
+        w.put(40, 7);
+        w.put((-40i32 as u32) & 0x7F, 7);
+        // Width 7 -> 2: band 60..=67, offset 1 -> width 2.
+        w.put(60 + 1, 7);
+        // Width 2 values: +1, -1 (0b10 is the width-change code).
+        w.put(0b01, 2);
+        w.put(0b11, 2);
+        // Width 2 -> 9: code 7 means 8, >= 2 so 9.
+        w.put(0b10, 2);
+        w.put(7, 3);
+        w.put(100, 9);
+        let out = decompress_it214(&w.block(), 7, false, false);
+        assert_eq!(out.frames, vec![3, 1, 41, 1, 2, 1, 101]);
+        assert_eq!((out.exact_blocks, out.short_blocks), (1, 0));
+    }
+
+    #[test]
+    fn it214_sixteen_bit_and_double_delta() {
+        let mut w = BitWriter::default();
+        for d in [1000i16, 1000, -500] {
+            w.put(d as u16 as u32, 17);
+        }
+        let block = w.block();
+        let out = decompress_it214(&block, 3, true, false);
+        assert_eq!(out.frames, vec![1000, 2000, 1500]);
+        // The "IT215" variant integrates once more.
+        let out = decompress_it214(&block, 3, true, true);
+        assert_eq!(out.frames, vec![1000, 3000, 4500]);
+        // 16-bit middle widths use a 16-value band and 4-bit codes:
+        // width 17 -> 10, value +5, band offset 3 -> width 4, value -1.
+        let mut w = BitWriter::default();
+        w.put(0x10000 | 9, 17);
+        w.put(5, 10);
+        w.put((1 << 9) - 8 + 3, 10);
+        w.put(0b1111, 4);
+        let out = decompress_it214(&w.block(), 2, true, false);
+        assert_eq!(out.frames, vec![5, 4]);
+    }
+
+    #[test]
+    fn it214_blocks_restart_width_and_delta() {
+        // A block holds 0x8000 8-bit frames; the second block starts
+        // again at width 9 with a zero running sum.
+        let mut first = BitWriter::default();
+        first.put(7, 9);
+        first.put(0x100, 9); // width 1: every further bit is a 0 delta…
+        // …except that a 1-bit value of 1 is the width-change code, so
+        // zeros only.
+        for _ in 1..0x8000 {
+            first.put(0, 1);
+        }
+        let mut data = first.block();
+        let mut second = BitWriter::default();
+        second.put(3, 9);
+        data.extend(second.block());
+        let out = decompress_it214(&data, 0x8001, false, false);
+        assert_eq!(out.frames.len(), 0x8001);
+        assert!(out.frames[..0x8000].iter().all(|&v| v == 7));
+        assert_eq!(out.frames[0x8000], 3);
+        assert_eq!((out.blocks, out.exact_blocks), (2, 2));
+    }
+
+    #[test]
+    fn it214_hostile_streams_stay_bounded() {
+        // Invalid width from the top form: the rest holds the last value.
+        let mut w = BitWriter::default();
+        w.put(5, 9);
+        w.put(0x100 | 200, 9);
+        let out = decompress_it214(&w.block(), 6, false, false);
+        assert_eq!(out.frames, vec![5; 6]);
+        assert_eq!((out.short_blocks, out.exact_blocks), (1, 0));
+        // A length field far beyond the data: bounded by the data size.
+        let out = decompress_it214(&[0, 0, 0, 0], usize::MAX, false, false);
+        assert!(out.frames.len() <= 32);
+        // Truncated block payloads and empty input never panic.
+        assert!(decompress_it214(&[], 100, true, true).frames.is_empty());
+        let out = decompress_it214(&[0xFF, 0xFF, 1, 2, 3], 100, false, false);
+        assert!(out.frames.len() <= 40);
+        for seed in 0u32..200 {
+            let data: Vec<u8> = (0..64)
+                .map(|i| (seed.wrapping_mul(2654435761).wrapping_add(i * 40503) >> 7) as u8)
+                .collect();
+            let _ = decompress_it214(&data, 5000, seed % 2 == 0, seed % 3 == 0);
+        }
+    }
+
+    #[test]
+    fn compressed_bodies_decode_and_absent_bodies_stay_empty() {
+        // Unsigned 8-bit compressed body: deltas +10, +10 -> 10, 20,
+        // re-centred by the unsigned convert flag.
+        let mut w = BitWriter::default();
+        w.put(10, 9);
+        w.put(10, 9);
+        let c = sample_from(IT_SMP_HAS_SAMPLE | IT_SMP_COMPRESSED, 0, 2, &w.block());
+        assert!(c.compressed());
+        assert_eq!(c.pcm, vec![(10i16 - 128) << 8, (20i16 - 128) << 8]);
+        assert!(!c.truncated);
+        // Signed: the values as they are.
+        let mut w = BitWriter::default();
+        w.put(10, 9);
+        w.put(10, 9);
         let c = sample_from(
             IT_SMP_HAS_SAMPLE | IT_SMP_COMPRESSED,
             IT_CVT_SIGNED,
-            4,
-            &[1, 2, 3, 4],
+            2,
+            &w.block(),
         );
-        assert!(c.compressed());
-        assert!(c.pcm.is_empty(), "compressed bodies are not guessed at");
-        assert!(!c.truncated);
+        assert_eq!(c.pcm, vec![10 << 8, 20 << 8]);
+        // A compressed body cut short is flagged.
+        let c = sample_from(
+            IT_SMP_HAS_SAMPLE | IT_SMP_COMPRESSED,
+            IT_CVT_SIGNED,
+            50,
+            &[3, 0, 1, 2, 3],
+        );
+        assert!(c.truncated);
         let a = sample_from(0, IT_CVT_SIGNED, 4, &[1, 2, 3, 4]);
         assert!(!a.has_sample());
         assert!(a.pcm.is_empty());

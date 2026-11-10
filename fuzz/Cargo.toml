@@ -188,3 +188,9 @@ name = "stm_player_steered"
 path = "fuzz_targets/stm_player_steered.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "it214_decompress"
+path = "fuzz_targets/it214_decompress.rs"
+test = false
+doc = false
