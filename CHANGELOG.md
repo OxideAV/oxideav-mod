@@ -19,10 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One finite pass for MOD, XM and IT**: the players record their flow state (order, row, per-channel pattern-loop start / counter, XM start-row latch) on every row arrival and raise `ended` the first time a state repeats, so songs that loop with a backward `Bxx`, an out-of-range `Bxx` wrap or an inescapable pattern loop no longer render forever through the decoders. Capped at 2¹⁸ states per pass. New public `stop_on_repeat` field on `PlayerState`, `XmPlayerState` and `ItPlayerState` (default `true`; clear to loop like the tracker); hidden `pass::PassTracker`.
+- XM: FastTracker 2.08 jump / break trace lockstep — 7 / 7 staged probe modules (`tests/xm_ft208_probes.rs`, fixtures vendored under `tests/fixtures/ft208-jump-probes/`).
 - Hidden `stm_writer` (module and packed-song output) for tests and fuzzing; `stm_player_steered` fuzz target (recipe → always-valid STM → render to the end of the pass); `stm_decode` corpus reseeded with two staged probe modules and a packed song.
 
 ### Fixed
 
+- XM `Dxx` left of a same-row `Bxx`: the jump now discards the earlier break's row and lands on row 0 (previously the two merged in either channel order); `Bxx` left of `Dxx` still merges. Per the FT 2.08 trace in `docs/audio/trackers/xm/xm-jump-break-precedence.md` (probes `XBD` / `XDB`).
+- XM end of song / out-of-range `Bxx`: the position always moves to the header's restart position (order 0 if that is outside the song) instead of replaying from it once and then leaving the position past the order list.
 - MOD `Bxx`: the target order is masked to 7 bits before the song-length bound (`B81` behaves as `B01`; `B84` on a 3-order song continues at order 0), per the ProTracker 2.3a resolution staged in `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`. The order-0 wrap for a target at or past the song length is now the documented behaviour rather than a working assumption; residue orders past the song length stay unreachable (pinned with the note's worked example).
 - MOD `EEx` + same-row `Bxx` / `Dxy`: with a delay of one or more row-times the jump lands one row past its destination (the destination row is skipped; off the pattern end it takes the ordinary next-order advance), per fact 7 of the same resolution. `EE0` is unaffected.
 

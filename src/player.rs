@@ -863,6 +863,14 @@ pub struct PlayerState {
     /// start row + remaining count independently (per spec).
     loop_rows: Vec<u8>,
     loop_counts: Vec<u8>,
+    /// End the song (raise [`Self::ended`]) the first time the flow
+    /// comes back to a state it already played — the order position,
+    /// the row and every channel's `E6x` loop state all equal — so a
+    /// module that loops with a backward `Bxx`, an out-of-range `Bxx`
+    /// wrap or an inescapable `E6x` still renders one finite pass.
+    /// Clear it to follow ProTracker and loop forever.
+    pub stop_on_repeat: bool,
+    pass: crate::pass::PassTracker,
 
     /// EEx pattern-delay: rows to repeat after the current one completes.
     pattern_delay: u8,
@@ -988,6 +996,15 @@ impl PlayerState {
             restart_order: header.restart_position().unwrap_or(0),
             loop_rows: vec![0; n_ch],
             loop_counts: vec![0; n_ch],
+            stop_on_repeat: true,
+            pass: {
+                // The opening state (order 0, row 0, no loops armed).
+                let mut pass = crate::pass::PassTracker::default();
+                pass.start(0, 0);
+                pass.push(&vec![0u8; 2 * n_ch]);
+                pass.finish();
+                pass
+            },
             pattern_delay: 0,
             in_pattern_delay_repeat: false,
             // LED ON is the Amiga default at power-up — and the
@@ -1582,8 +1599,30 @@ impl PlayerState {
         funkrepeat_step(&mut self.channels, &mut self.samples);
     }
 
-    /// Move to next row (or jump).
+    /// Move to next row (or jump), then check the new position against
+    /// the states this pass already played.
     fn next_row(&mut self) {
+        self.advance_position();
+        if self.in_pattern_delay_repeat {
+            // Still on the same row (an EEx repeat pass).
+            return;
+        }
+        self.pass
+            .start(self.order_index as usize, self.row as usize);
+        self.pass.push(&self.loop_rows);
+        self.pass.push(&self.loop_counts);
+        if self.ended {
+            // Song over by run-off: whatever follows is a new pass.
+            self.pass.clear();
+            self.pass.finish();
+        } else if self.pass.finish() && self.stop_on_repeat {
+            self.ended = true;
+            self.pass.clear();
+            self.pass.finish();
+        }
+    }
+
+    fn advance_position(&mut self) {
         // EEx pattern delay: repeat the current row `pattern_delay` more
         // times. Set `in_pattern_delay_repeat` so the next pass through
         // tick 0 skips `enter_row` (no note re-trigger, no tick-0 effect
@@ -5451,6 +5490,9 @@ pub mod tests {
             },
         )]);
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         assert_eq!(player.song_length, 1, "fixture must be a one-order song");
         // Step a full row plus a tick so `next_row` consumes the pending jump.
         let ticks = player.speed as usize + 1;
@@ -5743,6 +5785,9 @@ pub mod tests {
         let bytes =
             synth_mod_with_order_table_and_restart(3, 1, &[0, 1, 2], &[(0, 0, 0, fx(0xB, 0x05))]);
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         assert_eq!(player.restart_order, 1);
         step_rows_and_enter_next(&mut player, 1);
         assert!(!player.ended, "an out-of-range Bxx wraps, never ends");
@@ -5769,6 +5814,9 @@ pub mod tests {
             &[(0, 0, 0, fx(0xB, 0x81))],
         );
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         step_rows_and_enter_next(&mut player, 1);
         assert!(!player.ended);
         assert_eq!((player.order_index, player.row), (1, 0));
@@ -5782,6 +5830,9 @@ pub mod tests {
             &[(1, 0, 0, fx(0xB, 0x84))],
         );
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         step_rows_and_enter_next(&mut player, 65);
         assert!(!player.ended);
         assert_eq!((player.order_index, player.row), (0, 0));
@@ -5836,6 +5887,115 @@ pub mod tests {
             step_one_tick(&mut player);
         }
         assert_eq!((player.order_index, player.row), (1, 5));
+    }
+
+    #[test]
+    fn backward_jump_ends_the_pass_when_the_flow_state_repeats() {
+        // A song that loops with `B00` on its last pattern: ProTracker
+        // plays forever, a decoder must stop. The pass ends when the
+        // flow arrives back on order 0, row 0 — a state already played.
+        let bytes =
+            synth_mod_with_order_table_and_restart(2, 0x7F, &[0, 1], &[(1, 5, 0, fx(0xB, 0x00))]);
+        let mut player = make_player(&bytes);
+        assert!(player.stop_on_repeat, "one finite pass is the default");
+        step_rows_and_enter_next(&mut player, 64 + 5);
+        assert!(!player.ended);
+        assert_eq!((player.order_index, player.row), (1, 5));
+        for _ in 0..player.speed {
+            step_one_tick(&mut player);
+        }
+        assert!(player.ended, "order 0 / row 0 came round again");
+        assert_eq!((player.order_index, player.row), (0, 0));
+
+        // Rendered through the public entry points the pass is finite:
+        // 64 + 6 rows of 6 ticks of 882 frames.
+        let mut player = make_player(&bytes);
+        let mut buf = vec![0i16; 2 * 44_100];
+        let mut frames = 0usize;
+        loop {
+            let n = player.render(&mut buf);
+            if n == 0 {
+                break;
+            }
+            frames += n;
+            assert!(frames < 44_100 * 600, "the pass must be finite");
+        }
+        assert_eq!(frames, (64 + 6) * 6 * 882);
+    }
+
+    #[test]
+    fn out_of_range_bxx_wrap_ends_the_pass_at_order_zero() {
+        let bytes = synth_mod_with_order_table_and_restart(
+            3,
+            0x7F,
+            &[0, 1, 2],
+            &[(0, 3, 0, fx(0xB, 0x05))],
+        );
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 4);
+        assert_eq!((player.order_index, player.row), (0, 0));
+        assert_eq!(player.oob_position_jumps, 1);
+        assert!(player.ended, "the wrap re-enters a played state");
+    }
+
+    #[test]
+    fn inescapable_pattern_loop_ends_the_pass() {
+        // E60 / E61 / E61 down one channel never leaves the pattern in
+        // ProTracker; the repeat check sees the same row with the same
+        // loop counters and ends the pass instead of spinning.
+        let bytes = synth_mod_with_pattern(&[
+            (0, 0, fx(0xE, 0x60)),
+            (1, 0, fx(0xE, 0x61)),
+            (2, 0, fx(0xE, 0x61)),
+        ]);
+        let mut player = make_player(&bytes);
+        let mut rows = 0;
+        while !player.ended {
+            for _ in 0..player.speed {
+                step_one_tick(&mut player);
+            }
+            rows += 1;
+            assert!(rows < 1000, "the loop must be cut");
+        }
+        assert!(rows < 64, "cut well before a pattern's worth of rows");
+    }
+
+    #[test]
+    fn finite_pattern_loops_do_not_trip_the_repeat_check() {
+        // E60 on row 2, E63 on row 5: rows 2-5 play four times, each
+        // visit with a different loop counter — never the same flow
+        // state — and the song then runs to its natural end.
+        let bytes = synth_mod_with_pattern(&[(2, 1, fx(0xE, 0x60)), (5, 1, fx(0xE, 0x63))]);
+        let mut player = make_player(&bytes);
+        let mut rows = 0;
+        while !player.ended {
+            for _ in 0..player.speed {
+                step_one_tick(&mut player);
+            }
+            rows += 1;
+            assert!(rows < 1000);
+        }
+        assert_eq!(rows, 64 + 3 * 4, "64 rows plus three extra loop passes");
+    }
+
+    #[test]
+    fn planar_render_stops_after_one_pass_too() {
+        let bytes =
+            synth_mod_with_order_table_and_restart(1, 0x7F, &[0], &[(0, 7, 0, fx(0xB, 0x00))]);
+        let mut player = make_player(&bytes);
+        let n_ch = player.channels.len();
+        let mut bufs: Vec<Vec<i16>> = (0..n_ch).map(|_| vec![0i16; 4096]).collect();
+        let mut frames = 0usize;
+        loop {
+            let mut views: Vec<&mut [i16]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+            let n = player.render_per_channel(&mut views, 4096);
+            if n == 0 {
+                break;
+            }
+            frames += n;
+            assert!(frames < 44_100 * 600);
+        }
+        assert_eq!(frames, 8 * 6 * 882);
     }
 
     #[test]
@@ -5965,6 +6125,9 @@ pub mod tests {
         // modules on which players will disagree.
         let bytes = synth_mod_with_pattern(&[(0, 0, fx(0xB, 0x05))]);
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         assert_eq!(player.oob_position_jumps, 0, "fresh player starts clean");
         step_rows_and_enter_next(&mut player, 1);
         assert_eq!(
@@ -5993,6 +6156,9 @@ pub mod tests {
         // pattern).
         let bytes = synth_mod_with_order_table(4, &[3, 1, 2, 6, 5, 7], &[(3, 0, 0, fx(0xB, 0x04))]);
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         assert_eq!(player.song_length, 4);
         assert_eq!(player.order[..6], [3, 1, 2, 6, 5, 7]);
         step_rows_and_enter_next(&mut player, 1);
@@ -6131,6 +6297,9 @@ pub mod tests {
             (2, 0, fx(0xE, 0x61)),
         ]);
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         // Walk the equivalent of 48 rows — far past the 3-row body. The
         // player must still be cycling rows 0..=2 of order 0.
         for _ in 0..(48 * 6) {
@@ -6189,6 +6358,9 @@ pub mod tests {
             all.extend_from_slice(&cells);
             let bytes = synth_mod_multi_pattern(2, &all);
             let mut player = make_player(&bytes);
+            // Follow ProTracker and keep looping (the one-pass stop is
+            // pinned separately).
+            player.stop_on_repeat = false;
             step_rows_and_enter_next(&mut player, 2);
             assert!(!player.ended, "a B00+D00 restart must not end the song");
             assert_eq!(
@@ -6216,6 +6388,9 @@ pub mod tests {
             ],
         );
         let mut player = make_player(&bytes);
+        // Follow ProTracker and keep looping (the one-pass stop is
+        // pinned separately).
+        player.stop_on_repeat = false;
         let mut buf = vec![0i16; 44_100 * 2]; // 1 s stereo
         let produced = player.render(&mut buf);
         assert_eq!(

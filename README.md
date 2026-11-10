@@ -624,6 +624,7 @@ by a unit test as well:
 | `Rxy` | never fires on tick 0 of a note row; continuing rows do |
 | volume-column slides | no memory of their own (`+0` / `-0` no-op) but they seed the `Axy` memory |
 | order flow | `Bxx` / `Dxx` on any channel beat a same-row loop jump; `Dxx` past the pattern length → row 0; `F00` ignored |
+| `Bxx` + `Dxx` (FT 2.08 trace) | channels scan left to right: `Bxx` then `Dxx` → position xx, row of the `Dxx`; `Dxx` then `Bxx` → position xx, **row 0** (the jump discards the earlier break row); `Dxx` is two decimal digits; `Bxx` at or past the song length → the header's **restart position**, row 0 |
 | pattern loops | each jump latches its start row as the next pattern's start row and a finished loop leaves it; an `E6x` after a loop ran out (no new `E60`) plays x − 1 passes and breaks to the next pattern's row 0 without consuming the latch |
 | keymap | out-of-range entries play sample 0; a tone-porta note keeps the playing sample |
 | ping-pong loops | `2 × span` mirrored waveform, end frames doubled at the turns (shared mixer, IT battery unchanged) |
@@ -631,6 +632,36 @@ by a unit test as well:
 
 The absolute mix level is not gated: the v2.04 volume formula ends in
 an unspecified `Scale` factor.
+
+### FastTracker 2.08 jump / break trace
+
+`tests/xm_ft208_probes.rs` plays the seven probe modules staged under
+`docs/audio/trackers/xm/fixtures/ft208-jump-probes/` (byte-identical
+copies in `tests/fixtures/ft208-jump-probes/`) and asserts the
+`(song position, row)` flow the original FastTracker 2.08 showed
+(`xm-jump-break-precedence.md`): **7 / 7 probes in lockstep** over the
+jump row and the 40 rows after it — `B02` → 2 / 0, `D05` → 1 / 5, `D10`
+→ 1 / 10, `B02`·`D05` → 2 / 5, `D05`·`B02` → 2 / 0, and `B05` in a
+3-order song → the restart position (0, or 1 in `XBPASTR`).
+
+### One finite pass (MOD / XM / IT)
+
+The original trackers loop forever when a song jumps back into itself;
+a decoder has to stop. The MOD, XM and IT players record their *flow
+state* on every row arrival — order position, row, and whatever else
+decides where the song goes next (each channel's pattern-loop start
+row and counter; for XM also the next-pattern start-row latch) — and
+raise `ended` the first time a state comes round again
+(`pass::PassTracker`). Pattern loops revisit their rows with different
+counters and are never mistaken for a repeat; a loop that cannot exit
+(`E60` / `E61` / `E61` down one MOD channel) is cut. The number of
+states per pass is capped at 2¹⁸, so a module built to nest loops
+astronomically deep still ends. Every player exposes
+`stop_on_repeat` (default `true`); clear it to loop like the tracker.
+XM's end-of-song handling now always moves to the restart position and
+lets this check end the pass (previously it replayed from the restart
+position once before stopping). STM uses the simpler per-order form of
+the same rule (its flow has no pattern loops).
 
 ### Shared-mixer loop boundary (STM + XM)
 

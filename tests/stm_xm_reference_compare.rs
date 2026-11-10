@@ -422,6 +422,9 @@ fn xm_ref_position_lockstep() {
     mp.configure_clean();
 
     let mut ours = XmStepper::new(&bytes);
+    // The fixture loops; keep following it for the whole 30 s trace
+    // (the default stops after one pass).
+    ours.p.stop_on_repeat = false;
 
     // Chunk = 1/8 s. 30 s trace = 240 probes.
     let chunk_frames = (OUT_HZ / 8) as usize;

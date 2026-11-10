@@ -96,6 +96,8 @@ pub mod it_player;
 #[doc(hidden)]
 pub mod it_writer;
 pub mod mixer;
+#[doc(hidden)]
+pub mod pass;
 pub mod player;
 pub mod samples;
 pub mod stm;

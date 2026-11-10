@@ -437,6 +437,13 @@ pub struct XmPlayerState {
     /// via the restart-position mechanism. Used so `ended` can fire after
     /// a single pass for callers that want a one-shot render.
     pub loops: u16,
+    /// End the song (raise [`Self::ended`]) the first time the flow
+    /// comes back to a state it already played — order position, row,
+    /// the start-row latch and every channel's `E6x` loop state all
+    /// equal. FastTracker 2 itself keeps playing from the restart
+    /// position; clear this to follow it.
+    pub stop_on_repeat: bool,
+    pass: crate::pass::PassTracker,
 
     // -------- round-19 song-level state --------
     /// Global volume 0..=64 (Gxy / Hxy). Multiplies all voice volumes.
@@ -499,6 +506,19 @@ impl XmPlayerState {
             break_row: 0,
             pending_break0: false,
             loops: 0,
+            stop_on_repeat: true,
+            pass: {
+                // The opening state: order 0, row 0, no start-row latch,
+                // no loop armed on any channel.
+                let mut pass = crate::pass::PassTracker::default();
+                pass.start(0, 0);
+                pass.push(&[0, 0]);
+                for _ in 0..n_ch {
+                    pass.push(&[0, 0, 0, 0]);
+                }
+                pass.finish();
+                pass
+            },
             global_volume: 64,
             pattern_delay: 0,
             in_pattern_delay_replay: false,
@@ -984,8 +1004,18 @@ impl XmPlayerState {
             let ep = self.channels[ch_idx].effect_param;
             match effect {
                 0x0B => {
-                    // Bxy: jump to order ep.
+                    // Bxx: jump to order xx. Channels are scanned left
+                    // to right and a position jump also resets the
+                    // destination row, so a `Bxx` to the RIGHT of a
+                    // same-row `Dxx` discards that break's row, while a
+                    // `Dxx` to the right of the `Bxx` supplies it
+                    // (FT 2.08 trace, probes `XBD` / `XDB` in
+                    // `docs/audio/trackers/xm/xm-jump-break-precedence.md`).
                     self.pending_jump = Some(ep as u16);
+                    if self.pending_break {
+                        self.pending_break = false;
+                        self.break_row = 0;
+                    }
                 }
                 0x0D => {
                     // Dxy: pattern-break row = x*10 + y (DECIMAL — an
@@ -1467,7 +1497,35 @@ impl XmPlayerState {
         }
     }
 
+    /// Row-advance logic run when the row's last tick has elapsed,
+    /// followed by the one-finite-pass check on the new position.
     fn next_row(&mut self) {
+        self.advance_position();
+        if self.in_pattern_delay_replay {
+            return;
+        }
+        let ended = self.ended;
+        let repeat = self.note_flow_state(self.order_index, self.row as usize);
+        if ended || (repeat && self.stop_on_repeat) {
+            self.ended = true;
+            self.pass.clear();
+            self.note_flow_state(self.order_index, self.row as usize);
+        }
+    }
+
+    /// Record the flow state at `(order, row)`; true when it was already
+    /// played in this pass.
+    fn note_flow_state(&mut self, order: usize, row: usize) -> bool {
+        self.pass.start(order, row);
+        self.pass.push(&self.break_row.to_le_bytes());
+        for ch in &self.channels {
+            self.pass.push(&ch.pat_loop_row.to_le_bytes());
+            self.pass.push(&[ch.pat_loop_count, ch.pat_loop_done as u8]);
+        }
+        self.pass.finish()
+    }
+
+    fn advance_position(&mut self) {
         // EEx — Pattern delay. If pattern_delay > 0 we re-run the same
         // row's per-tick effects without re-entering (no note retrigger,
         // per the FT2 spec). Decrement on each replay.
@@ -1497,7 +1555,11 @@ impl XmPlayerState {
             return;
         }
         if let Some(order) = jump {
-            // Bxx: order from the jump, row from a same-row Dxx (else 0).
+            // Bxx: order from the jump; the row comes from a `Dxx`
+            // further RIGHT on the row (one to the left was discarded
+            // when the `Bxx` was scanned), else 0. A same-row pattern
+            // loop's start-row latch does not count (black-box pinned,
+            // round 458 `jump_then_loop`).
             let row = if brk { self.break_row } else { 0 };
             self.break_row = 0;
             self.goto_order(order as usize, row);
@@ -1559,16 +1621,25 @@ impl XmPlayerState {
         }
     }
 
-    /// Called when `order_index` runs past the song length. The XM
-    /// header's `restart_position` points back into the order table so
-    /// the song loops. We set `ended` after one restart so single-shot
-    /// callers still get a definite finish.
+    /// Called when `order_index` runs past the song length — by the
+    /// natural end of the last pattern, a `Dxx` on it, or a `Bxx`
+    /// naming a position at or past the song length. FastTracker 2
+    /// continues at the header's restart position (FT 2.08 trace,
+    /// probes `XBPAST` / `XBPASTR`: `B05` in a 3-order song lands on
+    /// the restart position, 0 or 1 — not on a hard-coded 0), so the
+    /// position moves there and `loops` counts the wrap; whether that
+    /// ends the song is the one-finite-pass check's call (the restart
+    /// position has normally been played already). A restart position
+    /// outside the song falls back to order 0.
     fn maybe_end_or_restart(&mut self) {
         let restart = self.restart_position as usize;
-        if restart < self.song_length as usize && restart < self.order.len() && self.loops == 0 {
-            self.order_index = restart;
-            self.loops = self.loops.saturating_add(1);
+        self.order_index = if restart < self.song_length as usize && restart < self.order.len() {
+            restart
         } else {
+            0
+        };
+        self.loops = self.loops.saturating_add(1);
+        if self.song_length == 0 || self.order.is_empty() {
             self.ended = true;
         }
     }

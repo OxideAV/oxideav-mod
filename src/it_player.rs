@@ -468,6 +468,13 @@ pub struct ItPlayerState {
     pub ended: bool,
     /// Song wrapped to order 0 this many times.
     pub loops: u16,
+    /// End the song the first time the flow comes back to a state it
+    /// already played (order, row and every channel's `SBx` loop state
+    /// equal), so a module that jumps back into itself with `Bxx`
+    /// still renders one finite pass. Clear it to loop like the
+    /// tracker.
+    pub stop_on_repeat: bool,
+    pass: crate::pass::PassTracker,
     pub pending_order_jump: Option<usize>,
     pub pending_break_row: Option<u16>,
     /// `SEx` row repeats remaining.
@@ -507,6 +514,19 @@ impl ItPlayerState {
         let old_effects = h.old_effects();
         let compat_gxx = h.compatible_gxx();
         let instrument_mode = h.uses_instruments() && !module.instruments.is_empty();
+        // The opening flow state: the first playable order (skip
+        // markers stepped over), row 0, no `SBx` loop armed.
+        let mut pass = crate::pass::PassTracker::default();
+        let first_order = h
+            .orders
+            .iter()
+            .position(|&o| o != IT_ORDER_SKIP)
+            .unwrap_or(0);
+        pass.start(first_order, 0);
+        for _ in 0..n_ch {
+            pass.push(&[0, 0, 0]);
+        }
+        pass.finish();
         ItPlayerState {
             speed: h.initial_speed.max(1),
             tempo: h.initial_tempo.max(32),
@@ -521,6 +541,8 @@ impl ItPlayerState {
             tick_sample_cursor: 0,
             ended: false,
             loops: 0,
+            stop_on_repeat: true,
+            pass,
             pending_order_jump: None,
             pending_break_row: None,
             pattern_delay: 0,
@@ -602,8 +624,31 @@ impl ItPlayerState {
         }
     }
 
-    /// Row-advance logic run when the row's last tick has elapsed.
+    /// Row-advance logic run when the row's last tick has elapsed,
+    /// followed by the one-finite-pass check on the new position.
     fn next_row(&mut self) {
+        self.advance_position();
+        let ended = self.ended;
+        let repeat = self.note_flow_state();
+        if ended || (repeat && self.stop_on_repeat) {
+            self.ended = true;
+            self.pass.clear();
+            self.note_flow_state();
+        }
+    }
+
+    /// Record the flow state at the current position; true when it was
+    /// already played in this pass.
+    fn note_flow_state(&mut self) -> bool {
+        self.pass.start(self.order_index, self.row as usize);
+        for ch in &self.channels {
+            self.pass.push(&ch.loop_row.to_le_bytes());
+            self.pass.push(&[ch.loop_count]);
+        }
+        self.pass.finish()
+    }
+
+    fn advance_position(&mut self) {
         if let Some(loop_row) = self.pending_loop_row.take() {
             self.row = loop_row;
             self.pending_order_jump = None;
@@ -2570,6 +2615,53 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(rows_seen, vec![0, 1, 2, 1, 2, 1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn backward_position_jump_ends_the_pass_on_the_repeated_state() {
+        // Two 4-row patterns; the second ends with `B00`. The tracker
+        // would loop forever — the pass ends when order 0 / row 0 comes
+        // round with the same loop state.
+        let a = build_pattern(4, &[(0, 0, note_cell(60, 1))]);
+        let b = build_pattern(4, &[(3, 0, cmd_cell('B', 0x00))]);
+        let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[a, b], &[0, 1]);
+        let mut p = player(&m);
+        assert!(p.stop_on_repeat);
+        let pcm = render_all(&mut p, 2_000_000);
+        assert!(p.ended);
+        assert_eq!((p.order_index, p.row), (0, 0));
+        assert_eq!(pcm.len() / 2, 8 * 6 * 882, "eight rows, then the stop");
+
+        // With the stop cleared the engine keeps looping like the
+        // tracker.
+        let mut p = player(&m);
+        p.stop_on_repeat = false;
+        let pcm = render_all(&mut p, 3 * 8 * 6 * 882);
+        assert!(
+            pcm.len() / 2 >= 3 * 8 * 6 * 882,
+            "three passes and counting"
+        );
+        assert!(!p.ended);
+    }
+
+    #[test]
+    fn pattern_loops_are_not_mistaken_for_a_repeated_state() {
+        // The SBx loop below revisits rows 1-2 with a different loop
+        // counter each time; the song must still run to its end.
+        let pat = build_pattern(
+            4,
+            &[
+                (0, 0, note_cell(60, 1)),
+                (1, 0, cmd_cell('S', 0xB0)),
+                (2, 0, cmd_cell('S', 0xB3)),
+            ],
+        );
+        let m = sample_mode_module(IT_FLAG_LINEAR_SLIDES, &[pat], &[0]);
+        let mut p = player(&m);
+        let pcm = render_all(&mut p, 2_000_000);
+        assert!(p.ended);
+        // rows 0,1,2,(1,2)x3,3 = 10 rows.
+        assert_eq!(pcm.len() / 2, 10 * 6 * 882);
     }
 
     #[test]
