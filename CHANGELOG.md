@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- MOD `Bxx`: the target order is masked to 7 bits before the song-length bound (`B81` behaves as `B01`; `B84` on a 3-order song continues at order 0), per the ProTracker 2.3a resolution staged in `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`. The order-0 wrap for a target at or past the song length is now the documented behaviour rather than a working assumption; residue orders past the song length stay unreachable (pinned with the note's worked example).
+- MOD `EEx` + same-row `Bxx` / `Dxy`: with a delay of one or more row-times the jump lands one row past its destination (the destination row is skipped; off the pattern end it takes the ordinary next-order advance), per fact 7 of the same resolution. `EE0` is unaffected.
+
 ### Changed
 
 - `#[non_exhaustive]`: the `ModVariant` enum; the parsed module records `ModHeader`, `Sample`, `SampleBody`, `ItHeader`, `ItSample`, `ItInstrument`, `ItEnvelope`, `ItPattern`, `ItModule`, `StmHeader`, `StmInstrument`, `StmPattern`, `StmSampleBody`, `XmHeader`, `XmPattern`, `XmEnvelope`, `XmSampleHeader` and `XmInstrument`; the player-state records `PlayerState`, `Channel`, `DelayedTrigger`, `StmPlayerState`, `StmChannel`, `XmPlayerState`, `XmChannel`, `ItPlayerState`, `ItChannel`, `ItVoice`, `EnvState` and `MixerVoice`. All are produced by the parsers / players; their fields stay readable and assignable. The format-fixed enums (IT NNA / DCT / DCA / vibrato waveform / volume column, XM volume column / loop mode / frequency table, STM file type / note kind, `LoopKind`, `XmPitchTable`) and the pattern-cell / pitch-model value types (`Note`, `ItCell`, `XmCell`, `StmCell`, `Pattern`, `Waveform`, `AmigaPeriodPitch`, `StmC3Pitch`, `XmPitch`, `ItLoopView`) are unchanged.

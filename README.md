@@ -99,7 +99,7 @@ Spec-level effect coverage per
 | 7xy | Tremolo | implemented |
 | 9xx | Sample offset (`param << 8`) with memory | implemented; an offset ≥ sample length plays no note (PT out-of-range quirk) |
 | Axy | Volume slide | implemented |
-| Bxx | Position jump | implemented (an out-of-range target — bound = the song-length byte, NOT the 128-byte order-table extent — wraps to order 0 per the staged erratum's working assumption and increments the public `oob_position_jumps` diagnostic; also clears a pending break row — see the same-row `Bxx`/`Dxy` bullet below) |
+| Bxx | Position jump | implemented (the target is masked to 7 bits — `B81` = `B01` — and bounded by the song-length byte, NOT the 128-byte order-table extent; at or past it playback continues at order 0, per the staged ProTracker 2.3a resolution, and the public `oob_position_jumps` diagnostic counts each such jump; also clears a pending break row — see the same-row `Bxx`/`Dxy` bullet below) |
 | Cxx | Set volume | implemented |
 | Dxy | Pattern break (decimal `x*10 + y`) | implemented (row > 63 starts the destination at row 0; merges its row into a same-row earlier-channel `Bxx`; two breaks on one row advance the order exactly once; a break past the last order wraps the position to order 0 per FireLight §5.14 while still raising the song-over flag) |
 | Fxx | Speed / BPM split (≤$1F = speed, ≥$20 = BPM; $00 = halt) | implemented (F00 raises the song-over `ended` flag) |
@@ -113,7 +113,7 @@ Spec-level effect coverage per
 | EAx / EBx | Fine volume slide up / down | implemented |
 | ECx | Note cut | implemented (`ECx` cuts at tick x; `EC0` cuts on tick 0 so "nothing will be heard") |
 | EDx | Note delay | implemented (`ED0` = "play at tick 0" fires immediately like an ordinary note-on; only `ED1`+ defer the trigger) |
-| EEx | Pattern delay | implemented (repeats suppress note retrigger + tick-0 re-fire while per-tick effects keep animating; a same-row `Bxx`/`Dxy`/`E6x` transition is deferred until the delay expires, never cancelled and never double-consumed — per MODFIL12 EE "the next line will be delayed … before it is executed" + FireLight §5.30) |
+| EEx | Pattern delay | implemented (repeats suppress note retrigger + tick-0 re-fire while per-tick effects keep animating; a same-row `E6x` transition is deferred until the delay expires; a same-row `Bxx`/`Dxy` fires once after the delay and — for `EE1`+ — lands one row PAST its destination, the delayed row-times stepping over the destination row per the ProTracker 2.3a resolution fact 7 in `mod-position-jump-pattern-break.md`) |
 | EFx | Invert loop ("funkrepeat") | implemented (per-tick counter from the 16-entry speed table; XORs one loop byte at a time, position wraps mod loop length, resets on new sample) |
 | 8xx | Set FINE Panning (FT extension) | implemented (raw 0..=255: $00 LEFT, $FF RIGHT; per-channel) |
 | E8x | Set ROUGH Panning (FT extension) | implemented (nibble replicated: $0 LEFT, $F RIGHT; per-channel) |
@@ -384,16 +384,20 @@ a unit test in `src/player.rs`):
   intended stop into trailing pattern data.
 - **`Bxx` out-of-range wraps to order 0** — a position-jump `Bxx` whose
   target order is at or past the song length does **not** end the song;
-  ProTracker wraps it back to order 0 and keeps playing. Previously an
-  out-of-range `Bxx` fell into the same end-of-song path as a natural
-  run-off the order list, so a module that used a high `Bxx` as its
-  loop-back stopped instead of restarting. The natural run-off the end of
-  the order list (and a `Dxy` pattern-break that overflows past the last
-  order) still raise the song-over `ended` flag — only the explicit
-  out-of-range `Bxx` target wraps. Cited in
-  `docs/audio/trackers/mod/Protracker-effects-MODFIL12.txt` B:Position-Jump
-  ("If you do Bxx where xx is order_num or more, then it simply jumps to
-  order 0. And yes, I have tested this in ProTracker.").
+  ProTracker 2.3a continues at order 0. The staged sources disagreed
+  (ignore / clamp to the last order / wrap), and
+  `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`
+  ("Resolution 2026-09-28") settles it: the destination is `xx & 0x7F`
+  (parameters `$80`–`$FF` alias down by 128), compared against the
+  song-length byte, and at or past it the position becomes 0 — so the
+  order-table residue between the song length and 127 is unreachable by
+  `Bxx`. The same note's fact 7 gives the `EEx` interplay: with a
+  pattern delay of one or more row-times on the jump row, the destination
+  row itself is skipped and playback resumes one row after it. The
+  natural run-off the end of the order list (and a `Dxy` pattern-break
+  that overflows past the last order) still raise the song-over `ended`
+  flag — only the explicit out-of-range `Bxx` target wraps silently, and
+  each one increments `oob_position_jumps`.
 - **Restart byte (offset 951) steers the song-end wrap** — the header
   byte at +951 is a song-restart position in the NoiseTracker /
   FastTracker lineage and a filler everywhere else (`mod-spec-eblong.txt`
@@ -408,8 +412,8 @@ a unit test in `src/player.rs`):
   run-off and the `Dxy`-overflow paths to that order instead of order 0
   when it is live. The song-over `ended` flag still rises on every wrap,
   and the out-of-range-`Bxx` path is untouched (its order-0 wrap is the
-  erratum's working assumption, pinned independently of the restart
-  byte).
+  ProTracker 2.3a behaviour, whose playroutine never reads the +951
+  byte — pinned independently of the restart byte).
 - **Startrekker `FLT8` paired patterns** — `FLT8` files keep the plain
   4-channel 0x400-byte pattern layout on disk and pair two consecutive
   stored patterns into one logical 8-channel pattern: stored `2k`

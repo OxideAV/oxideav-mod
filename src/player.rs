@@ -1594,7 +1594,10 @@ impl PlayerState {
             return;
         }
         // Real row advance — clear the repeat flag so the next row's
-        // tick-0 processing runs normally.
+        // tick-0 processing runs normally. Remember whether this row ran
+        // at least one EEx repeat pass: a same-row Bxx / Dxy then lands
+        // one row past its destination (see below).
+        let delayed_row = self.in_pattern_delay_repeat;
         self.in_pattern_delay_repeat = false;
         let prev_order = self.order_index;
         // True when the consumed jump was an explicit Bxx position jump or
@@ -1611,21 +1614,20 @@ impl PlayerState {
         if let Some(jump) = self.pending_jump.take() {
             explicit_jump = jump.from_position_jump || jump.order.is_none();
             if let Some(order) = jump.order {
-                // Bxx position jump. An explicit target order at or past the
-                // song length does NOT end the song — it wraps back to order 0
-                // (the song restarts from the top). This is the documented
-                // working assumption of
+                // Bxx position jump. Per the ProTracker 2.3a resolution in
                 // `docs/audio/trackers/mod/mod-position-jump-pattern-break.md`
-                // (erratum "Bxx naming an order past the end"): the staged
-                // sources disagree (wrap to 0 / clamp to last order / ignore),
-                // and wrap-to-0 is the only answer asserted by more than one
-                // document (`Protracker-effects-MODFIL12.txt` B:Position-Jump
-                // "++" note + `FireLight-MOD-Player-Tutorial.txt` §5.12 "set
-                // it to the first order"). Each wrap increments the
-                // `oob_position_jumps` diagnostic per the erratum's status
-                // section. Only the *pattern-break / natural* run-off the end
-                // of the order list (the branches below) raises the song-over
-                // flag.
+                // ("Resolution 2026-09-28", facts 2-3) the destination goes
+                // through the common order-advance path: the position is
+                // masked to 7 bits (`B81` behaves as `B01`) and compared
+                // against the song-length byte; at or past it, playback
+                // continues at ORDER 0. The residue orders between the song
+                // length and 127 are unreachable. An out-of-range target
+                // therefore does NOT end the song, and each one increments
+                // the `oob_position_jumps` diagnostic (other replayers
+                // diverge on exactly these modules). Only the *pattern-break
+                // / natural* run-off the end of the order list (the branches
+                // below) raises the song-over flag.
+                let order = order & 0x7F;
                 if order >= self.song_length {
                     self.order_index = 0;
                     wrapped = true;
@@ -1658,6 +1660,26 @@ impl PlayerState {
                 }
             }
             self.row = jump.row;
+            // EEx + Bxx / Dxy on one row: the delayed row-times keep
+            // stepping the row counter under the already-written jump
+            // destination, and the final one is not taken back, so for a
+            // delay of one or more row-times the destination row itself
+            // is skipped and playback resumes one row after it
+            // (`mod-position-jump-pattern-break.md`, resolution fact 7).
+            // Running off the destination pattern that way takes the
+            // ordinary pattern-end advance.
+            if delayed_row && explicit_jump {
+                self.row += 1;
+                if self.row as usize >= PATTERN_ROWS {
+                    self.row = 0;
+                    self.order_index = self.order_index.saturating_add(1);
+                    if self.order_index >= self.song_length {
+                        self.order_index = self.restart_order;
+                        self.ended = true;
+                        wrapped = true;
+                    }
+                }
+            }
         } else {
             self.row += 1;
             if self.row as usize >= PATTERN_ROWS {
@@ -5734,6 +5756,89 @@ pub mod tests {
     }
 
     #[test]
+    fn bxx_parameter_is_masked_to_seven_bits() {
+        // ProTracker 2.3a resolution, fact 3
+        // (`mod-position-jump-pattern-break.md`): the order-advance
+        // path masks the position to 7 bits, so parameters $80-$FF
+        // alias down by 128 — `B81` behaves as `B01`, and is NOT an
+        // out-of-range jump.
+        let bytes = synth_mod_with_order_table_and_restart(
+            3,
+            0x7F,
+            &[0, 1, 2],
+            &[(0, 0, 0, fx(0xB, 0x81))],
+        );
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 1);
+        assert!(!player.ended);
+        assert_eq!((player.order_index, player.row), (1, 0));
+        assert_eq!(player.oob_position_jumps, 0, "B81 = B01 is in range");
+
+        // `B84` aliases to order 4, at/past the song length 3 -> order 0.
+        let bytes = synth_mod_with_order_table_and_restart(
+            3,
+            0x7F,
+            &[0, 1, 2],
+            &[(1, 0, 0, fx(0xB, 0x84))],
+        );
+        let mut player = make_player(&bytes);
+        step_rows_and_enter_next(&mut player, 65);
+        assert!(!player.ended);
+        assert_eq!((player.order_index, player.row), (0, 0));
+        assert_eq!(player.oob_position_jumps, 1);
+    }
+
+    #[test]
+    fn bxx_cannot_reach_order_table_residue_past_the_song_length() {
+        // The doc's worked example: song length 4, order table
+        // `[03 01 02 06 05 07 …]` — orders 4 and 5 are editing residue
+        // naming real patterns. `B04` / `B05` are bounded by the
+        // song-length byte, not the 128-byte table: both continue at
+        // order 0 (pattern 03), never at patterns 05 / 07.
+        for target in [0x04u8, 0x05] {
+            let bytes = synth_mod_with_order_table_and_restart(
+                4,
+                0x7F,
+                &[3, 1, 2, 6, 5, 7],
+                &[(3, 0, 0, fx(0xB, target))],
+            );
+            let mut player = make_player(&bytes);
+            step_rows_and_enter_next(&mut player, 1);
+            assert_eq!((player.order_index, player.row), (0, 0));
+            assert_eq!(player.order[player.order_index as usize], 3);
+            assert_eq!(player.oob_position_jumps, 1);
+        }
+    }
+
+    #[test]
+    fn pattern_delay_skip_off_the_destination_pattern_end_advances_order() {
+        // Resolution fact 7 corner: D63 + EE1 lands one row past row 63,
+        // i.e. off the destination pattern — the ordinary pattern-end
+        // advance takes over (next order, row 0).
+        let bytes =
+            synth_mod_multi_pattern(3, &[(0, 0, 0, fx(0xD, 0x63)), (0, 0, 1, fx(0xE, 0xE1))]);
+        let mut player = make_player(&bytes);
+        for _ in 0..13 {
+            step_one_tick(&mut player);
+        }
+        assert!(!player.ended);
+        assert_eq!((player.order_index, player.row), (2, 0));
+    }
+
+    #[test]
+    fn pattern_delay_zero_does_not_skip_the_jump_destination() {
+        // The skip needs at least one delayed row-time; `EE0` + `D05`
+        // lands on row 5 exactly.
+        let bytes =
+            synth_mod_multi_pattern(2, &[(0, 0, 0, fx(0xD, 0x05)), (0, 0, 1, fx(0xE, 0xE0))]);
+        let mut player = make_player(&bytes);
+        for _ in 0..7 {
+            step_one_tick(&mut player);
+        }
+        assert_eq!((player.order_index, player.row), (1, 5));
+    }
+
+    #[test]
     fn pattern_delay_defers_dxy_break_and_advances_order_once() {
         // EEx delays the row transition, it does not cancel it:
         // `Protracker-effects-MODFIL12.txt` EE ("the next line will be
@@ -5766,9 +5871,10 @@ pub mod tests {
         assert!(!player.ended);
         assert_eq!(
             (player.order_index, player.row),
-            (1, 5),
+            (1, 6),
             "after the delay expires the pending break fires exactly \
-             once: next order, decoded row 5"
+             once: next order — and the delayed row-times skip the \
+             destination row 5 itself (resolution fact 7)"
         );
     }
 
@@ -5796,8 +5902,10 @@ pub mod tests {
         assert!(!player.ended);
         assert_eq!(
             (player.order_index, player.row),
-            (2, 0),
-            "after the delay expires the Bxx fires: order 2, row 0"
+            (2, 1),
+            "after the delay expires the Bxx fires: order 2 — with the \
+             destination row 0 skipped by the delayed row-times \
+             (resolution fact 7)"
         );
     }
 
